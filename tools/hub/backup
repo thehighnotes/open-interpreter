@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""backup — Back up the hub ecosystem to the configured backup target.
+
+Rsyncs all critical files (hub tools, configs, OI patches, display setup,
+XFCE customizations) to the backup destination. Also prints sudo commands
+for system-level files that can't be backed up directly.
+
+Usage:
+    backup              Run full backup to AGX
+    backup --dry-run    Show what would be transferred
+    backup --list       List all backed-up file categories
+    backup --help
+"""
+
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import *
+
+# BACKUP_DEST is imported from hub_common (config-derived)
+HOME = str(Path.home())
+PY_VER = f'python{sys.version_info.major}.{sys.version_info.minor}'
+LOCAL_USER = HOSTS.get(LOCAL_HOST, {}).get('user', os.environ.get('USER', 'user'))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File manifest — everything worth backing up
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Each entry: (category, description, list of paths relative to HOME or absolute)
+MANIFEST = [
+    ('Hub Tools', 'Core hub ecosystem scripts (auto-discovered)', 'auto'),
+    ('Hub Config', 'Project registry and bash setup', [
+        '.config/hub/projects.json',
+        '.config/hub/config.json',
+        '.bashrc', '.tmux.conf',
+    ]),
+    ('SSH', 'Keys and host config', [
+        '.ssh/config', '.ssh/authorized_keys',
+        '.ssh/id_ed25519', '.ssh/id_ed25519.pub',
+    ]),
+    ('Open Interpreter', 'Profile + patched library files', [
+        '.config/open-interpreter/profiles/linux-admin.py',
+        'oi-patches/',
+        f'.local/lib/{PY_VER}/site-packages/interpreter/core/core.py',
+        f'.local/lib/{PY_VER}/site-packages/interpreter/terminal_interface/terminal_interface.py',
+        f'.local/lib/{PY_VER}/site-packages/interpreter/core/utils/truncate_output.py',
+        f'.local/lib/{PY_VER}/site-packages/interpreter/terminal_interface/magic_commands.py',
+        f'.local/lib/{PY_VER}/site-packages/interpreter/core/computer/terminal/languages/subprocess_language.py',
+        f'.local/lib/{PY_VER}/site-packages/interpreter/terminal_interface/components/code_block.py',
+        f'.local/lib/{PY_VER}/site-packages/interpreter/core/respond.py',
+    ]),
+    ('RustDesk', 'Remote access config (user-side)', [
+        '.config/rustdesk/RustDesk2.toml',
+        '.config/rustdesk/RustDesk.toml',
+        '.config/rustdesk/RustDesk_local.toml',
+    ]),
+    ('XFCE + Display', 'Panel, keyboard, workspace, theme, devilspie2', [
+        '.config/xfce4/xfconf/xfce-perchannel-xml/',
+        '.config/devilspie2/',
+        '.config/autostart/devilspie2.desktop',
+        '.local/bin/switch-window',
+        '.local/bin/toggle-panels',
+    ]),
+    ('VNC', 'TigerVNC startup and password', [
+        '.vnc/xstartup', '.vnc/passwd',
+    ]),
+    ('Tab Completions', 'Bash completions for all hub tools', [
+        '.local/share/bash-completion/completions/',
+    ]),
+    ('Timeline', 'Session journals (irreplaceable history)', [
+        '.cache/timeline/',
+    ]),
+    ('Claude Code', 'Instructions and conversation history', [
+        '.claude/CLAUDE.md',
+        f'.claude/projects/-home-{LOCAL_USER}/memory/',
+    ]),
+    ('Desktop', 'Setup guide and launcher shortcuts', [
+        'Desktop/',
+    ]),
+]
+
+# System files requiring sudo — printed as manual instructions
+SUDO_FILES = [
+    ('/lib/firmware/edid/EDID.bin', 'EDID binary (synthetic headless monitor)'),
+    ('/etc/X11/xorg.conf', 'Xorg config (Tegra EDID injection)'),
+    ('/etc/X11/xorg.conf.backup', 'Xorg backup (original Tegra config)'),
+    ('/etc/lightdm/lightdm.conf', 'LightDM auto-login'),
+    ('/lib/systemd/system/rustdesk.service', 'RustDesk service unit'),
+    ('/etc/systemd/system/rustdesk.service.d/override.conf', 'RustDesk DISPLAY override'),
+    ('/etc/wireguard/wg0.conf', 'WireGuard VPN config'),
+    ('/etc/systemd/system/wg-quick@wg0.service.d/override.conf', 'WireGuard userspace override'),
+]
+
+
+def discover_hub_tools():
+    """Auto-discover hub tools: executable files in ~ (non-dotfiles) + hub_common.py."""
+    tools = []
+    for entry in sorted(os.listdir(HOME)):
+        if entry.startswith('.'):
+            continue
+        full = os.path.join(HOME, entry)
+        if os.path.isfile(full) and os.access(full, os.X_OK):
+            tools.append(entry)
+    # Ensure hub_common.py is included even if not executable
+    if 'hub_common.py' not in tools and os.path.exists(os.path.join(HOME, 'hub_common.py')):
+        tools.append('hub_common.py')
+    return sorted(tools)
+
+
+def resolve_manifest_paths(paths):
+    """Resolve a paths entry — handles 'auto' sentinel for hub tools."""
+    if paths == 'auto':
+        return discover_hub_tools()
+    return paths
+
+
+def build_file_list():
+    """Build flat list of existing files/dirs to rsync."""
+    files = []
+    for category, desc, paths in MANIFEST:
+        for p in resolve_manifest_paths(paths):
+            full = os.path.join(HOME, p)
+            if os.path.exists(full):
+                files.append(full)
+    return files
+
+
+def run_backup(dry_run=False):
+    """Run the backup to the configured destination."""
+    backup_host = BACKUP_DEST.split(':')[0] if ':' in BACKUP_DEST else LOCAL_HOST
+    backup_path = BACKUP_DEST.split(':', 1)[1] if ':' in BACKUP_DEST else BACKUP_DEST
+    backup_host_name = HOSTS.get(backup_host, {}).get('name', backup_host)
+
+    print()
+    header_bar()
+    print_right(f"{BRIGHT_GREEN}  HUB BACKUP{RESET}", f"{BRIGHT_GREEN}{datetime.now().strftime('%a %d %b %H:%M')}{RESET}")
+    header_bar()
+
+    # Check backup host reachability
+    if backup_host != LOCAL_HOST:
+        print(f"\n  {CYAN}Checking {backup_host_name}...{RESET}", end='', flush=True)
+        if not check_host_reachable(backup_host):
+            print(f" {RED}OFFLINE{RESET}")
+            print(f"\n  {RED}Cannot backup — {backup_host_name} is not reachable{RESET}\n")
+            sys.exit(1)
+        print(f" {GREEN}online{RESET}")
+
+    # Ensure remote backup dir exists
+    ssh_cmd(backup_host, f'mkdir -p {backup_path}', timeout=5)
+
+    # Build file list
+    files = build_file_list()
+    if not files:
+        print(f"\n  {RED}No files found to backup{RESET}\n")
+        sys.exit(1)
+
+    # Count categories
+    cat_counts = {}
+    for category, desc, paths in MANIFEST:
+        resolved = resolve_manifest_paths(paths)
+        count = sum(1 for p in resolved if os.path.exists(os.path.join(HOME, p)))
+        if count > 0:
+            cat_counts[category] = count
+
+    print(f"\n  {WHITE}Backing up {len(files)} items across {len(cat_counts)} categories:{RESET}")
+    for cat, count in cat_counts.items():
+        print(f"    {GRAY}·{RESET} {cat} ({count})")
+
+    # Write file list to temp file for rsync --files-from
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        for path in files:
+            # rsync --files-from needs paths relative to the source base
+            # But we have a mix of HOME-relative and absolute. Use --relative instead.
+            f.write(path + '\n')
+        filelist = f.name
+
+    # Run rsync
+    print()
+    mode_str = f"{YELLOW}DRY RUN{RESET}" if dry_run else f"{CYAN}syncing{RESET}"
+    print(f"  {mode_str} → {WHITE}{BACKUP_DEST}{RESET}")
+    divider()
+
+    cmd = [
+        'rsync', '-av', '--relative',
+        '--files-from', filelist,
+        '/', f'{BACKUP_DEST}/',
+    ]
+    if dry_run:
+        cmd.insert(2, '--dry-run')
+
+    start = time.time()
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    elapsed = time.time() - start
+
+    os.unlink(filelist)
+
+    if result.returncode != 0:
+        print(f"\n  {RED}rsync failed:{RESET}")
+        print(f"  {result.stderr.strip()}")
+        sys.exit(1)
+
+    # Parse rsync output for summary
+    lines = result.stdout.strip().split('\n')
+    transferred = [l for l in lines if not l.startswith('sending') and not l.startswith('total') and not l.startswith('sent') and not l.startswith('created') and l.strip()]
+
+    if dry_run:
+        print(f"\n  {WHITE}Would transfer:{RESET}")
+        for l in transferred[:20]:
+            print(f"    {GRAY}{l}{RESET}")
+        if len(transferred) > 20:
+            print(f"    {GRAY}... and {len(transferred) - 20} more{RESET}")
+    else:
+        # Get total size from rsync output
+        size_line = [l for l in lines if l.startswith('sent')]
+        size_str = size_line[0] if size_line else ''
+        print(f"\n  {GREEN}✓{RESET} Backup complete ({elapsed:.1f}s)")
+        if size_str:
+            print(f"    {GRAY}{size_str}{RESET}")
+        hub_notify("Backup complete", f"{len(cat_counts)} categories synced", source='backup')
+
+    # Sudo files reminder — must use full IP + key since sudo loses SSH aliases
+    backup_host = BACKUP_DEST.split(':')[0] if ':' in BACKUP_DEST else LOCAL_HOST
+    backup_path = BACKUP_DEST.split(':', 1)[1] if ':' in BACKUP_DEST else BACKUP_DEST
+    bk_user = HOSTS.get(backup_host, {}).get('user', backup_host)
+    bk_ip = HOSTS.get(backup_host, {}).get('ip', backup_host)
+    ssh_key = os.path.join(HOME, '.ssh/id_ed25519')
+    sudo_dest = f'{bk_user}@{bk_ip}:{backup_path}/system/'
+    print(f"\n  {WHITE}System files (run manually with sudo):{RESET}")
+    divider()
+    print(f"  {GRAY}sudo rsync -av -e \"ssh -i {ssh_key}\" \\{RESET}")
+    for path, desc in SUDO_FILES:
+        if os.path.exists(path) or path.startswith('/etc/') or path.startswith('/lib/'):
+            print(f"  {GRAY}  {path} \\{RESET}")
+    print(f"  {GRAY}  /root/.config/rustdesk/ \\{RESET}")
+    print(f"  {GRAY}  {sudo_dest}{RESET}")
+
+    print()
+    header_bar()
+
+
+def show_list():
+    """Show all backup categories and files."""
+    print()
+    header_bar()
+    print(f"{BRIGHT_GREEN}  BACKUP MANIFEST{RESET}")
+    header_bar()
+
+    total_size = 0
+    total_files = 0
+
+    for category, desc, paths in MANIFEST:
+        items = []
+        cat_size = 0
+        for p in resolve_manifest_paths(paths):
+            full = os.path.join(HOME, p)
+            if os.path.exists(full):
+                if os.path.isdir(full):
+                    # Count dir contents
+                    for root, dirs, fnames in os.walk(full):
+                        for fn in fnames:
+                            fp = os.path.join(root, fn)
+                            try:
+                                cat_size += os.path.getsize(fp)
+                            except OSError:
+                                pass
+                    items.append(f"{p} (dir)")
+                else:
+                    try:
+                        cat_size += os.path.getsize(full)
+                    except OSError:
+                        pass
+                    items.append(p)
+
+        if not items:
+            continue
+
+        total_size += cat_size
+        total_files += len(items)
+
+        size_str = f"{cat_size / 1024:.0f} KB" if cat_size >= 1024 else f"{cat_size} B"
+        print(f"\n  {CYAN}{category}{RESET}  {GRAY}— {desc} ({size_str}){RESET}")
+        for item in items:
+            print(f"    {GRAY}·{RESET} {item}")
+
+    print(f"\n  {WHITE}System files (sudo required):{RESET}")
+    for path, desc in SUDO_FILES:
+        print(f"    {GRAY}·{RESET} {path}  {DIM}— {desc}{RESET}")
+    print(f"    {GRAY}·{RESET} /root/.config/rustdesk/  {DIM}— RustDesk root config{RESET}")
+
+    total_str = f"{total_size / 1024:.0f} KB" if total_size >= 1024 else f"{total_size} B"
+    print(f"\n  {WHITE}Total:{RESET} {total_files} items, {total_str} (excludes sudo files)")
+    print(f"  {WHITE}Destination:{RESET} {BACKUP_DEST}")
+    print()
+    header_bar()
+
+
+def print_usage():
+    print(f"""
+{WHITE}backup{RESET} — Back up the Orin Nano hub ecosystem to AGX
+
+{WHITE}Usage:{RESET}
+  backup              Run full backup to AGX
+  backup --dry-run    Show what would be transferred
+  backup --list       List all backed-up file categories
+  backup --help       This help
+
+{WHITE}Destination:{RESET} {BACKUP_DEST}
+
+{WHITE}What gets backed up:{RESET}
+  Hub tools, configs, OI profile + library patches, SSH keys,
+  RustDesk config, XFCE/display setup, tab completions,
+  timeline journals, Claude Code memory, Desktop docs.
+
+{WHITE}System files (printed as sudo commands):{RESET}
+  EDID binary, xorg.conf, lightdm.conf, RustDesk service,
+  /root RustDesk config — run the printed commands manually.
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args:
+        print_usage()
+        sys.exit(0)
+
+    if '--list' in args:
+        show_list()
+        sys.exit(0)
+
+    dry_run = '--dry-run' in args
+    run_backup(dry_run=dry_run)
+
+
+if __name__ == '__main__':
+    main()

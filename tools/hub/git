@@ -1,0 +1,2131 @@
+#!/usr/bin/env python3
+"""repo — Unified git management for hub projects.
+
+Provides status dashboard, init, commit, push, pull, log, GitHub repo
+creation, batch checkpoint, deploy, and issue auditing across all 6 projects.
+Commit messages are auto-generated via Ollama when not provided.
+
+Usage:
+    repo                           Unified status dashboard
+    repo status <project>          Detailed status for one project
+    repo init <project>            git init + .gitignore + first commit
+    repo commit <project> ["msg"]  Stage all + commit (LLM message if omitted)
+    repo push <project>            Push to remote
+    repo pull <project>            Pull from remote
+    repo log <project>             Recent commit log
+    repo create <project>          Create GitHub repo + configure remote
+    repo checkpoint ["msg"]        Batch commit+push all dirty projects
+    repo deploy <project>          Commit + push + restart services + health check
+    repo fix <project>             Audit/fix issues (PAT, user config, .gitignore)
+"""
+
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import (
+    PROJECTS, PROJECT_ORDER, HOSTS, LOCAL_HOST, GITHUB_USERNAME, GIT_EMAIL, DEFAULT_MODEL,
+    HUB_CONFIG,
+    GREEN, BRIGHT_GREEN, DIM, YELLOW, RED, CYAN, WHITE, GRAY, RESET, BOLD,
+    HIGHLIGHT_BG, HIGHLIGHT_OFF,
+    ssh_cmd, check_host_reachable, run_parallel, resolve_project,
+    cols, divider, thin_divider, header_bar, print_right, strip_ansi, Spinner,
+    interactive_toggle,
+    fetch_git_status_batch, sanitize_remote_url, extract_github_repo,
+    save_projects, load_projects, reload_projects, ollama_query_text,
+    load_services, probe_service, restart_service, start_service,
+    wait_for_ready, read_deploy_state, write_deploy_state, fetch_git_head,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gitignore templates
+# ─────────────────────────────────────────────────────────────────────────────
+
+GITIGNORE_COMMON = """# OS
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+"""
+
+GITIGNORE_PYTHON = """# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.tox/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+"""
+
+GITIGNORE_JS = """# Node/JS
+node_modules/
+.next/
+dist/
+build/
+.cache/
+*.log
+.env
+.env.local
+.env.*.local
+"""
+
+GITIGNORE_DATA = """# Data / Models
+*.bin
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.gguf
+*.h5
+*.pkl
+*.pickle
+*.parquet
+*.csv
+*.tsv
+*.db
+*.sqlite
+"""
+
+
+def _guess_languages(host_alias, path):
+    """Detect project language(s) by file presence. Returns set of strings."""
+    cmd = (
+        f'cd {path} 2>/dev/null && '
+        f'echo "PY:$(find . -maxdepth 3 -name "*.py" 2>/dev/null | head -1)" && '
+        f'echo "JS:$(find . -maxdepth 3 \\( -name "*.js" -o -name "*.ts" -o -name "*.tsx" \\) 2>/dev/null | head -1)" && '
+        f'echo "PKG:$([ -f package.json ] && echo yes || echo no)" && '
+        f'echo "REQ:$([ -f requirements.txt ] && echo yes || echo no)"'
+    )
+    ok, output = ssh_cmd(host_alias, cmd, timeout=10)
+    langs = set()
+    if ok:
+        for line in output.split('\n'):
+            if line.startswith('PY:') and line[3:].strip():
+                langs.add('python')
+            elif line.startswith('JS:') and line[3:].strip():
+                langs.add('js')
+            elif line.startswith('PKG:yes'):
+                langs.add('js')
+            elif line.startswith('REQ:yes'):
+                langs.add('python')
+    return langs if langs else {'python'}  # default
+
+
+def _build_gitignore(languages):
+    """Build .gitignore content from detected languages."""
+    parts = [GITIGNORE_COMMON.strip()]
+    if 'python' in languages:
+        parts.append(GITIGNORE_PYTHON.strip())
+    if 'js' in languages:
+        parts.append(GITIGNORE_JS.strip())
+    parts.append(GITIGNORE_DATA.strip())
+    return '\n\n'.join(parts) + '\n'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM commit message generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_COMMIT_MSG_SYSTEM = """/no_think
+Write a git commit message for these changes. Follow these conventions exactly:
+
+SUBJECT LINE (required):
+- Max 72 chars, imperative mood ("Add X", "Fix Y", not "Added/Fixes")
+- Name the feature/fix, not the files. Be specific about what changed.
+
+BODY (when changes are non-trivial):
+- Blank line after subject
+- Explain WHY the change was made, not just what files were touched
+- For multi-part changes: use bullet points (- prefix) describing each logical change
+- For single focused changes: 1-3 sentence paragraph explaining context/reasoning
+- Reference specific technical details (function names, config keys, error messages) when they clarify
+
+Study the RECENT COMMITS section to match the project's established style and detail level.
+Output ONLY the commit message, nothing else."""
+
+
+_COMMIT_MSG_PRESETS = {
+    'low':    {'diff_lines': 100, 'diff_ctx': 1, 'ut_files': 3,  'ut_lines': 15, 'recent': 3,  'max_chars': 2000,  'num_predict': 256, 'log_fmt': 'oneline'},
+    'medium': {'diff_lines': 300, 'diff_ctx': 2, 'ut_files': 5,  'ut_lines': 25, 'recent': 5,  'max_chars': 6000,  'num_predict': 384, 'log_fmt': 'full'},
+    'high':   {'diff_lines': 500, 'diff_ctx': 2, 'ut_files': 8,  'ut_lines': 40, 'recent': 8,  'max_chars': 12000, 'num_predict': 512, 'log_fmt': 'full'},
+}
+
+
+def _generate_commit_msg(host_alias, path, model=None, project_key=None):
+    """Generate a commit message from git diff via Ollama. Returns message string or None."""
+    # Read config: detail preset + optional temperature override
+    cm = HUB_CONFIG.get('git', {}).get('commit_msg', {})
+    detail = cm.get('detail', 'medium')
+    preset = _COMMIT_MSG_PRESETS.get(detail, _COMMIT_MSG_PRESETS['medium'])
+    temperature = cm.get('temperature', 0.3)
+
+    diff_lines = preset['diff_lines']
+    diff_ctx = preset['diff_ctx']
+    ut_files = preset['ut_files']
+    ut_lines = preset['ut_lines']
+    recent = preset['recent']
+    max_chars = preset['max_chars']
+    num_predict = preset['num_predict']
+    log_fmt = preset['log_fmt']
+
+    # Gather context: stat, compact diff, untracked files with preview, recent commits
+    if log_fmt == 'full':
+        log_cmd = f'git log --format="COMMIT: %s%n%b%n---" -{recent} 2>/dev/null'
+    else:
+        log_cmd = f'git log --oneline -{recent} 2>/dev/null'
+
+    cmd = (
+        f'cd {path} && '
+        f'echo "===STAT===" && git diff --cached --stat 2>/dev/null && git diff --stat 2>/dev/null && '
+        f'echo "===DIFF===" && {{ git diff --cached -U{diff_ctx} 2>/dev/null; git diff -U{diff_ctx} 2>/dev/null; }} | head -{diff_lines} && '
+        f'echo "===UNTRACKED===" && git ls-files --others --exclude-standard 2>/dev/null | head -30 && '
+        f'echo "===UNTRACKED_PREVIEW===" && git ls-files --others --exclude-standard 2>/dev/null | head -{ut_files} | while IFS= read -r f; do echo "--- $f ---"; head -{ut_lines} "$f" 2>/dev/null; done && '
+        f'echo "===RECENT_COMMITS===" && {log_cmd}'
+    )
+    ok, output = ssh_cmd(host_alias, cmd, timeout=20)
+    if not ok or not output.strip():
+        return None
+
+    # Add project context if available
+    project_context = ''
+    if project_key and project_key in PROJECTS:
+        proj = PROJECTS[project_key]
+        pname = proj.get('name', project_key)
+        tagline = proj.get('tagline', '')
+        if tagline:
+            project_context = f"Project: {pname} — {tagline}\n\n"
+        else:
+            project_context = f"Project: {pname}\n\n"
+
+    # Smart truncation: preserve all sections, trim largest first
+    if len(output) > max_chars:
+        parts = []
+        current_label = ''
+        current_content = []
+        for line in output.split('\n'):
+            if line.startswith('===') and line.endswith('===') and len(line) > 6:
+                if current_label:
+                    parts.append((current_label, '\n'.join(current_content)))
+                current_label = line
+                current_content = []
+            else:
+                current_content.append(line)
+        if current_label:
+            parts.append((current_label, '\n'.join(current_content)))
+
+        while sum(len(l) + len(c) for l, c in parts) > max_chars:
+            largest_idx = max(range(len(parts)), key=lambda i: len(parts[i][1]))
+            label, content = parts[largest_idx]
+            cut_to = int(len(content) * 0.6)
+            parts[largest_idx] = (label, content[:cut_to] + '\n... (truncated)')
+
+        output = '\n'.join(f'{label}\n{content}' for label, content in parts)
+
+    user_msg = f"{project_context}Changes in this commit:\n\n{output}"
+
+    result = ollama_query_text(
+        model=model or DEFAULT_MODEL,
+        system_msg=_COMMIT_MSG_SYSTEM,
+        user_msg=user_msg,
+        timeout=90,
+        temperature=temperature,
+        num_predict=num_predict,
+    )
+
+    if result:
+        # Strip any markdown fences or extra formatting
+        result = result.strip()
+        if result.startswith('```'):
+            lines = result.split('\n')
+            lines = [l for l in lines if not l.strip().startswith('```')]
+            result = '\n'.join(lines).strip()
+    return result or None
+
+
+def _ssh_commit(host_alias, path, message, timeout=30):
+    """Stage all + commit via temp file (handles multi-line messages safely).
+
+    Returns (success, output). Captures both stdout and stderr for error reporting.
+    For local hosts, skips SCP/SSH and runs git directly.
+    """
+    import os as _os
+    import tempfile as _tf
+    import subprocess as _sp
+    import uuid as _uuid
+
+    is_local = (host_alias == LOCAL_HOST)
+    uid = _uuid.uuid4().hex[:8]
+    with _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write(message)
+        tmp_local = f.name
+
+    tmp_remote = f'/tmp/_hub_commit_msg_{uid}.txt'
+    try:
+        if is_local:
+            # Local: use the temp file directly
+            import shutil as _sh
+            _sh.copy2(tmp_local, tmp_remote)
+        else:
+            scp = _sp.run(
+                ['scp', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                 tmp_local, f'{host_alias}:{tmp_remote}'],
+                capture_output=True, text=True, timeout=10
+            )
+            if scp.returncode != 0:
+                return False, f'SCP failed: {scp.stderr.strip()}'
+
+        cmd = f"cd {path} && git add -A && git commit -F {tmp_remote}"
+        try:
+            if is_local:
+                result = _sp.run(
+                    ['bash', '-c', cmd],
+                    capture_output=True, text=True, timeout=timeout
+                )
+            else:
+                result = _sp.run(
+                    ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                     '-o', 'StrictHostKeyChecking=no', host_alias, cmd],
+                    capture_output=True, text=True, timeout=timeout
+                )
+            output = (result.stdout.strip() + '\n' + result.stderr.strip()).strip()
+            return result.returncode == 0, output
+        except _sp.TimeoutExpired:
+            return False, 'timeout'
+    finally:
+        _os.unlink(tmp_local)
+        try:
+            _os.unlink(tmp_remote)
+        except OSError:
+            pass
+        if not is_local:
+            ssh_cmd(host_alias, f'rm -f {tmp_remote}', timeout=5)
+
+
+def _ssh_cmd_with_stderr(host_alias, cmd, timeout=30):
+    """SSH command that captures both stdout and stderr separately.
+
+    Returns (success, stdout, stderr). Unlike ssh_cmd() which drops stderr,
+    this gives callers access to git's error output for better diagnostics.
+    For local hosts, runs via bash directly.
+    """
+    import subprocess as _sp
+    try:
+        if host_alias == LOCAL_HOST:
+            result = _sp.run(
+                ['bash', '-c', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+        else:
+            result = _sp.run(
+                ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                 '-o', 'StrictHostKeyChecking=no', host_alias, cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+        return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+    except _sp.TimeoutExpired:
+        return False, '', 'timeout'
+    except Exception as e:
+        return False, '', str(e)
+
+
+def _check_index_lock(host_alias, path):
+    """Check for stale .git/index.lock. Returns True if clear to proceed."""
+    ok, output = ssh_cmd(host_alias,
+        f'cd {path} && [ -f .git/index.lock ] && stat -c %Y .git/index.lock || echo NONE',
+        timeout=10)
+    if not ok or 'NONE' in (output or ''):
+        return True  # No lock file — clear
+
+    try:
+        lock_mtime = int(output.strip())
+    except ValueError:
+        return True  # Can't parse — assume clear
+
+    import time as _time
+    age = int(_time.time()) - lock_mtime
+
+    if age < 10:
+        print(f"  {YELLOW}●{RESET} index.lock found (age {age}s) — git operation may be in progress")
+        return False
+
+    print(f"  {YELLOW}●{RESET} Stale index.lock found (age {age}s)")
+    try:
+        choice = input(f"    Remove it? (Y/n): ").strip().lower() or 'y'
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+    if choice in ('y', 'yes'):
+        ssh_cmd(host_alias, f'rm -f {path}/.git/index.lock', timeout=5)
+        print(f"    {GREEN}✓{RESET} Removed index.lock")
+        return True
+    return False
+
+
+def _check_large_files(host_alias, path, threshold_mb=95, pre_init=False):
+    """Check for large files and heavy directories. Returns True if clear.
+
+    Uses git status --porcelain for existing repos, or find for pre-init scans.
+    Also scans top-level directories by total size (>500MB threshold).
+    When adding to .gitignore, groups files by parent directory when 3+ share one.
+    """
+    threshold_bytes = threshold_mb * 1024 * 1024
+
+    # Two-part scan: large individual files + heavy directories
+    if pre_init or not _has_git_repo(host_alias, path):
+        # Pre-init: use find for large files (no git available)
+        file_cmd = (
+            f'cd {path} && '
+            f'find . -maxdepth 4 -type f -size +{threshold_mb}M 2>/dev/null | head -50 | '
+            f'while IFS= read -r f; do '
+            f'  s=$(stat -c %s "$f" 2>/dev/null) && echo "$s $f"; '
+            f'done'
+        )
+    else:
+        # Existing repo: scan dirty/untracked files
+        file_cmd = (
+            f'cd {path} && '
+            f'git status --porcelain 2>/dev/null | sed "s/^...//" | '
+            f'while IFS= read -r f; do '
+            f'  [ -f "$f" ] && s=$(stat -c %s "$f" 2>/dev/null) && '
+            f'  [ "$s" -gt {threshold_bytes} ] && echo "$s $f"; '
+            f'done'
+        )
+
+    # Heavy directories: top-level dirs >500MB (always runs, fast du scan)
+    dir_cmd = (
+        f'cd {path} && '
+        f'for d in */; do '
+        f'  [ -d "$d" ] && s=$(du -sb "$d" 2>/dev/null | cut -f1) && '
+        f'  [ "$s" -gt 524288000 ] && echo "$s $d"; '
+        f'done'
+    )
+
+    ok1, file_output = ssh_cmd(host_alias, file_cmd, timeout=20)
+    ok2, dir_output = ssh_cmd(host_alias, dir_cmd, timeout=20)
+
+    # Parse large files
+    large_files = []
+    if ok1 and file_output.strip():
+        for line in file_output.strip().split('\n'):
+            parts = line.strip().split(' ', 1)
+            if len(parts) == 2:
+                try:
+                    large_files.append((parts[1], int(parts[0])))
+                except ValueError:
+                    pass
+
+    # Parse heavy directories
+    heavy_dirs = []
+    if ok2 and dir_output.strip():
+        for line in dir_output.strip().split('\n'):
+            parts = line.strip().split('\t') if '\t' in line else line.strip().split(' ', 1)
+            if len(parts) == 2:
+                try:
+                    heavy_dirs.append((parts[1].rstrip('/'), int(parts[0])))
+                except ValueError:
+                    pass
+
+    # Remove large files that are inside heavy dirs (avoid double-listing)
+    heavy_prefixes = [d + '/' for d, _ in heavy_dirs]
+    large_files = [(f, s) for f, s in large_files
+                   if not any(f.lstrip('./').startswith(p) for p in heavy_prefixes)]
+
+    if not large_files and not heavy_dirs:
+        return True
+
+    # Display findings
+    if heavy_dirs:
+        print(f"\n  {RED}!{RESET} {WHITE}Heavy directories:{RESET}")
+        for dname, size in sorted(heavy_dirs, key=lambda x: -x[1]):
+            gb = size / (1024 * 1024 * 1024)
+            if gb >= 1:
+                print(f"    {YELLOW}{gb:>8.1f}GB{RESET}  {dname}/")
+            else:
+                mb = size / (1024 * 1024)
+                print(f"    {YELLOW}{mb:>8.0f}MB{RESET}  {dname}/")
+
+    if large_files:
+        print(f"\n  {RED}!{RESET} {WHITE}Large files (>{threshold_mb}MB):{RESET}")
+        for fname, size in sorted(large_files, key=lambda x: -x[1])[:15]:
+            mb = size / (1024 * 1024)
+            print(f"    {YELLOW}{mb:>8.1f}MB{RESET}  {fname}")
+        if len(large_files) > 15:
+            print(f"    {DIM}... and {len(large_files) - 15} more{RESET}")
+
+    print(f"\n    {CYAN}[a]{RESET}dd to .gitignore (default)  {CYAN}[s]{RESET}kip  {CYAN}[q]{RESET}uit")
+    try:
+        choice = input(f"    Choice [a]: ").strip().lower() or 'a'
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+    if choice in ('q', 'quit'):
+        return False
+    elif choice in ('a', 'add'):
+        # Build gitignore entries: use directory/ when 3+ files share a parent
+        entries = set()
+        # Add heavy dirs directly
+        for dname, _ in heavy_dirs:
+            entries.add(dname.lstrip('./') + '/')
+
+        # Group remaining large files by parent dir
+        from collections import Counter
+        parents = Counter()
+        for fname, _ in large_files:
+            clean = fname.lstrip('./')
+            parent = '/'.join(clean.split('/')[:-1])
+            if parent:
+                parents[parent] += 1
+
+        for fname, _ in large_files:
+            clean = fname.lstrip('./')
+            parent = '/'.join(clean.split('/')[:-1])
+            if parent and parents[parent] >= 3:
+                entries.add(parent + '/')
+            else:
+                entries.add(clean)
+
+        sorted_entries = '\n'.join(sorted(entries))
+        append_cmd = (
+            f"cd {path} && cat >> .gitignore << 'LARGE_EOF'\n\n"
+            f"# Heavy content (auto-excluded by repo tool)\n"
+            f"{sorted_entries}\n"
+            f"LARGE_EOF"
+        )
+        ssh_cmd(host_alias, append_cmd, timeout=10)
+
+        # Summary
+        dir_count = sum(1 for e in entries if e.endswith('/'))
+        file_count = len(entries) - dir_count
+        total_size = sum(s for _, s in heavy_dirs) + sum(s for _, s in large_files)
+        total_gb = total_size / (1024 * 1024 * 1024)
+        parts = []
+        if dir_count:
+            parts.append(f"{dir_count} dir(s)")
+        if file_count:
+            parts.append(f"{file_count} file(s)")
+        print(f"    {GREEN}✓{RESET} Added {' + '.join(parts)} to .gitignore ({total_gb:.1f}GB excluded)")
+        return True
+    else:
+        # skip — proceed anyway
+        return True
+
+
+def _has_git_repo(host_alias, path):
+    """Quick check if path has a .git directory."""
+    ok, out = ssh_cmd(host_alias, f'[ -d {path}/.git ] && echo Y || echo N', timeout=5)
+    return ok and 'Y' in (out or '')
+
+
+def _check_remote_auth(host_alias, path, remote_url):
+    """Check remote URL for auth issues: PAT tokens or bare HTTPS without credentials.
+
+    Returns True if clear to proceed.
+    """
+    if not remote_url:
+        return True
+
+    repo = extract_github_repo(remote_url)
+    has_pat = any(tok in remote_url for tok in ('ghp_', 'gho_', 'github_pat_'))
+    is_https = remote_url.startswith('https://')
+    is_ssh = remote_url.startswith('git@')
+
+    # SSH remotes are fine
+    if is_ssh:
+        return True
+
+    # No issue detected for non-GitHub remotes
+    if not repo:
+        return True
+
+    if has_pat:
+        print(f"\n  {RED}!{RESET} PAT token detected in remote URL")
+        print(f"    {GRAY}{sanitize_remote_url(remote_url)}{RESET}")
+    elif is_https:
+        # Check if HTTPS will actually work (credential helper or token)
+        ok_cred, cred_out = ssh_cmd(host_alias,
+            'git config --global credential.helper 2>/dev/null', timeout=5)
+        has_cred_helper = ok_cred and cred_out.strip()
+        if has_cred_helper:
+            return True  # Credential helper configured — HTTPS should work
+        print(f"\n  {YELLOW}●{RESET} HTTPS remote without credentials (push will fail)")
+        print(f"    {GRAY}{remote_url}{RESET}")
+    else:
+        return True
+
+    print(f"\n    {CYAN}[f]{RESET}ix now (default)  {CYAN}[c]{RESET}ontinue  {CYAN}[q]{RESET}uit")
+    try:
+        choice = input(f"    Choice [f]: ").strip().lower() or 'f'
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+    if choice in ('q', 'quit'):
+        return False
+    elif choice in ('c', 'continue'):
+        return True
+    elif choice in ('f', 'fix') and repo:
+        # Check SSH auth on the host
+        ok_ssh, ssh_out = ssh_cmd(host_alias,
+            'ssh -T -o BatchMode=yes -o ConnectTimeout=5 git@github.com 2>&1 || true',
+            timeout=15)
+        github_ssh_ok = 'successfully authenticated' in (ssh_out or '').lower()
+
+        if github_ssh_ok:
+            new_url = f'git@github.com:{repo}.git'
+            ok_fix, _ = ssh_cmd(host_alias, f'cd {path} && git remote set-url origin {new_url}', timeout=10)
+            if ok_fix:
+                print(f"    {GREEN}✓{RESET} Switched to SSH: {new_url}")
+                return True
+            else:
+                print(f"    {RED}✗ Failed to update remote{RESET}")
+                return False
+        else:
+            if has_pat:
+                # At least strip the PAT
+                new_url = f'https://github.com/{repo}.git'
+                ssh_cmd(host_alias, f'cd {path} && git remote set-url origin {new_url}', timeout=10)
+                print(f"    {GREEN}✓{RESET} Stripped PAT (still HTTPS — set up SSH key for push)")
+            else:
+                print(f"    {YELLOW}●{RESET} No SSH key on this host — set one up:")
+                print(f"      {DIM}ssh-keygen -t ed25519 && cat ~/.ssh/id_ed25519.pub{RESET}")
+                print(f"      {DIM}Then add to github.com/settings/keys{RESET}")
+            return True
+    else:
+        return True
+
+
+def _prompt_commit_msg(generated_msg):
+    """Show generated message and prompt user to accept/edit/type/quit.
+
+    Returns commit message string, or None if user cancels.
+    """
+    print(f"\n    {WHITE}Generated:{RESET} {generated_msg.split(chr(10))[0]}")
+    if '\n' in generated_msg:
+        for line in generated_msg.split('\n')[1:]:
+            print(f"               {line}")
+
+    print(f"\n    {CYAN}[a]{RESET}ccept  {CYAN}[e]{RESET}dit  {CYAN}[t]{RESET}ype own  {CYAN}[q]{RESET}uit")
+    try:
+        choice = input(f"    Choice [a]: ").strip().lower() or 'a'
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+    if choice in ('a', 'accept'):
+        return generated_msg
+    elif choice in ('e', 'edit'):
+        # Show first line as editable default
+        first_line = generated_msg.split('\n')[0]
+        try:
+            edited = input(f"    Message [{first_line}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        return edited if edited else first_line
+    elif choice in ('t', 'type'):
+        try:
+            typed = input(f"    Message: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        return typed if typed else None
+    else:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _probe_all_hosts():
+    """Probe reachability of all unique hosts. Returns {host_key: bool}."""
+    hosts = set()
+    for pk in PROJECT_ORDER:
+        hosts.add(PROJECTS[pk]['host'])
+    return run_parallel({h: (lambda h=h: check_host_reachable(h)) for h in hosts})
+
+
+def _fetch_all_status(host_reachable):
+    """Fetch git status for all projects, one SSH call per host.
+
+    Returns {project_key: status_dict}.
+    """
+    # Group projects by host
+    by_host = {}
+    for pk in PROJECT_ORDER:
+        proj = PROJECTS[pk]
+        host = proj['host']
+        by_host.setdefault(host, []).append((pk, proj))
+
+    # Fetch in parallel per host
+    tasks = {}
+    for host, entries in by_host.items():
+        if host_reachable.get(host, False):
+            tasks[host] = (lambda h=host, e=entries: fetch_git_status_batch(h, e))
+
+    results = run_parallel(tasks) if tasks else {}
+
+    # Flatten into per-project dict
+    all_status = {}
+    for host, host_results in results.items():
+        if isinstance(host_results, dict):
+            all_status.update(host_results)
+    return all_status
+
+
+def render_dashboard():
+    """Render unified git status dashboard."""
+    now = datetime.now().strftime('%a %d %b %H:%M')
+
+    with Spinner('Probing hosts...'):
+        host_reachable = _probe_all_hosts()
+
+    with Spinner('Fetching git status...'):
+        all_status = _fetch_all_status(host_reachable)
+
+    print()
+    header_bar()
+    print_right(f"{BRIGHT_GREEN}  GIT STATUS{RESET}", f"{BRIGHT_GREEN}{now}{RESET}")
+    header_bar()
+    print()
+
+    # Table header
+    print(f"  {GRAY}{'Project':<14s}{'Branch':<10s}{'Dirty':>6s}{'Commits':>9s}  {'Remote':<28s}{'Host':<5s}{RESET}")
+    print(f"  {GRAY}{'─' * 74}{RESET}")
+
+    warnings = []
+
+    for pk in PROJECT_ORDER:
+        proj = PROJECTS[pk]
+        host_name = HOSTS[proj['host']]['alias'].upper()
+        st = all_status.get(pk)
+
+        if not host_reachable.get(proj['host'], False):
+            print(f"  {DIM}{pk:<14s}{'—':<10s}{'—':>6s}{'—':>9s}  {'—':<28s}{host_name:<5s}{RESET}  {YELLOW}offline{RESET}")
+            continue
+
+        if not st or not st.get('is_git'):
+            print(f"  {DIM}{pk:<14s}{'—':<10s}{'—':>6s}{'—':>9s}  {'—':<28s}{host_name:<5s}{RESET}")
+            if st is not None:
+                # Directory exists but not a git repo
+                warnings.append(f"  {GRAY}●{RESET} {WHITE}{pk}{RESET}: not a git repo — run {CYAN}repo init {pk}{RESET}")
+            continue
+
+        branch = st.get('branch', '—') or '—'
+        dirty = st.get('dirty', 0) + st.get('untracked', 0)
+        commits = st.get('commits', 0)
+        remote_url = st.get('remote_url', '')
+        has_pat = st.get('has_pat', False)
+        ahead = st.get('ahead', 0)
+        behind = st.get('behind', 0)
+
+        # Format remote display
+        if remote_url:
+            repo_short = extract_github_repo(remote_url)
+            if repo_short:
+                # Truncate if too long
+                if len(repo_short) > 26:
+                    repo_short = '...' + repo_short[-(26 - 3):]
+                remote_display = repo_short
+            else:
+                remote_display = sanitize_remote_url(remote_url)[:26]
+        else:
+            remote_display = '—'
+
+        # Color coding
+        branch_str = f"{WHITE}{branch:<10s}{RESET}" if branch != '—' else f"{DIM}{'—':<10s}{RESET}"
+        dirty_str = f"{YELLOW}{dirty:>6d}{RESET}" if dirty > 0 else f"{GREEN}{'0':>6s}{RESET}"
+        commits_str = f"{WHITE}{commits:>9d}{RESET}" if commits > 0 else f"{DIM}{'0':>9s}{RESET}"
+        remote_str = f"{GRAY}{remote_display:<28s}{RESET}" if remote_display != '—' else f"{DIM}{'—':<28s}{RESET}"
+
+        # Suffix indicators
+        suffix_parts = []
+        if has_pat:
+            suffix_parts.append(f"{RED}PAT{RESET}")
+        if isinstance(ahead, int) and ahead > 0:
+            suffix_parts.append(f"{CYAN}↑{ahead}{RESET}")
+        if isinstance(behind, int) and behind > 0:
+            suffix_parts.append(f"{YELLOW}↓{behind}{RESET}")
+        deploy_state = read_deploy_state(pk)
+        if deploy_state and st.get('head') and deploy_state.get('head') != st.get('head'):
+            suffix_parts.append(f"{YELLOW}stale{RESET}")
+        suffix = '  ' + ' '.join(suffix_parts) if suffix_parts else ''
+
+        print(f"  {WHITE}{pk:<14s}{RESET}{branch_str}{dirty_str}{commits_str}  {remote_str}{host_name:<5s}{suffix}")
+
+        # Collect warnings
+        if has_pat:
+            warnings.append(f"  {RED}!{RESET} {WHITE}{pk}{RESET}: PAT token in remote URL — run {CYAN}repo fix {pk}{RESET}")
+        if commits == 0 and st['is_git']:
+            warnings.append(f"  {GRAY}●{RESET} {WHITE}{pk}{RESET}: initialized but no commits — run {CYAN}repo init {pk}{RESET}")
+        if not remote_url and commits > 0:
+            warnings.append(f"  {GRAY}●{RESET} {WHITE}{pk}{RESET}: no remote — run {CYAN}repo create {pk}{RESET}")
+
+    if warnings:
+        print()
+        print(f"  {WHITE}Warnings:{RESET}")
+        for w in warnings:
+            print(w)
+
+    print()
+    header_bar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# repo status <project>
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_project_status(key):
+    """Detailed git status for a single project."""
+    proj = PROJECTS[key]
+    host = proj['host']
+    host_alias = HOSTS[host]['alias']
+
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {HOSTS[host]['name']} is offline{RESET}")
+        return
+
+    # Get detailed status with a richer SSH command
+    cmd = f'''cd {proj['path']} 2>/dev/null || {{ echo "NO_DIR"; exit 1; }}
+if [ ! -d .git ]; then echo "NOT_GIT"; exit 0; fi
+echo "===BASIC==="
+echo "BRANCH:$(git symbolic-ref --short HEAD 2>/dev/null || echo 'detached')"
+echo "HEAD:$(git rev-parse --short HEAD 2>/dev/null)"
+echo "COMMITS:$(git rev-list --count HEAD 2>/dev/null || echo '0')"
+echo "REMOTE:$(git remote get-url origin 2>/dev/null || echo '')"
+echo "===USER==="
+echo "NAME:$(git config user.name 2>/dev/null)"
+echo "EMAIL:$(git config user.email 2>/dev/null)"
+echo "===STATUS==="
+git status --porcelain 2>/dev/null | head -30
+echo "===LOG==="
+git log --oneline -5 2>/dev/null
+echo "===GITIGNORE==="
+[ -f .gitignore ] && echo "EXISTS" || echo "MISSING"
+echo "===STASH==="
+git stash list 2>/dev/null | wc -l | tr -d ' '
+'''
+    ok, output = ssh_cmd(host_alias, cmd, timeout=15)
+    if not ok:
+        print(f"\n  {RED}Failed to query {HOSTS[host]['name']}{RESET}")
+        return
+
+    if 'NO_DIR' in output:
+        print(f"\n  {RED}Directory not found: {proj['path']}{RESET}")
+        return
+
+    if 'NOT_GIT' in output:
+        print(f"\n  {YELLOW}{proj['name']}{RESET} ({key}) — {DIM}not a git repository{RESET}")
+        print(f"  {GRAY}Run {CYAN}repo init {key}{GRAY} to initialize{RESET}")
+        return
+
+    # Parse sections
+    sections = {}
+    current_section = None
+    for line in output.split('\n'):
+        if line.startswith('===') and line.endswith('==='):
+            current_section = line.strip('= ')
+            sections[current_section] = []
+        elif current_section:
+            sections.setdefault(current_section, []).append(line)
+
+    # Extract fields
+    basic = {}
+    for line in sections.get('BASIC', []):
+        if ':' in line:
+            k, v = line.split(':', 1)
+            basic[k] = v.strip()
+
+    user = {}
+    for line in sections.get('USER', []):
+        if ':' in line:
+            k, v = line.split(':', 1)
+            user[k] = v.strip()
+
+    status_lines = [l for l in sections.get('STATUS', []) if l.strip()]
+    log_lines = [l for l in sections.get('LOG', []) if l.strip()]
+    gitignore = 'EXISTS' in '\n'.join(sections.get('GITIGNORE', []))
+    stash_count = 0
+    for line in sections.get('STASH', []):
+        if line.strip().isdigit():
+            stash_count = int(line.strip())
+
+    remote_url = basic.get('REMOTE', '')
+    has_pat = bool(remote_url and 'ghp_' in remote_url)
+
+    print()
+    header_bar()
+    print(f"  {BRIGHT_GREEN}{proj['name']}{RESET}  {GRAY}({key}){RESET}")
+    print(f"  {GRAY}{HOSTS[host]['name']}:{proj['path']}{RESET}")
+    header_bar()
+
+    # Branch & head
+    branch = basic.get('BRANCH', '?')
+    head = basic.get('HEAD', '?')
+    commits = basic.get('COMMITS', '?')
+    print(f"\n  {WHITE}Branch{RESET}     {CYAN}{branch}{RESET}  @{head}  ({commits} commits)")
+
+    # Remote
+    if remote_url:
+        display_url = sanitize_remote_url(remote_url)
+        repo = extract_github_repo(remote_url)
+        if has_pat:
+            print(f"  {WHITE}Remote{RESET}     {display_url}  {RED}! PAT token{RESET}")
+        else:
+            print(f"  {WHITE}Remote{RESET}     {display_url}")
+        if repo:
+            print(f"  {WHITE}GitHub{RESET}     {repo}")
+    else:
+        print(f"  {WHITE}Remote{RESET}     {DIM}none{RESET}")
+
+    # User config
+    uname = user.get('NAME', '')
+    uemail = user.get('EMAIL', '')
+    if uname or uemail:
+        print(f"  {WHITE}User{RESET}       {uname} <{uemail}>")
+
+    # Gitignore
+    print(f"  {WHITE}.gitignore{RESET} {GREEN}present{RESET}" if gitignore else f"  {WHITE}.gitignore{RESET} {YELLOW}missing{RESET}")
+
+    # Stash
+    if stash_count > 0:
+        print(f"  {WHITE}Stash{RESET}      {stash_count} entries")
+
+    # Dirty files
+    modified = [l for l in status_lines if l and not l.startswith('?')]
+    untracked = [l for l in status_lines if l and l.startswith('?')]
+    total_dirty = len(modified) + len(untracked)
+    if total_dirty > 0:
+        print(f"\n  {WHITE}Working tree{RESET}  {YELLOW}{total_dirty} dirty{RESET} ({len(modified)} modified, {len(untracked)} untracked)")
+        for line in status_lines[:15]:
+            print(f"    {GRAY}{line}{RESET}")
+        if len(status_lines) > 15:
+            print(f"    {DIM}... and {len(status_lines) - 15} more{RESET}")
+    else:
+        print(f"\n  {WHITE}Working tree{RESET}  {GREEN}clean{RESET}")
+
+    # Recent log
+    if log_lines:
+        print(f"\n  {WHITE}Recent commits{RESET}")
+        for line in log_lines:
+            print(f"    {GRAY}{line}{RESET}")
+
+    # Suggestions
+    suggestions = []
+    if has_pat:
+        suggestions.append(f"repo fix {key}     — remove PAT from remote URL")
+    if not gitignore:
+        suggestions.append(f"repo fix {key}     — generate .gitignore")
+    if not remote_url and int(basic.get('COMMITS', '0')) > 0:
+        suggestions.append(f"repo create {key}  — create GitHub repo + remote")
+    if total_dirty > 0:
+        suggestions.append(f"repo commit {key}  — commit changes")
+
+    if suggestions:
+        print(f"\n  {WHITE}Suggestions{RESET}")
+        for s in suggestions:
+            print(f"    {CYAN}{s}{RESET}")
+
+    print()
+    header_bar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# repo init <project>
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_init(key):
+    """Initialize a git repo for a project."""
+    proj = PROJECTS[key]
+    host = proj['host']
+    host_alias = HOSTS[host]['alias']
+    path = proj['path']
+
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {HOSTS[host]['name']} is offline{RESET}")
+        return
+
+    # Check current state
+    ok, output = ssh_cmd(host_alias, f'cd {path} 2>/dev/null && [ -d .git ] && echo GIT || echo NOGIT', timeout=8)
+    if not ok:
+        print(f"\n  {RED}Cannot access {path} on {HOSTS[host]['name']}{RESET}")
+        return
+
+    has_git = 'GIT' in output.strip()
+
+    if has_git:
+        # Check if there are commits
+        ok, commits_out = ssh_cmd(host_alias, f'cd {path} && git rev-list --count HEAD 2>/dev/null || echo 0', timeout=8)
+        commit_count = 0
+        if ok:
+            try:
+                commit_count = int(commits_out.strip())
+            except ValueError:
+                pass
+
+        if commit_count > 0:
+            print(f"\n  {GREEN}✓{RESET} {WHITE}{key}{RESET} is already a git repo with {commit_count} commits")
+            print(f"  {GRAY}Use {CYAN}repo status {key}{GRAY} for details{RESET}")
+            return
+        else:
+            print(f"\n  {YELLOW}●{RESET} {WHITE}{key}{RESET} has a .git directory but no commits (incomplete init)")
+            wipe = input(f"  {WHITE}Remove .git and start fresh? (y/N): {RESET}").strip().lower()
+            if wipe in ('y', 'yes'):
+                ok_rm, _ = ssh_cmd(host_alias, f'cd {path} && rm -rf .git', timeout=10)
+                if ok_rm:
+                    print(f"  {GREEN}✓{RESET} Removed stale .git — continuing with fresh init")
+                    has_git = False
+                else:
+                    print(f"  {RED}✗ Failed to remove .git{RESET}")
+                    return
+    else:
+        print(f"\n  {CYAN}Initializing git repo for {WHITE}{proj['name']}{CYAN}...{RESET}")
+
+    # Detect languages
+    with Spinner('Detecting project type...'):
+        langs = _guess_languages(host_alias, path)
+    lang_str = ', '.join(sorted(langs))
+    print(f"  {GRAY}Detected: {lang_str}{RESET}")
+
+    # Generate .gitignore
+    gitignore_content = _build_gitignore(langs)
+
+    # Build init command
+    init_parts = []
+    if not has_git:
+        init_parts.append(f'cd {path} && git init')
+    else:
+        init_parts.append(f'cd {path}')
+
+    # Write .gitignore (check if one already exists)
+    ok_gi, gi_out = ssh_cmd(host_alias, f'[ -f {path}/.gitignore ] && echo EXISTS || echo MISSING', timeout=5)
+    if 'MISSING' in gi_out:
+        # Use heredoc to write gitignore
+        init_parts.append(f"cat > .gitignore << 'GITIGNORE_EOF'\n{gitignore_content}GITIGNORE_EOF")
+        print(f"  {GREEN}+{RESET} Creating .gitignore ({lang_str})")
+
+    # Set user config if not set
+    init_parts.append(f'git config user.name "{GITHUB_USERNAME}" 2>/dev/null')
+    init_parts.append(f'git config user.email "{GIT_EMAIL}" 2>/dev/null')
+
+    # Pre-flight: check for large files/heavy dirs before staging
+    if not _check_large_files(host_alias, path, pre_init=True):
+        return
+
+    # Stage and commit
+    init_parts.append('git add -A')
+    init_parts.append('git commit -m "Initial commit"')
+
+    full_cmd = ' && '.join(init_parts)
+
+    with Spinner('Initializing...'):
+        ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, full_cmd, timeout=30)
+
+    output = (stdout + '\n' + stderr).strip()
+    if ok:
+        print(f"  {GREEN}✓{RESET} Repository initialized and first commit created")
+        # Show summary
+        ok2, summary = ssh_cmd(host_alias, f'cd {path} && git log --oneline -1 && echo "FILES:$(git ls-files | wc -l | tr -d " ")"', timeout=8)
+        if ok2:
+            for line in summary.split('\n'):
+                if line.startswith('FILES:'):
+                    print(f"  {GRAY}{line[6:]} files tracked{RESET}")
+                elif line.strip():
+                    print(f"  {GRAY}{line}{RESET}")
+        print(f"\n  {GRAY}Next: {CYAN}repo create {key}{GRAY} to push to GitHub{RESET}")
+    else:
+        print(f"  {RED}✗ Init failed{RESET}")
+        if output:
+            for line in output.split('\n'):
+                if line.strip():
+                    print(f"    {GRAY}{line}{RESET}")
+        # Run diagnostics to help the user understand the state
+        diag_cmd = f'cd {path} && echo "=== git status ===" && git status 2>&1 && echo "=== git log ===" && git log --oneline -1 2>&1'
+        ok_diag, diag_out = ssh_cmd(host_alias, diag_cmd, timeout=8)
+        if ok_diag and diag_out:
+            print(f"\n  {YELLOW}Diagnostics:{RESET}")
+            for line in diag_out.strip().split('\n'):
+                print(f"    {GRAY}{line}{RESET}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# repo commit <project> "msg"
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_commit(key, message=None):
+    """Stage all changes and commit. If no message, generate via LLM."""
+    proj = PROJECTS[key]
+    host = proj['host']
+    host_alias = HOSTS[host]['alias']
+    path = proj['path']
+
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {HOSTS[host]['name']} is offline{RESET}")
+        return
+
+    # Check it's a git repo with changes
+    ok, check = ssh_cmd(host_alias,
+        f'cd {path} && [ -d .git ] && echo GIT || echo NOGIT && git status --porcelain 2>/dev/null | wc -l | tr -d " "',
+        timeout=10)
+    if not ok or 'NOGIT' in check:
+        print(f"\n  {RED}{key} is not a git repository{RESET}")
+        return
+
+    lines = check.strip().split('\n')
+    dirty_count = 0
+    for line in lines:
+        if line.strip().isdigit():
+            dirty_count = int(line.strip())
+
+    if dirty_count == 0:
+        print(f"\n  {GREEN}✓{RESET} {WHITE}{key}{RESET} — nothing to commit (working tree clean)")
+        return
+
+    # Pre-flight checks
+    if not _check_index_lock(host_alias, path):
+        return
+    if not _check_large_files(host_alias, path):
+        return
+
+    # Get or generate commit message
+    if not message:
+        with Spinner('Generating commit message...'):
+            generated = _generate_commit_msg(host_alias, path, project_key=key)
+        if generated:
+            message = _prompt_commit_msg(generated)
+        if not message:
+            # LLM failed or user cancelled — ask for manual input
+            if not generated:
+                print(f"\n  {YELLOW}●{RESET} Could not generate message (AGX offline?)")
+            try:
+                message = input(f"  Commit message: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if not message:
+                print(f"  {GRAY}Cancelled{RESET}")
+                return
+
+    with Spinner(f'Committing {dirty_count} changes...'):
+        ok, output = _ssh_commit(host_alias, path, message)
+
+    if ok:
+        print(f"\n  {GREEN}✓{RESET} {WHITE}{key}{RESET} — committed")
+        # Parse commit output for stats
+        for line in output.split('\n'):
+            line = line.strip()
+            if 'file' in line and ('changed' in line or 'insertion' in line or 'deletion' in line):
+                print(f"  {GRAY}{line}{RESET}")
+            elif line.startswith('['):
+                print(f"  {GRAY}{line}{RESET}")
+    else:
+        print(f"\n  {RED}✗ Commit failed{RESET}")
+        if output:
+            for line in output.split('\n')[-5:]:
+                if line.strip():
+                    print(f"    {GRAY}{line}{RESET}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# repo push <project>
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_push(key):
+    """Push to remote."""
+    proj = PROJECTS[key]
+    host = proj['host']
+    host_alias = HOSTS[host]['alias']
+    path = proj['path']
+
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {HOSTS[host]['name']} is offline{RESET}")
+        return
+
+    # Check remote
+    ok, remote = ssh_cmd(host_alias, f'cd {path} && git remote get-url origin 2>/dev/null', timeout=8)
+    if not ok or not remote.strip():
+        print(f"\n  {YELLOW}●{RESET} {WHITE}{key}{RESET} has no remote configured")
+        print(f"  {GRAY}Run {CYAN}repo create {key}{GRAY} to create a GitHub repo{RESET}")
+        return
+
+    # Pre-flight: PAT check
+    if not _check_remote_auth(host_alias, path, remote.strip()):
+        return
+
+    # Check for upstream tracking
+    ok_up, upstream = ssh_cmd(host_alias, f'cd {path} && git rev-parse --abbrev-ref @{{upstream}} 2>/dev/null', timeout=8)
+    if not ok_up or not upstream.strip():
+        # Need to set upstream
+        ok_br, branch = ssh_cmd(host_alias, f'cd {path} && git symbolic-ref --short HEAD 2>/dev/null', timeout=8)
+        branch_name = branch.strip() if ok_br and branch.strip() else 'main'
+        push_cmd = f'cd {path} && git push -u origin {branch_name}'
+    else:
+        push_cmd = f'cd {path} && git push'
+
+    with Spinner('Pushing...'):
+        ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, push_cmd, timeout=60)
+
+    output = (stdout + '\n' + stderr).strip()
+    if ok:
+        print(f"\n  {GREEN}✓{RESET} {WHITE}{key}{RESET} — pushed successfully")
+        if output:
+            for line in output.split('\n'):
+                if line.strip() and ('→' in line or '->' in line or 'branch' in line.lower()):
+                    print(f"  {GRAY}{line.strip()}{RESET}")
+    else:
+        print(f"\n  {RED}✗ Push failed{RESET}")
+        if stderr:
+            for line in stderr.split('\n')[-5:]:
+                if line.strip():
+                    print(f"    {RED}{line}{RESET}")
+        elif output:
+            for line in output.split('\n')[-5:]:
+                if line.strip():
+                    print(f"    {GRAY}{line}{RESET}")
+        print(f"\n  {GRAY}Check SSH/HTTPS auth on {HOSTS[host]['name']}{RESET}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# repo pull <project>
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_pull(key):
+    """Pull from remote."""
+    proj = PROJECTS[key]
+    host = proj['host']
+    host_alias = HOSTS[host]['alias']
+    path = proj['path']
+
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {HOSTS[host]['name']} is offline{RESET}")
+        return
+
+    ok, remote = ssh_cmd(host_alias, f'cd {path} && git remote get-url origin 2>/dev/null', timeout=8)
+    if not ok or not remote.strip():
+        print(f"\n  {YELLOW}●{RESET} {WHITE}{key}{RESET} has no remote configured")
+        return
+
+    with Spinner('Pulling...'):
+        ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, f'cd {path} && git pull', timeout=60)
+
+    output = (stdout + '\n' + stderr).strip()
+    if ok:
+        if 'Already up to date' in output:
+            print(f"\n  {GREEN}✓{RESET} {WHITE}{key}{RESET} — already up to date")
+        else:
+            print(f"\n  {GREEN}✓{RESET} {WHITE}{key}{RESET} — pulled successfully")
+            if output:
+                for line in output.split('\n'):
+                    if line.strip():
+                        print(f"  {GRAY}{line.strip()}{RESET}")
+    else:
+        print(f"\n  {RED}✗ Pull failed{RESET}")
+        if stderr:
+            for line in stderr.split('\n')[-5:]:
+                if line.strip():
+                    print(f"    {RED}{line}{RESET}")
+        elif output:
+            for line in output.split('\n')[-5:]:
+                if line.strip():
+                    print(f"    {GRAY}{line}{RESET}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# repo log <project>
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_log(key):
+    """Show recent commit log with subject + body."""
+    proj = PROJECTS[key]
+    host = proj['host']
+    host_alias = HOSTS[host]['alias']
+    path = proj['path']
+
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {HOSTS[host]['name']} is offline{RESET}")
+        return
+
+    # Format: hash, relative date, subject, body (separated by markers)
+    fmt = '===COMMIT===%n%C(auto)%h %C(dim)%ar%C(reset)%n%s%n%b'
+    ok, output = ssh_cmd(host_alias,
+        f'cd {path} && git log --reverse --format="{fmt}" -15 2>/dev/null',
+        timeout=10)
+
+    if not ok or not output.strip():
+        print(f"\n  {YELLOW}●{RESET} {WHITE}{key}{RESET} — no git log available")
+        return
+
+    print(f"\n  {WHITE}{proj['name']}{RESET}  {GRAY}({key}){RESET}")
+
+    commits = output.split('===COMMIT===')
+    for block in commits:
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.split('\n')
+        if len(lines) < 2:
+            continue
+        # Line 0: hash + relative date, Line 1: subject, Line 2+: body
+        header = lines[0].strip()
+        subject = lines[1].strip() if len(lines) > 1 else ''
+        body_lines = [l.strip() for l in lines[2:] if l.strip()]
+
+        print(f"\n  {CYAN}{header}{RESET}")
+        print(f"  {WHITE}{subject}{RESET}")
+        for bl in body_lines:
+            print(f"    {GRAY}{bl}{RESET}")
+
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# repo create <project>
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_create(key):
+    """Create GitHub repo via WS gh CLI and configure remote on project host."""
+    proj = PROJECTS[key]
+    host = proj['host']
+    host_alias = HOSTS[host]['alias']
+    path = proj['path']
+
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {HOSTS[host]['name']} is offline{RESET}")
+        return
+
+    # Check WS is reachable (needed for gh CLI)
+    if not check_host_reachable('ws'):
+        print(f"\n  {RED}● Workstation is offline — needed for GitHub CLI{RESET}")
+        print(f"  {GRAY}Wake it with {WHITE}wake-ws{RESET}")
+        return
+
+    # Check current state
+    ok, remote = ssh_cmd(host_alias, f'cd {path} && git remote get-url origin 2>/dev/null', timeout=8)
+    if ok and remote.strip():
+        repo = extract_github_repo(remote.strip())
+        print(f"\n  {YELLOW}●{RESET} {WHITE}{key}{RESET} already has a remote: {repo or remote.strip()}")
+        return
+
+    # Check it's a git repo
+    ok, git_check = ssh_cmd(host_alias, f'cd {path} && [ -d .git ] && echo GIT || echo NOGIT', timeout=8)
+    if 'NOGIT' in (git_check or ''):
+        print(f"\n  {RED}{key} is not a git repo — run {CYAN}repo init {key}{RED} first{RESET}")
+        return
+
+    # Derive repo name
+    default_name = key
+    try:
+        name = input(f"\n  GitHub repo name [{WHITE}{default_name}{RESET}]: ").strip() or default_name
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    tagline = proj.get('tagline', '')
+    safe_tagline = tagline.replace('"', '\\"') if tagline else ''
+
+    # Confirm
+    print(f"\n  {WHITE}Will create:{RESET}")
+    print(f"    Repository: {CYAN}{GITHUB_USERNAME}/{name}{RESET}")
+    print(f"    Visibility: {WHITE}private{RESET}")
+    if tagline:
+        print(f"    Description: {GRAY}{tagline}{RESET}")
+    print(f"    Remote on:  {HOSTS[host]['name']} ({path})")
+
+    try:
+        confirm = input(f"\n  Proceed? (Y/n): ").strip().lower() or 'y'
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if confirm not in ('y', 'yes'):
+        print(f"  {GRAY}Cancelled{RESET}")
+        return
+
+    # Create repo via WS
+    desc_flag = f' -d "{safe_tagline}"' if tagline else ''
+    gh_cmd = f'gh repo create {GITHUB_USERNAME}/{name} --private{desc_flag} --confirm 2>&1'
+
+    with Spinner('Creating GitHub repo via WS...'):
+        ok, output = ssh_cmd('ws', gh_cmd, timeout=30)
+
+    if not ok:
+        # gh might not have --confirm flag in older versions, try without
+        gh_cmd_alt = f'gh repo create {GITHUB_USERNAME}/{name} --private{desc_flag} 2>&1'
+        ok, output = ssh_cmd('ws', gh_cmd_alt, timeout=30)
+
+    if not ok:
+        print(f"\n  {RED}✗ Failed to create GitHub repo{RESET}")
+        if output:
+            for line in output.split('\n')[-3:]:
+                if line.strip():
+                    print(f"    {GRAY}{line}{RESET}")
+        return
+
+    # Check if repo was created or already exists
+    if 'already exists' in output.lower():
+        print(f"\n  {YELLOW}●{RESET} Repository {GITHUB_USERNAME}/{name} already exists")
+    else:
+        print(f"\n  {GREEN}✓{RESET} Created {GITHUB_USERNAME}/{name}")
+
+    # Configure remote on the project's host
+    # First check if SSH auth works on that host
+    ok_ssh, ssh_out = ssh_cmd(host_alias, 'ssh -T -o BatchMode=yes -o ConnectTimeout=5 git@github.com 2>&1 || true', timeout=15)
+    github_ssh_ok = 'successfully authenticated' in (ssh_out or '').lower()
+
+    if github_ssh_ok:
+        remote_url = f'git@github.com:{GITHUB_USERNAME}/{name}.git'
+        print(f"  {GREEN}✓{RESET} SSH auth works on {HOSTS[host]['name']} — using SSH URL")
+    else:
+        remote_url = f'https://github.com/{GITHUB_USERNAME}/{name}.git'
+        print(f"  {YELLOW}●{RESET} No SSH auth on {HOSTS[host]['name']} — using HTTPS URL")
+        print(f"  {GRAY}Set up SSH key on {HOSTS[host]['name']} for push access:{RESET}")
+        print(f"    {DIM}ssh-keygen -t ed25519 && cat ~/.ssh/id_ed25519.pub{RESET}")
+        print(f"    {DIM}Then add to github.com/settings/keys{RESET}")
+
+    # Add remote
+    ok, output = ssh_cmd(host_alias, f'cd {path} && git remote add origin {remote_url}', timeout=10)
+    if not ok:
+        # Maybe origin already exists with different URL
+        ssh_cmd(host_alias, f'cd {path} && git remote set-url origin {remote_url}', timeout=10)
+
+    # Push
+    ok_br, branch = ssh_cmd(host_alias, f'cd {path} && git symbolic-ref --short HEAD 2>/dev/null', timeout=8)
+    branch_name = branch.strip() if ok_br and branch.strip() else 'main'
+
+    with Spinner('Pushing to GitHub...'):
+        ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, f'cd {path} && git push -u origin {branch_name}', timeout=60)
+
+    if ok:
+        print(f"  {GREEN}✓{RESET} Pushed to {GITHUB_USERNAME}/{name}")
+    else:
+        print(f"  {YELLOW}●{RESET} Push may require auth setup — try manually:")
+        print(f"    {DIM}cd {path} && git push -u origin {branch_name}{RESET}")
+        if stderr:
+            for line in stderr.split('\n')[-3:]:
+                if line.strip():
+                    print(f"    {RED}{line.strip()}{RESET}")
+
+    # Update projects.json
+    projects, order, ignored = load_projects()
+    if key in projects:
+        projects[key]['git_remote'] = f'{GITHUB_USERNAME}/{name}'
+        projects[key]['git_branch'] = branch_name
+        save_projects(projects, order, ignored)
+        reload_projects()
+        print(f"  {GREEN}✓{RESET} Updated projects.json")
+
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# repo checkpoint ["msg"]
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_checkpoint(message=None, auto_yes=False):
+    """Batch commit+push all dirty projects that have remotes."""
+    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+    user_message = message  # Explicit message from CLI
+
+    with Spinner('Probing hosts...'):
+        host_reachable = _probe_all_hosts()
+
+    with Spinner('Fetching git status...'):
+        all_status = _fetch_all_status(host_reachable)
+
+    # Filter: is_git + dirty > 0
+    candidates = []
+    for pk in PROJECT_ORDER:
+        st = all_status.get(pk)
+        if not st:
+            continue
+        if not st.get('is_git'):
+            continue
+        dirty = st.get('dirty', 0) + st.get('untracked', 0)
+        if dirty == 0:
+            continue
+        has_remote = bool(st.get('remote_url'))
+        candidates.append((pk, st, dirty, has_remote))
+
+    if not candidates:
+        print(f"\n  {GREEN}✓{RESET} All projects clean — nothing to checkpoint")
+        return
+
+    # Batch pre-flight: check index.lock + large files (one SSH call per host)
+    blocked = set()
+    by_host = {}
+    for pk, st, dirty, has_remote in candidates:
+        proj = PROJECTS[pk]
+        host = proj['host']
+        by_host.setdefault(host, []).append((pk, proj))
+
+    for host, entries in by_host.items():
+        host_alias = HOSTS[host]['alias']
+        # Build combined check command
+        check_parts = []
+        for pk, proj in entries:
+            p = proj['path']
+            check_parts.append(
+                f'echo "===PREFLIGHT:{pk}===" && '
+                f'cd {p} 2>/dev/null && '
+                f'{{ [ -f .git/index.lock ] && echo "LOCK:$(stat -c %Y .git/index.lock 2>/dev/null)" || echo "LOCK:NONE"; }} && '
+                f'{{ git status --porcelain 2>/dev/null | sed "s/^...//" | '
+                f'while IFS= read -r f; do '
+                f'[ -f "$f" ] && s=$(stat -c %s "$f" 2>/dev/null) && '
+                f'[ "$s" -gt 99614720 ] && echo "LARGE:$s $f"; '
+                f'done; echo "LARGE_DONE"; }}'
+            )
+        combined = ' && '.join(check_parts)
+        ok, output = ssh_cmd(host_alias, combined, timeout=20)
+        if not ok:
+            continue
+
+        # Parse results per project
+        current_pk = None
+        for line in (output or '').split('\n'):
+            if line.startswith('===PREFLIGHT:') and line.endswith('==='):
+                current_pk = line[len('===PREFLIGHT:'):-len('===')]
+            elif current_pk and line.startswith('LOCK:') and line != 'LOCK:NONE':
+                try:
+                    import time as _time
+                    lock_mtime = int(line.split(':')[1])
+                    age = int(_time.time()) - lock_mtime
+                    if auto_yes:
+                        if age >= 10:
+                            # Auto-remove stale locks in --yes mode
+                            proj = PROJECTS[current_pk]
+                            ssh_cmd(host_alias, f'rm -f {proj["path"]}/.git/index.lock', timeout=5)
+                            print(f"  {YELLOW}●{RESET} {current_pk}: removed stale index.lock (age {age}s)")
+                        else:
+                            blocked.add(current_pk)
+                            print(f"  {YELLOW}●{RESET} {current_pk}: index.lock (age {age}s) — skipped")
+                    else:
+                        blocked.add(current_pk)
+                        print(f"  {YELLOW}●{RESET} {current_pk}: index.lock found (age {age}s) — skipped")
+                except (ValueError, IndexError):
+                    pass
+            elif current_pk and line.startswith('LARGE:'):
+                parts = line[6:].strip().split(' ', 1)
+                if len(parts) == 2:
+                    try:
+                        size_mb = int(parts[0]) / (1024 * 1024)
+                        blocked.add(current_pk)
+                        print(f"  {RED}!{RESET} {current_pk}: large file {parts[1]} ({size_mb:.0f}MB) — skipped")
+                    except ValueError:
+                        pass
+
+    # Also check for HTTPS remotes without credentials (will fail on push)
+    for pk, st, dirty, has_remote in candidates:
+        if pk in blocked or not has_remote:
+            continue
+        remote_url = st.get('remote_url', '')
+        if remote_url.startswith('https://') and not remote_url.startswith('git@'):
+            repo = extract_github_repo(remote_url)
+            if repo:
+                proj = PROJECTS[pk]
+                host_alias = HOSTS[proj['host']]['alias']
+                # Quick check: does this host have SSH auth?
+                ok_ssh, ssh_out = ssh_cmd(host_alias,
+                    'ssh -T -o BatchMode=yes -o ConnectTimeout=5 git@github.com 2>&1 || true',
+                    timeout=15)
+                if 'successfully authenticated' in (ssh_out or '').lower():
+                    # Auto-fix: switch to SSH
+                    new_url = f'git@github.com:{repo}.git'
+                    ssh_cmd(host_alias, f'cd {proj["path"]} && git remote set-url origin {new_url}', timeout=10)
+                    print(f"  {GREEN}✓{RESET} {pk}: switched remote to SSH ({new_url})")
+                else:
+                    blocked.add(pk)
+                    print(f"  {YELLOW}●{RESET} {pk}: HTTPS remote without credentials — skipped")
+
+    targets = [(pk, st, dirty, hr) for pk, st, dirty, hr in candidates if pk not in blocked]
+
+    if not targets:
+        if blocked:
+            print(f"\n  {YELLOW}●{RESET} All dirty projects blocked by pre-flight checks")
+        else:
+            print(f"\n  {GREEN}✓{RESET} All projects clean — nothing to checkpoint")
+        return
+
+    # Generate LLM commit messages (unless user provided one)
+    commit_msgs = {}
+    if not user_message:
+        with Spinner('Generating commit messages...'):
+            for pk, st, dirty, has_remote in targets:
+                proj = PROJECTS[pk]
+                host_alias = HOSTS[proj['host']]['alias']
+                path = proj['path']
+                generated = _generate_commit_msg(host_alias, path, project_key=pk)
+                commit_msgs[pk] = generated or f'checkpoint: {now}'
+    else:
+        for pk, st, dirty, has_remote in targets:
+            commit_msgs[pk] = user_message
+
+    # Display
+    print(f"\n  {WHITE}Checkpoint:{RESET} {CYAN}{now}{RESET}\n")
+    for pk, st, dirty, has_remote in targets:
+        proj = PROJECTS[pk]
+        msg_lines = commit_msgs[pk].split('\n')
+        subject = msg_lines[0]
+        suffix = '' if has_remote else f'  {GRAY}(no remote — commit only){RESET}'
+        print(f"  {YELLOW}●{RESET} {WHITE}{pk:<14s}{RESET} {dirty:>4d} dirty{suffix}")
+        print(f"    {DIM}{subject}{RESET}")
+        body_lines = [l.strip() for l in msg_lines[1:] if l.strip()]
+        for bl in body_lines:
+            print(f"    {GRAY}{bl}{RESET}")
+
+    if not auto_yes:
+        print(f"\n    {CYAN}[a]{RESET}ll  {CYAN}[s]{RESET}elect  {CYAN}[e]{RESET}dit messages  {CYAN}[q]{RESET}uit")
+        try:
+            choice = input(f"    Choice [a]: ").strip().lower() or 'a'
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if choice in ('q', 'quit'):
+            print(f"  {GRAY}Cancelled{RESET}")
+            return
+
+        if choice in ('s', 'select'):
+            # Per-project toggle — all start included, space to exclude
+            toggle_items = [{'pk': pk, 'dirty': dirty, 'included': True}
+                            for pk, st, dirty, has_remote in targets]
+
+            def _cp_render(item, idx, highlighted):
+                inc = f"{GREEN}[+]{RESET}" if item['included'] else f"{GRAY}[ ]{RESET}"
+                hl_start = HIGHLIGHT_BG if highlighted else ''
+                hl_end = HIGHLIGHT_OFF if highlighted else ''
+                return f"    {inc} {hl_start}{item['pk']:<14s} {item['dirty']:>4d} dirty{hl_end}"
+
+            print()
+            saved = interactive_toggle(
+                toggle_items, _cp_render,
+                get_state=lambda item: item['included'],
+                set_state=lambda item, v: item.__setitem__('included', v),
+                title=f"    {WHITE}Select projects{RESET}  {GRAY}— space=toggle  enter=confirm  q=cancel{RESET}",
+            )
+            if not saved:
+                print(f"  {GRAY}Cancelled{RESET}")
+                return
+            included = {item['pk'] for item in toggle_items if item['included']}
+            targets = [t for t in targets if t[0] in included]
+            if not targets:
+                print(f"  {GRAY}All excluded — cancelled{RESET}")
+                return
+
+        elif choice in ('e', 'edit'):
+            # Edit messages per-project
+            print()
+            for pk, st, dirty, has_remote in targets:
+                msg_lines = commit_msgs[pk].split('\n')
+                subject = msg_lines[0]
+                body_lines = [l.strip() for l in msg_lines[1:] if l.strip()]
+                print(f"    {WHITE}{pk}{RESET}")
+                print(f"      {DIM}{subject}{RESET}")
+                for bl in body_lines:
+                    print(f"      {GRAY}{bl}{RESET}")
+                try:
+                    edited = input(f"      {CYAN}New subject{RESET} [{subject}]: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return
+                if edited:
+                    # Keep body if user only changed the subject
+                    if body_lines:
+                        commit_msgs[pk] = edited + '\n\n' + '\n'.join(body_lines)
+                    else:
+                        commit_msgs[pk] = edited
+                print()
+
+        elif choice not in ('a', 'all', 'y', 'yes'):
+            print(f"  {GRAY}Cancelled{RESET}")
+            return
+
+    print()
+    success = 0
+    failed = 0
+
+    for pk, st, dirty, has_remote in targets:
+        proj = PROJECTS[pk]
+        host_alias = HOSTS[proj['host']]['alias']
+        path = proj['path']
+        msg = commit_msgs[pk]
+
+        sys.stderr.write(f"\r  {CYAN}●{RESET} {pk}...")
+        sys.stderr.flush()
+
+        ok, output = _ssh_commit(host_alias, path, msg, timeout=60)
+
+        if ok and has_remote:
+            remote_url = st.get('remote_url', '')
+            ok_push, stdout_push, stderr_push = _ssh_cmd_with_stderr(
+                host_alias, f'cd {path} && git push', timeout=60)
+            if not ok_push:
+                ok = False
+                output = stderr_push or stdout_push or 'Push failed'
+
+        action = 'committed + pushed' if has_remote else 'committed'
+        if ok:
+            sys.stderr.write(f"\r  {GREEN}✓{RESET} {WHITE}{pk:<14s}{RESET} {action} ({dirty} files)\n")
+            success += 1
+        else:
+            sys.stderr.write(f"\r  {RED}✗{RESET} {WHITE}{pk:<14s}{RESET} failed\n")
+            if output:
+                last_line = [l for l in output.split('\n') if l.strip()]
+                if last_line:
+                    sys.stderr.write(f"    {GRAY}{last_line[-1].strip()}{RESET}\n")
+            failed += 1
+
+    print(f"\n  {GREEN}{success}/{len(targets)} projects checkpointed{RESET}" + (f"  {RED}{failed} failed{RESET}" if failed else ''))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# repo fix <project>
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_fix(key):
+    """Audit and fix common git issues."""
+    proj = PROJECTS[key]
+    host = proj['host']
+    host_alias = HOSTS[host]['alias']
+    path = proj['path']
+
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {HOSTS[host]['name']} is offline{RESET}")
+        return
+
+    # Gather info
+    cmd = f'''cd {path} 2>/dev/null || {{ echo "NO_DIR"; exit 1; }}
+[ -d .git ] || {{ echo "NOT_GIT"; exit 0; }}
+echo "REMOTE:$(git remote get-url origin 2>/dev/null || echo '')"
+echo "NAME:$(git config user.name 2>/dev/null || echo '')"
+echo "EMAIL:$(git config user.email 2>/dev/null || echo '')"
+echo "GITIGNORE:$([ -f .gitignore ] && echo EXISTS || echo MISSING)"
+'''
+    ok, output = ssh_cmd(host_alias, cmd, timeout=10)
+    if not ok or 'NO_DIR' in (output or ''):
+        print(f"\n  {RED}Cannot access {key}{RESET}")
+        return
+    if 'NOT_GIT' in (output or ''):
+        print(f"\n  {YELLOW}{key} is not a git repo{RESET}")
+        return
+
+    info = {}
+    for line in output.split('\n'):
+        if ':' in line:
+            k, v = line.split(':', 1)
+            info[k.strip()] = v.strip()
+
+    remote = info.get('REMOTE', '')
+    user_name = info.get('NAME', '')
+    user_email = info.get('EMAIL', '')
+    has_gitignore = info.get('GITIGNORE', '') == 'EXISTS'
+
+    issues = []
+    fixes_applied = 0
+
+    print(f"\n  {WHITE}Auditing {proj['name']}{RESET}  {GRAY}({key}){RESET}\n")
+
+    # Issue 1: Remote URL issues (PAT token or bare HTTPS without credentials)
+    has_pat = remote and any(tok in remote for tok in ('ghp_', 'gho_', 'github_pat_'))
+    is_bare_https = remote and remote.startswith('https://') and not has_pat
+    repo = extract_github_repo(remote) if remote else None
+
+    if has_pat:
+        print(f"  {RED}!{RESET} PAT token in remote URL")
+        print(f"    {GRAY}Current: {sanitize_remote_url(remote)}{RESET}")
+    elif is_bare_https and repo:
+        # Check if credential helper exists
+        ok_cred, cred_out = ssh_cmd(host_alias, 'git config --global credential.helper 2>/dev/null', timeout=5)
+        if not (ok_cred and cred_out.strip()):
+            print(f"  {YELLOW}●{RESET} HTTPS remote without credentials (push will fail)")
+            print(f"    {GRAY}Current: {remote}{RESET}")
+        else:
+            is_bare_https = False  # has credential helper, it's fine
+
+    if (has_pat or is_bare_https) and repo:
+        ok_ssh, ssh_out = ssh_cmd(host_alias, 'ssh -T -o BatchMode=yes -o ConnectTimeout=5 git@github.com 2>&1 || true', timeout=15)
+        github_ssh_ok = 'successfully authenticated' in (ssh_out or '').lower()
+
+        if github_ssh_ok:
+            new_url = f'git@github.com:{repo}.git'
+            label = 'SSH'
+        elif has_pat:
+            new_url = f'https://github.com/{repo}.git'
+            label = 'HTTPS (no PAT)'
+        else:
+            new_url = None
+
+        if new_url:
+            try:
+                fix = input(f"    Switch to {label}? ({new_url}) (Y/n): ").strip().lower() or 'y'
+            except (EOFError, KeyboardInterrupt):
+                fix = 'n'
+                print()
+
+            if fix in ('y', 'yes'):
+                ok_fix, _ = ssh_cmd(host_alias, f"cd {path} && git remote set-url origin {new_url}", timeout=10)
+                if ok_fix:
+                    print(f"    {GREEN}✓{RESET} Remote updated to {new_url}")
+                    fixes_applied += 1
+                else:
+                    print(f"    {RED}✗ Failed to update remote{RESET}")
+        elif not github_ssh_ok:
+            print(f"    {GRAY}Set up SSH key on {HOSTS[host]['name']} for push access:{RESET}")
+            print(f"      {DIM}ssh-keygen -t ed25519 && cat ~/.ssh/id_ed25519.pub{RESET}")
+    elif remote and not has_pat and not is_bare_https:
+        print(f"  {GREEN}✓{RESET} Remote URL clean")
+    elif not remote:
+        print(f"  {YELLOW}●{RESET} No remote configured")
+        print(f"    {GRAY}Run {CYAN}repo create {key}{GRAY} to set up GitHub{RESET}")
+
+    # Issue 2: Git user config
+    expected_name = GITHUB_USERNAME
+    expected_email = GIT_EMAIL
+    if user_name != expected_name or user_email != expected_email:
+        print(f"\n  {YELLOW}●{RESET} Git user: {user_name or '(not set)'} <{user_email or '(not set)'}>" )
+        print(f"    {GRAY}Expected: {expected_name} <{expected_email}>{RESET}")
+        try:
+            fix = input(f"    Fix? (Y/n): ").strip().lower() or 'y'
+        except (EOFError, KeyboardInterrupt):
+            fix = 'n'
+            print()
+
+        if fix in ('y', 'yes'):
+            ssh_cmd(host_alias, f'cd {path} && git config user.name "{expected_name}" && git config user.email "{expected_email}"', timeout=10)
+            print(f"    {GREEN}✓{RESET} User config updated")
+            fixes_applied += 1
+    else:
+        print(f"  {GREEN}✓{RESET} Git user: {user_name} <{user_email}>")
+
+    # Issue 3: Missing .gitignore
+    if not has_gitignore:
+        print(f"\n  {YELLOW}●{RESET} No .gitignore")
+        try:
+            fix = input(f"    Generate .gitignore? (Y/n): ").strip().lower() or 'y'
+        except (EOFError, KeyboardInterrupt):
+            fix = 'n'
+            print()
+
+        if fix in ('y', 'yes'):
+            langs = _guess_languages(host_alias, path)
+            content = _build_gitignore(langs)
+            safe_content = content.replace("'", "'\\''")
+            ok_gi, _ = ssh_cmd(host_alias,
+                f"cd {path} && cat > .gitignore << 'GITIGNORE_EOF'\n{content}GITIGNORE_EOF",
+                timeout=10)
+            if ok_gi:
+                print(f"    {GREEN}✓{RESET} .gitignore created ({', '.join(sorted(langs))})")
+                fixes_applied += 1
+            else:
+                print(f"    {RED}✗ Failed to create .gitignore{RESET}")
+    else:
+        print(f"  {GREEN}✓{RESET} .gitignore present")
+
+    # Summary
+    if fixes_applied > 0:
+        print(f"\n  {GREEN}✓ {fixes_applied} fix(es) applied{RESET}")
+    else:
+        print(f"\n  {GRAY}No fixes applied{RESET}")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# repo deploy <project>
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_deploy(key):
+    """Deploy: commit + push + restart services + health check."""
+    proj = PROJECTS[key]
+    host = proj['host']
+    host_alias = HOSTS[host]['alias']
+    path = proj['path']
+
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {HOSTS[host]['name']} is offline{RESET}")
+        return
+
+    print()
+    header_bar()
+    print(f"  {BRIGHT_GREEN}DEPLOY — {proj['name']}{RESET}")
+    header_bar()
+
+    # [1/4] Check git state
+    print(f"\n  {WHITE}[1/4]{RESET} Checking git state...")
+    ok, check = ssh_cmd(host_alias,
+        f'cd {path} && [ -d .git ] && echo GIT || echo NOGIT',
+        timeout=8)
+    if not ok or 'NOGIT' in (check or ''):
+        print(f"  {RED}Not a git repository{RESET}")
+        return
+
+    ok, status = ssh_cmd(host_alias,
+        f'cd {path} && git status --porcelain 2>/dev/null | wc -l | tr -d " "',
+        timeout=10)
+    dirty = int(status.strip()) if ok and status.strip().isdigit() else 0
+
+    if dirty > 0:
+        # Pre-flight checks before commit
+        if not _check_index_lock(host_alias, path):
+            return
+        if not _check_large_files(host_alias, path):
+            return
+
+        print(f"  {YELLOW}● {dirty} uncommitted changes{RESET}")
+        with Spinner('Generating commit message...'):
+            generated = _generate_commit_msg(host_alias, path, project_key=key)
+        msg = None
+        if generated:
+            msg = _prompt_commit_msg(generated)
+        if not msg:
+            if not generated:
+                print(f"\n  {YELLOW}●{RESET} Could not generate message")
+            try:
+                msg = input(f"  Commit message (or q to cancel): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if msg.lower() in ('q', 'quit', ''):
+                print(f"  {GRAY}Cancelled{RESET}")
+                return
+        ok, output = _ssh_commit(host_alias, path, msg)
+        if ok:
+            print(f"  {GREEN}✓{RESET} Committed")
+        else:
+            print(f"  {RED}✗ Commit failed{RESET}")
+            return
+    else:
+        print(f"  {GREEN}✓{RESET} Working tree clean")
+
+    # [2/4] Check remote
+    print(f"\n  {WHITE}[2/4]{RESET} Checking remote...")
+    ok, remote = ssh_cmd(host_alias,
+        f'cd {path} && git remote get-url origin 2>/dev/null',
+        timeout=8)
+    if not ok or not remote.strip():
+        print(f"  {YELLOW}● No remote configured — skipping push{RESET}")
+    else:
+        # Pre-flight: PAT check
+        if not _check_remote_auth(host_alias, path, remote.strip()):
+            return
+
+        # Check if ahead
+        ok, ahead = ssh_cmd(host_alias,
+            f'cd {path} && git rev-list --count @{{upstream}}..HEAD 2>/dev/null || echo "0"',
+            timeout=10)
+        ahead_count = int(ahead.strip()) if ok and ahead.strip().isdigit() else 0
+        if ahead_count > 0:
+            print(f"  {CYAN}● {ahead_count} commit(s) ahead — pushing...{RESET}")
+            ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, f'cd {path} && git push', timeout=60)
+            if ok:
+                print(f"  {GREEN}✓{RESET} Pushed")
+            else:
+                print(f"  {RED}✗ Push failed{RESET}")
+                err_output = stderr or stdout
+                if err_output:
+                    for line in err_output.split('\n')[-3:]:
+                        if line.strip():
+                            print(f"    {RED}{line.strip()}{RESET}")
+                return
+        else:
+            print(f"  {GREEN}✓{RESET} Up to date with remote")
+
+    # [3/4] Restart services
+    print(f"\n  {WHITE}[3/4]{RESET} Restarting services...")
+    env_services = load_services(key)
+
+    restarted = []
+    if not env_services:
+        print(f"  {GRAY}● No services to restart{RESET}")
+    else:
+        for svc in env_services:
+            svc_name = svc.get('name', '?')
+            port = svc.get('port')
+            print(f"  {CYAN}●{RESET} Restarting {svc_name} (:{port})...", end='', flush=True)
+
+            success = restart_service(host_alias, path, svc, ready_timeout=30)
+            if success:
+                print(f"\r  {GREEN}✓{RESET} {svc_name} (:{port}) — healthy")
+                restarted.append(svc_name)
+            else:
+                print(f"\r  {RED}✗{RESET} {svc_name} (:{port}) — failed health check")
+
+    # [4/4] Record deploy state
+    print(f"\n  {WHITE}[4/4]{RESET} Recording deploy state...")
+    head = fetch_git_head(host_alias, path)
+    if head:
+        write_deploy_state(key, head, restarted if restarted else None)
+        print(f"  {GREEN}✓{RESET} Deployed at {WHITE}{head}{RESET}")
+    else:
+        print(f"  {YELLOW}● Could not read HEAD{RESET}")
+
+    # Summary
+    print()
+    header_bar()
+    parts = []
+    if dirty > 0:
+        parts.append('committed')
+    if remote and remote.strip():
+        parts.append('pushed')
+    if restarted:
+        parts.append(f"{len(restarted)} service(s) restarted")
+    print(f"  {GREEN}✓ Deploy complete: {', '.join(parts) if parts else 'recorded'}{RESET}")
+    header_bar()
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+USAGE = f"""
+{WHITE}repo{RESET} — Unified git management for hub projects
+
+{WHITE}Usage:{RESET}
+  repo                           Unified status dashboard
+  repo status                    Unified status dashboard (same as bare repo)
+  repo status <project>          Detailed status for one project
+  repo init <project>            git init + .gitignore + first commit
+  repo commit <project> ["msg"]  Stage all + commit (LLM message if omitted)
+  repo push <project>            Push to remote
+  repo pull <project>            Pull from remote
+  repo log <project>             Recent commit log
+  repo create <project>          Create GitHub repo + configure remote
+  repo checkpoint ["msg"]        Batch commit+push dirty projects (LLM messages)
+  repo deploy <project>          Commit + push + restart services + health check
+  repo fix <project>             Audit/fix issues (PAT, user config, .gitignore)
+
+{WHITE}Options:{RESET}
+  --yes                          Skip confirmation (for checkpoint)
+  --help, -h                     This help
+
+{GRAY}Projects: {', '.join(PROJECT_ORDER)}{RESET}
+"""
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        render_dashboard()
+        return
+
+    if args[0] in ('-h', '--help'):
+        print(USAGE)
+        return
+
+    subcmd = args[0]
+
+    if subcmd == 'status':
+        if len(args) < 2:
+            render_dashboard()
+            return
+        key = resolve_project(args[1])
+        if key:
+            render_project_status(key)
+
+    elif subcmd == 'init':
+        if len(args) < 2:
+            print(f"{RED}Usage: repo init <project>{RESET}")
+            return
+        key = resolve_project(args[1])
+        if key:
+            do_init(key)
+
+    elif subcmd == 'commit':
+        if len(args) < 2:
+            print(f"{RED}Usage: repo commit <project> [\"message\"]{RESET}")
+            return
+        key = resolve_project(args[1])
+        if key:
+            message = ' '.join(args[2:]) if len(args) > 2 else None
+            do_commit(key, message)
+
+    elif subcmd == 'push':
+        if len(args) < 2:
+            print(f"{RED}Usage: repo push <project>{RESET}")
+            return
+        key = resolve_project(args[1])
+        if key:
+            do_push(key)
+
+    elif subcmd == 'pull':
+        if len(args) < 2:
+            print(f"{RED}Usage: repo pull <project>{RESET}")
+            return
+        key = resolve_project(args[1])
+        if key:
+            do_pull(key)
+
+    elif subcmd == 'log':
+        if len(args) < 2:
+            print(f"{RED}Usage: repo log <project>{RESET}")
+            return
+        key = resolve_project(args[1])
+        if key:
+            do_log(key)
+
+    elif subcmd == 'create':
+        if len(args) < 2:
+            print(f"{RED}Usage: repo create <project>{RESET}")
+            return
+        key = resolve_project(args[1])
+        if key:
+            do_create(key)
+
+    elif subcmd == 'checkpoint':
+        message = None
+        auto_yes = '--yes' in args
+        remaining = [a for a in args[1:] if a != '--yes']
+        if remaining:
+            message = ' '.join(remaining)
+        do_checkpoint(message, auto_yes)
+
+    elif subcmd == 'deploy':
+        if len(args) < 2:
+            print(f"{RED}Usage: repo deploy <project>{RESET}")
+            return
+        key = resolve_project(args[1])
+        if key:
+            do_deploy(key)
+
+    elif subcmd == 'fix':
+        if len(args) < 2:
+            print(f"{RED}Usage: repo fix <project>{RESET}")
+            return
+        key = resolve_project(args[1])
+        if key:
+            do_fix(key)
+
+    else:
+        # Maybe it's a project name for quick status
+        key = resolve_project(subcmd)
+        if key:
+            render_project_status(key)
+        else:
+            print(USAGE)
+
+
+if __name__ == '__main__':
+    main()

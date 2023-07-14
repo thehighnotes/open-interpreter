@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""~/search — DuckDuckGo search helper for OI. Returns concise text results."""
+
+import sys
+import json
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: ~/search \"query\"")
+        sys.exit(1)
+
+    query = " ".join(sys.argv[1:])
+
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        print("Error: pip install ddgs")
+        sys.exit(1)
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+    except Exception as e:
+        print(f"Search error: {e}")
+        sys.exit(1)
+
+    if not results:
+        print("No results found.")
+        sys.exit(0)
+
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "")
+        body = r.get("body", "")
+        href = r.get("href", "")
+        print(f"{i}. {title}")
+        print(f"   {body}")
+        print(f"   {href}")
+        print()
+
+if __name__ == "__main__":
+    main()

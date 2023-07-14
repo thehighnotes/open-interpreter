@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""edit — Structured file editing tool for the Orin Nano hub.
+
+Provides safe, validated file editing operations for both local and remote
+files. Designed for use by Open Interpreter in project mode.
+
+Usage:
+    edit <file> --find "old" --replace "new"     Unique search-and-replace
+    edit <file> --after "anchor" --insert "text"  Insert after unique anchor line
+    edit <file> --line N --replace "text"          Replace specific line number
+    edit <file> --append "text"                    Append to end of file
+    edit <file> --write-from /tmp/content.txt      Overwrite file from temp file
+    edit <file> --patch /tmp/edit.json             JSON-based edit (avoids escaping)
+    edit <file> --show [N]                         Show file with line numbers (offset N)
+    edit --help
+
+Remote files: use host:path syntax (e.g. gpu:~/projects/myapp/main.py)
+JSON patch format: {"find": "...", "replace": "..."} or {"after": "...", "insert": "..."}
+                   {"line": N, "replace": "..."} or {"append": "..."} or {"content": "..."}
+"""
+
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import (
+    HOSTS, CYAN, GREEN, RED, YELLOW, WHITE, GRAY, DIM, RESET, BOLD,
+    ssh_cmd, header_bar, divider,
+)
+
+# Track which files have been backed up this process (no double .bak)
+_backed_up = set()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File I/O (local + remote)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_target(target):
+    """Parse host:path or plain path. Returns (host_alias, path) where host_alias is None for local."""
+    if ':' in target and not target.startswith('/'):
+        parts = target.split(':', 1)
+        host_key = parts[0]
+        path = parts[1]
+        if host_key in HOSTS:
+            return host_key, path
+    return None, target
+
+
+def read_file(host, path):
+    """Read file content. Returns (success, content_string)."""
+    if host:
+        ok, content = ssh_cmd(host, f'cat {path}', timeout=15)
+        if not ok:
+            return False, f"Cannot read {host}:{path}"
+        return True, content
+    else:
+        try:
+            with open(os.path.expanduser(path)) as f:
+                return True, f.read()
+        except FileNotFoundError:
+            return False, f"File not found: {path}"
+        except OSError as e:
+            return False, str(e)
+
+
+def write_file(host, path, content):
+    """Write file content atomically. Creates parent directories if needed.
+    Returns (success, error_message)."""
+    if host:
+        # Ensure parent directory exists on remote
+        parent = os.path.dirname(path)
+        if parent:
+            ssh_cmd(host, f'mkdir -p {parent}', timeout=10)
+        # Remote: write to local temp → SCP to remote temp → mv
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(content)
+            tmp_local = f.name
+        try:
+            tmp_remote = f'/tmp/_edit_tmp_{os.getpid()}.txt'
+            scp = subprocess.run(
+                ['scp', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                 tmp_local, f'{host}:{tmp_remote}'],
+                capture_output=True, text=True, timeout=15
+            )
+            if scp.returncode != 0:
+                return False, f"SCP failed: {scp.stderr.strip()}"
+            ok, out = ssh_cmd(host, f'mv {tmp_remote} {path}', timeout=10)
+            if not ok:
+                return False, f"mv failed on {host}"
+            return True, ''
+        finally:
+            os.unlink(tmp_local)
+    else:
+        expanded = os.path.expanduser(path)
+        # Ensure parent directory exists
+        parent = os.path.dirname(expanded)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp_path = expanded + '.edit-tmp'
+        try:
+            with open(tmp_path, 'w') as f:
+                f.write(content)
+            os.replace(tmp_path, expanded)
+            return True, ''
+        except OSError as e:
+            # Clean up tmp if replace failed
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            return False, str(e)
+
+
+def backup_file(host, path):
+    """Create .bak on first edit per process."""
+    key = f"{host or 'local'}:{path}"
+    if key in _backed_up:
+        return
+    _backed_up.add(key)
+
+    if host:
+        ssh_cmd(host, f'cp {path} {path}.bak 2>/dev/null', timeout=10)
+    else:
+        expanded = os.path.expanduser(path)
+        try:
+            if os.path.exists(expanded):
+                import shutil
+                shutil.copy2(expanded, expanded + '.bak')
+        except OSError:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Diff display
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_diff(old_content, new_content, path):
+    """Print a colored unified diff of the changed region."""
+    old_lines = old_content.splitlines(keepends=True)
+    new_lines = new_content.splitlines(keepends=True)
+
+    diff = list(difflib.unified_diff(old_lines, new_lines, fromfile=path, tofile=path, n=3))
+    if not diff:
+        return
+
+    for line in diff:
+        line_str = line.rstrip('\n')
+        if line.startswith('+++') or line.startswith('---'):
+            print(f"  {BOLD}{line_str}{RESET}")
+        elif line.startswith('@@'):
+            print(f"  {CYAN}{line_str}{RESET}")
+        elif line.startswith('+'):
+            print(f"  {GREEN}{line_str}{RESET}")
+        elif line.startswith('-'):
+            print(f"  {RED}{line_str}{RESET}")
+        else:
+            print(f"  {line_str}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Closest-line finder for "not found" errors
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_closest_lines(content, needle, n=3):
+    """Find the n lines most similar to needle using SequenceMatcher."""
+    lines = content.splitlines()
+    scored = []
+    for i, line in enumerate(lines):
+        ratio = difflib.SequenceMatcher(None, needle.strip(), line.strip()).ratio()
+        scored.append((ratio, i + 1, line))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:n]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Edit operations
+# ─────────────────────────────────────────────────────────────────────────────
+
+def op_find_replace(content, find_str, replace_str):
+    """Replace unique occurrence of find_str. Returns (new_content, error)."""
+    count = content.count(find_str)
+    if count == 0:
+        return None, 'NOT_FOUND'
+    if count > 1:
+        return None, 'AMBIGUOUS'
+    return content.replace(find_str, replace_str, 1), None
+
+
+def op_after_insert(content, anchor, insert_text):
+    """Insert text after unique anchor line. Returns (new_content, error)."""
+    lines = content.splitlines(keepends=True)
+    matches = [(i, l) for i, l in enumerate(lines) if anchor.strip() in l.strip()]
+    if len(matches) == 0:
+        return None, 'NOT_FOUND'
+    if len(matches) > 1:
+        return None, 'AMBIGUOUS'
+    idx = matches[0][0]
+    # Detect line ending
+    ending = '\n'
+    if lines[idx].endswith('\r\n'):
+        ending = '\r\n'
+    # Insert after the matched line
+    new_line = insert_text + ending
+    lines.insert(idx + 1, new_line)
+    return ''.join(lines), None
+
+
+def op_line_replace(content, line_num, replace_text):
+    """Replace a specific line number (1-indexed). Returns (new_content, error)."""
+    lines = content.splitlines(keepends=True)
+    if line_num < 1 or line_num > len(lines):
+        return None, f"Line {line_num} out of range (file has {len(lines)} lines)"
+    ending = '\n'
+    if lines[line_num - 1].endswith('\r\n'):
+        ending = '\r\n'
+    lines[line_num - 1] = replace_text + ending
+    return ''.join(lines), None
+
+
+def op_append(content, text):
+    """Append text to end. Returns (new_content, None)."""
+    if content and not content.endswith('\n'):
+        content += '\n'
+    return content + text + '\n', None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Show file
+# ─────────────────────────────────────────────────────────────────────────────
+
+def show_file(host, path, offset=0, limit=100):
+    """Display file with line numbers."""
+    ok, content = read_file(host, path)
+    if not ok:
+        print(f"  {RED}{content}{RESET}")
+        return 1
+
+    lines = content.splitlines()
+    total = len(lines)
+    start = offset
+    end = min(start + limit, total)
+
+    label = f"{host}:{path}" if host else path
+    print(f"  {CYAN}{label}{RESET}  {GRAY}({total} lines, showing {start + 1}-{end}){RESET}")
+    print()
+
+    width = len(str(end))
+    for i in range(start, end):
+        print(f"  {GRAY}{i + 1:>{width}}{RESET}  {lines[i]}")
+
+    if end < total:
+        next_end = min(end + limit, total)
+        print(f"  {GRAY}... ({total - end} more lines — use --show {end + 1}-{next_end} to view next section){RESET}")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structural map (--map)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Patterns for structural lines by file extension
+_MAP_PATTERNS = {
+    # Python
+    '.py': re.compile(r'^(\s*)(class |def |async def |if __name__)'),
+    # JavaScript / TypeScript
+    '.js': re.compile(r'^(\s*)(function |class |const |let |var |export |import |module\.)'),
+    '.ts': re.compile(r'^(\s*)(function |class |const |let |var |export |import |interface |type |enum )'),
+    '.jsx': re.compile(r'^(\s*)(function |class |const |let |var |export |import )'),
+    '.tsx': re.compile(r'^(\s*)(function |class |const |let |var |export |import |interface |type )'),
+    # C / C++
+    '.c': re.compile(r'^(\s*)(#include |#define |typedef |struct |enum |int |void |char |float |double |static |extern )'),
+    '.h': re.compile(r'^(\s*)(#include |#define |#ifndef |#pragma |typedef |struct |enum |int |void |char |float |double |static |extern )'),
+    '.cpp': re.compile(r'^(\s*)(#include |#define |class |struct |enum |namespace |template |int |void |auto |static )'),
+    '.hpp': re.compile(r'^(\s*)(#include |#define |#ifndef |#pragma |class |struct |enum |namespace |template )'),
+    # Go
+    '.go': re.compile(r'^(\s*)(package |import |func |type |var |const )'),
+    # Rust
+    '.rs': re.compile(r'^(\s*)(use |mod |pub |fn |struct |enum |impl |trait |const |static |type )'),
+    # Ruby
+    '.rb': re.compile(r'^(\s*)(class |module |def |require |include |attr_)'),
+    # Shell
+    '.sh': re.compile(r'^(\s*)(function |\w+\s*\(\)\s*\{)'),
+    '.bash': re.compile(r'^(\s*)(function |\w+\s*\(\)\s*\{)'),
+    # HTML / XML
+    '.html': re.compile(r'^(\s*)(<html|<head|<body|<div|<section|<nav|<main|<header|<footer|<script|<style|<form|<table)', re.IGNORECASE),
+    '.xml': re.compile(r'^(\s*)(<\?xml|<\w+[ >])'),
+    # CSS
+    '.css': re.compile(r'^(\s*)(@import |@media |@keyframes |[.#]?\w+[^:]*\{)'),
+    # Markdown
+    '.md': re.compile(r'^()(#{1,6} )'),
+    # YAML
+    '.yml': re.compile(r'^()(\w[\w-]*:)'),
+    '.yaml': re.compile(r'^()(\w[\w-]*:)'),
+    # JSON (top-level keys)
+    '.json': re.compile(r'^(\s*)("[^"]+"\s*:)'),
+    # Config files
+    '.ini': re.compile(r'^()(\[)'),
+    '.conf': re.compile(r'^()(\[)'),
+    '.toml': re.compile(r'^()(\[)'),
+    # Dockerfile
+    'Dockerfile': re.compile(r'^()(FROM |RUN |CMD |COPY |ADD |ENV |EXPOSE |WORKDIR |ENTRYPOINT |ARG |LABEL )'),
+    # Makefile
+    'Makefile': re.compile(r'^()(\w[\w-]*\s*:)'),
+}
+
+
+def map_file(host, path):
+    """Show structural skeleton of a file with line numbers."""
+    ok, content = read_file(host, path)
+    if not ok:
+        print(f"  {RED}{content}{RESET}")
+        return 1
+
+    lines = content.splitlines()
+    total = len(lines)
+
+    # Determine pattern from extension or filename
+    basename = os.path.basename(path)
+    _, ext = os.path.splitext(basename)
+    pattern = _MAP_PATTERNS.get(ext) or _MAP_PATTERNS.get(basename)
+
+    if not pattern:
+        # Fallback: show lines that look "structural" — non-empty, not indented too deep
+        pattern = re.compile(r'^(\s{0,4})(\S)')
+
+    label = f"{host}:{path}" if host else path
+    print(f"  {CYAN}{label}{RESET}  {GRAY}({total} lines){RESET}")
+    print()
+
+    width = len(str(total))
+    shown = 0
+    for i, line in enumerate(lines):
+        if pattern.match(line):
+            # Show indent level visually
+            stripped = line.rstrip()
+            indent = len(stripped) - len(stripped.lstrip())
+            depth = indent // 2 if indent else 0
+            marker = '·' * depth + ' ' if depth else ''
+            print(f"  {GRAY}{i + 1:>{width}}{RESET}  {marker}{stripped.lstrip()}")
+            shown += 1
+
+    if shown == 0:
+        print(f"  {GRAY}(no structural lines detected — use --show instead){RESET}")
+    else:
+        print(f"\n  {GRAY}{shown} structural lines / {total} total — use --show N-M to view details{RESET}")
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Error reporting for match failures
+# ─────────────────────────────────────────────────────────────────────────────
+
+def report_not_found(content, needle, label="text"):
+    """Report NOT FOUND with closest matches."""
+    print(f"  {RED}NOT FOUND:{RESET} {label} not found in file")
+    closest = find_closest_lines(content, needle)
+    if closest and closest[0][0] > 0.3:
+        print(f"  {YELLOW}Closest lines:{RESET}")
+        for ratio, lineno, line in closest:
+            print(f"    {GRAY}L{lineno}{RESET}  {line.rstrip()}")
+
+
+def report_ambiguous(content, needle, label="text"):
+    """Report AMBIGUOUS with match locations."""
+    lines = content.splitlines()
+    matches = []
+    for i, line in enumerate(lines):
+        if needle.strip() in line:
+            matches.append((i + 1, line))
+    print(f"  {RED}AMBIGUOUS:{RESET} {label} matches {len(matches)} locations")
+    for lineno, line in matches[:5]:
+        print(f"    {GRAY}L{lineno}{RESET}  {line.rstrip()}")
+    if len(matches) > 5:
+        print(f"    {GRAY}... and {len(matches) - 5} more{RESET}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Execute a single edit operation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def execute_edit(host, path, old_content, operation, args):
+    """Run one edit operation. Returns (new_content, exit_code)."""
+    if operation == 'find_replace':
+        new_content, err = op_find_replace(old_content, args['find'], args['replace'])
+    elif operation == 'after_insert':
+        new_content, err = op_after_insert(old_content, args['after'], args['insert'])
+    elif operation == 'line_replace':
+        new_content, err = op_line_replace(old_content, args['line'], args['replace'])
+    elif operation == 'append':
+        new_content, err = op_append(old_content, args['text'])
+    elif operation == 'content':
+        new_content, err = args['content'], None
+    else:
+        print(f"  {RED}Unknown operation: {operation}{RESET}")
+        return None, 1
+
+    if err == 'NOT_FOUND':
+        needle = args.get('find') or args.get('after', '')
+        report_not_found(old_content, needle)
+        return None, 1
+    elif err == 'AMBIGUOUS':
+        needle = args.get('find') or args.get('after', '')
+        report_ambiguous(old_content, needle)
+        return None, 1
+    elif err:
+        print(f"  {RED}Error: {err}{RESET}")
+        return None, 1
+
+    return new_content, 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patch mode (JSON file)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_patch(host, path, patch_file):
+    """Apply a JSON patch file. Returns exit code."""
+    # Read patch
+    try:
+        with open(os.path.expanduser(patch_file)) as f:
+            patch_text = f.read().strip()
+    except FileNotFoundError:
+        print(f"  {RED}Patch file not found: {patch_file}{RESET}")
+        return 1
+
+    # Parse — can be single JSON object or one-per-line
+    patches = []
+    try:
+        obj = json.loads(patch_text)
+        patches = [obj] if isinstance(obj, dict) else obj
+    except json.JSONDecodeError:
+        # Try line-by-line
+        for line in patch_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                patches.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"  {RED}Invalid JSON in patch: {line[:80]}{RESET}")
+                return 1
+
+    if not patches:
+        print(f"  {RED}Empty patch file{RESET}")
+        return 1
+
+    # Read target file
+    ok, content = read_file(host, path)
+    if not ok:
+        print(f"  {RED}{content}{RESET}")
+        return 1
+
+    old_content = content
+    backup_file(host, path)
+
+    # Apply patches sequentially
+    for i, patch in enumerate(patches):
+        if 'content' in patch:
+            op = 'content'
+            args = {'content': patch['content']}
+        elif 'find' in patch and 'replace' in patch:
+            op = 'find_replace'
+            args = {'find': patch['find'], 'replace': patch['replace']}
+        elif 'after' in patch and 'insert' in patch:
+            op = 'after_insert'
+            args = {'after': patch['after'], 'insert': patch['insert']}
+        elif 'line' in patch and 'replace' in patch:
+            op = 'line_replace'
+            args = {'line': int(patch['line']), 'replace': patch['replace']}
+        elif 'append' in patch:
+            op = 'append'
+            args = {'text': patch['append']}
+        else:
+            print(f"  {RED}Unknown patch operation at index {i}: {list(patch.keys())}{RESET}")
+            return 1
+
+        content, code = execute_edit(host, path, content, op, args)
+        if code != 0:
+            print(f"  {RED}Patch failed at operation {i + 1}{RESET}")
+            return code
+
+    # Write result
+    ok, err = write_file(host, path, content)
+    if not ok:
+        print(f"  {RED}Write failed: {err}{RESET}")
+        return 1
+
+    label = f"{host}:{path}" if host else path
+    print(f"  {GREEN}✓{RESET} {label} — {len(patches)} operation(s) applied")
+    print_diff(old_content, content, path)
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI argument parsing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_arg(args, flag):
+    """Get value for a --flag from args list. Returns value or None."""
+    for i, a in enumerate(args):
+        if a == flag and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def has_flag(args, flag):
+    """Check if a flag is present in args."""
+    return flag in args
+
+
+def print_usage():
+    print(f"""
+{WHITE}edit{RESET} — Structured file editing tool
+
+{WHITE}Usage:{RESET}
+  edit <file> --find "old" --replace "new"      Unique search-and-replace
+  edit <file> --after "anchor" --insert "text"   Insert after unique anchor line
+  edit <file> --line N --replace "text"           Replace specific line number
+  edit <file> --append "text"                     Append to end of file
+  edit <file> --write-from /tmp/content.txt       Overwrite file from temp file
+  edit <file> --patch /tmp/edit.json              JSON-based edit (avoids escaping)
+  edit <file> --show                               Show file with line numbers
+  edit <file> --show N                              Show from line N (offset)
+  edit <file> --show N-M                            Show lines N through M
+  edit <file> --map                                 Show structural skeleton with line numbers
+  edit <file> --create                               Create empty file (with parent dirs)
+
+{WHITE}Remote files:{RESET}
+  edit gpu:~/projects/myapp/main.py --show
+  edit dev:~/projects/myapp/src/app.ts --find "X" --replace "Y"
+
+{WHITE}JSON patch format:{RESET}  (one JSON object per line, or a single JSON object)
+  {GRAY}{{"find": "old_text", "replace": "new_text"}}
+  {{"after": "anchor_line", "insert": "new_line"}}
+  {{"line": 42, "replace": "new content"}}
+  {{"append": "text at end"}}
+  {{"content": "entire file content"}}{RESET}
+
+{WHITE}Safety:{RESET}
+  - --find must match exactly 1 occurrence (0 = NOT FOUND, 2+ = AMBIGUOUS)
+  - Atomic writes (temp file + rename)
+  - .bak created on first edit of each file per invocation
+  - Colored diff shown after every edit
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or '-h' in args or '--help' in args:
+        print_usage()
+        sys.exit(0)
+
+    target = args[0]
+    host, path = parse_target(target)
+
+    # --show mode
+    if has_flag(args, '--show'):
+        offset = 0
+        limit = 100
+        show_idx = args.index('--show')
+        if show_idx + 1 < len(args):
+            show_arg = args[show_idx + 1]
+            if '-' in show_arg and not show_arg.startswith('-'):
+                # Range with dash: --show 110-120
+                parts = show_arg.split('-', 1)
+                try:
+                    range_start = int(parts[0])
+                    range_end = int(parts[1])
+                    offset = max(range_start - 1, 0)  # convert to 0-indexed
+                    limit = range_end - offset  # number of lines to show
+                except ValueError:
+                    pass
+            elif show_arg.isdigit():
+                # Check for space-separated range: --show 50 65
+                if show_idx + 2 < len(args) and args[show_idx + 2].isdigit():
+                    range_start = int(show_arg)
+                    range_end = int(args[show_idx + 2])
+                    offset = max(range_start - 1, 0)
+                    limit = range_end - offset
+                else:
+                    offset = int(show_arg)
+        sys.exit(show_file(host, path, offset=offset, limit=limit))
+
+    # --map mode
+    if has_flag(args, '--map'):
+        sys.exit(map_file(host, path))
+
+    # --patch mode
+    patch_file = get_arg(args, '--patch')
+    if patch_file:
+        sys.exit(apply_patch(host, path, patch_file))
+
+    # --write-from mode
+    write_from = get_arg(args, '--write-from')
+    if write_from:
+        try:
+            with open(os.path.expanduser(write_from)) as f:
+                new_content = f.read()
+        except FileNotFoundError:
+            print(f"  {RED}Source file not found: {write_from}{RESET}")
+            sys.exit(1)
+
+        # Read old for diff (might not exist yet)
+        ok, old_content = read_file(host, path)
+        if ok:
+            backup_file(host, path)
+        else:
+            old_content = ''
+
+        ok, err = write_file(host, path, new_content)
+        if not ok:
+            print(f"  {RED}Write failed: {err}{RESET}")
+            sys.exit(1)
+
+        label = f"{host}:{path}" if host else path
+        print(f"  {GREEN}✓{RESET} {label} — written from {write_from}")
+        if old_content:
+            print_diff(old_content, new_content, path)
+        sys.exit(0)
+
+    # --create mode: create empty file (touch equivalent)
+    if has_flag(args, '--create'):
+        ok, existing = read_file(host, path)
+        if ok:
+            label = f"{host}:{path}" if host else path
+            print(f"  {YELLOW}File already exists:{RESET} {label}")
+            sys.exit(1)
+        ok, err = write_file(host, path, '')
+        if not ok:
+            print(f"  {RED}Create failed: {err}{RESET}")
+            sys.exit(1)
+        label = f"{host}:{path}" if host else path
+        print(f"  {GREEN}✓{RESET} {label} — created (empty)")
+        sys.exit(0)
+
+    # Read the target file
+    ok, content = read_file(host, path)
+    if not ok:
+        print(f"  {RED}{content}{RESET}")
+        sys.exit(1)
+
+    old_content = content
+
+    # Determine operation from flags
+    find_str = get_arg(args, '--find')
+    replace_str = get_arg(args, '--replace')
+    after_str = get_arg(args, '--after')
+    insert_str = get_arg(args, '--insert')
+    line_str = get_arg(args, '--line')
+    append_str = get_arg(args, '--append')
+
+    operation = None
+    op_args = {}
+
+    if find_str is not None and replace_str is not None:
+        operation = 'find_replace'
+        op_args = {'find': find_str, 'replace': replace_str}
+    elif after_str is not None and insert_str is not None:
+        operation = 'after_insert'
+        op_args = {'after': after_str, 'insert': insert_str}
+    elif line_str is not None and replace_str is not None:
+        try:
+            line_num = int(line_str)
+        except ValueError:
+            print(f"  {RED}--line must be a number, got: {line_str}{RESET}")
+            sys.exit(1)
+        operation = 'line_replace'
+        op_args = {'line': line_num, 'replace': replace_str}
+    elif append_str is not None:
+        operation = 'append'
+        op_args = {'text': append_str}
+    else:
+        print(f"  {RED}No valid operation specified.{RESET}")
+        print(f"  {GRAY}Use --find/--replace, --after/--insert, --line/--replace, --append, --write-from, or --patch{RESET}")
+        sys.exit(1)
+
+    backup_file(host, path)
+
+    new_content, code = execute_edit(host, path, content, operation, op_args)
+    if code != 0:
+        sys.exit(code)
+
+    ok, err = write_file(host, path, new_content)
+    if not ok:
+        print(f"  {RED}Write failed: {err}{RESET}")
+        sys.exit(1)
+
+    label = f"{host}:{path}" if host else path
+    print(f"  {GREEN}✓{RESET} {label}")
+    print_diff(old_content, new_content, path)
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()

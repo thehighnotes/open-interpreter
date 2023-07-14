@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""health-probe — Lightweight health check for the hub ecosystem.
+
+Probes hosts, LLM backend (vLLM or Ollama), Code Assistant, and autosummary.
+Writes state to ~/.cache/health/latest.json. On state transitions, fires
+desktop notifications.
+
+Usage:
+    health-probe              Run probe (designed for cron every 15m)
+    health-probe --show       Print current state without probing
+    health-probe --help
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import (
+    HEALTH_CACHE_DIR, HOSTS, LOCAL_HOST,
+    LLM_BACKEND, LLM_HOST, LLM_PORT, LLM_BASE_URL,
+    OLLAMA_HOST, OLLAMA_PORT,
+    HUB_CONFIG,
+    GREEN, YELLOW, RED, CYAN, WHITE, GRAY, RESET,
+    check_host_reachable, probe_service, check_code_assistant,
+    hub_notify, ensure_dir,
+)
+
+STATE_FILE = HEALTH_CACHE_DIR / 'latest.json'
+
+# Build dynamic host list (all hosts except local)
+_REMOTE_HOSTS = [k for k in HOSTS if k != LOCAL_HOST]
+
+
+def load_previous():
+    """Load previous probe state. Returns dict or empty dict."""
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def run_probe():
+    """Probe all endpoints, return state dict."""
+    state = {'ts': time.time()}
+
+    # Host reachability (all remote hosts)
+    for host_key in _REMOTE_HOSTS:
+        state[host_key] = check_host_reachable(host_key)
+
+    # LLM backend (vLLM or Ollama)
+    llm_reachable = state.get(LLM_HOST, True) if LLM_HOST != LOCAL_HOST else True
+    if llm_reachable:
+        state['llm'] = probe_service(LLM_HOST, LLM_PORT, timeout=3)
+    else:
+        state['llm'] = False
+
+    # Code Assistant
+    ca_host = HUB_CONFIG['code_assistant']['host']
+    ca_reachable = state.get(ca_host, True) if ca_host != LOCAL_HOST else True
+    if ca_reachable:
+        state['code_assistant'] = check_code_assistant()
+    else:
+        state['code_assistant'] = False
+
+    # Autosummary (check if running locally)
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['pgrep', '-f', 'autosummary'],
+            capture_output=True, timeout=5
+        )
+        state['autosummary'] = result.returncode == 0
+    except Exception:
+        state['autosummary'] = False
+
+    return state
+
+
+def detect_transitions(prev, curr):
+    """Compare previous and current state, return list of transition strings."""
+    transitions = []
+    # Build labels dynamically from hosts + services
+    labels = {}
+    for host_key in _REMOTE_HOSTS:
+        labels[host_key] = HOSTS[host_key]['name']
+    labels['llm'] = f'LLM ({LLM_BACKEND})'
+    labels['code_assistant'] = 'Code Assistant'
+    labels['autosummary'] = 'Autosummary'
+
+    for key, label in labels.items():
+        was = prev.get(key)
+        now = curr.get(key)
+        if was is None:
+            continue  # First run, no transition
+        if was and not now:
+            transitions.append(f"{label} is now DOWN")
+        elif not was and now:
+            transitions.append(f"{label} is now UP")
+    return transitions
+
+
+def save_state(state):
+    """Write state to JSON file."""
+    ensure_dir(HEALTH_CACHE_DIR)
+    STATE_FILE.write_text(json.dumps(state, indent=2) + '\n')
+
+
+def show_state():
+    """Print current state from cache."""
+    state = load_previous()
+    if not state:
+        print(f"  {GRAY}No health data — run health-probe first{RESET}")
+        return
+
+    ts = state.get('ts', 0)
+    age_min = int((time.time() - ts) / 60)
+    print(f"\n  {WHITE}Health Status{RESET}  {GRAY}({age_min}m ago){RESET}\n")
+
+    # Build checks list dynamically
+    checks = []
+    for host_key in _REMOTE_HOSTS:
+        checks.append((HOSTS[host_key]['name'], state.get(host_key)))
+    checks.append((f'LLM ({LLM_BACKEND})', state.get('llm')))
+    checks.append(('Code Assistant', state.get('code_assistant')))
+    checks.append(('Autosummary', state.get('autosummary')))
+
+    for label, up in checks:
+        dot = f"{GREEN}●{RESET}" if up else f"{RED}●{RESET}"
+        status = f"{GREEN}up{RESET}" if up else f"{RED}down{RESET}"
+        print(f"    {dot} {label:<20} {status}")
+    print()
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args:
+        print(__doc__)
+        sys.exit(0)
+
+    if '--show' in args:
+        show_state()
+        sys.exit(0)
+
+    # Run probe
+    prev = load_previous()
+    curr = run_probe()
+    save_state(curr)
+
+    # Detect and notify on transitions
+    transitions = detect_transitions(prev, curr)
+    if transitions:
+        for t in transitions:
+            icon = 'dialog-warning' if 'DOWN' in t else 'dialog-information'
+            hub_notify('Hub Health', t, icon, source='health')
+            print(f"  {YELLOW}▸{RESET} {t}")
+    else:
+        total_checks = len(_REMOTE_HOSTS) + 3  # hosts + llm + CA + autosummary
+        up_count = sum(1 for k in list(_REMOTE_HOSTS) + ['llm', 'code_assistant', 'autosummary'] if curr.get(k))
+        print(f"  {GREEN}●{RESET} {up_count}/{total_checks} healthy — no transitions")
+
+
+if __name__ == '__main__':
+    main()

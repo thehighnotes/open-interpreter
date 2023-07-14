@@ -1,0 +1,38 @@
+{
+  "hub": {
+    "name": "My Dev Hub",
+    "local_host": "local",
+    "role": "hub"
+  },
+  "oi_auto_update": false,
+  "hosts": {
+    "local": {
+      "name": "Hub", "ip": "127.0.0.1", "user": "myuser",
+      "roles": ["local", "vllm"]
+    }
+  },
+  "llm": {
+    "backend": "vllm",
+    "host": "local",
+    "port": 8000,
+    "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+    "context_window": 44000
+  },
+  "code_assistant": { "host": "local", "port": 5002 },
+  "session_persist": false,
+  "backup": { "destination": "~/hub-backup" },
+  "git": {
+    "github_username": "myuser", "email": "me@example.com",
+    "commit_msg": {
+      "detail": "medium",
+      "temperature": 0.3
+    }
+  },
+  "research": {
+    "threshold": 7,
+    "arxiv_categories": ["eess.AS", "cs.SD", "cs.CL", "cs.LG", "cs.AI"],
+    "arxiv_keywords": ["TTS", "speech", "transformer", "inference"],
+    "arxiv_max_results": 30,
+    "github_repos": ["ollama/ollama", "pytorch/pytorch"]
+  }
+}

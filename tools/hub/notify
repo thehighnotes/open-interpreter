@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""notify — Review persistent notification history.
+
+Usage:
+    notify           Show unread notifications
+    notify --all     Show all notifications (last 7 days)
+    notify --clear   Mark all as read
+    notify --count   Print unread count (for dashboard integration)
+"""
+
+import json
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import (
+    NOTIFY_LOG, GREEN, YELLOW, RED, CYAN, WHITE, GRAY, DIM, RESET, BOLD,
+    header_bar, divider,
+)
+
+# Source colors
+SOURCE_COLORS = {
+    'hub': WHITE,
+    'health': CYAN,
+    'session': GREEN,
+    'backup': YELLOW,
+    'research': CYAN,
+    'test': GRAY,
+}
+
+
+def load_entries():
+    """Load all JSONL entries. Returns list of dicts."""
+    if not NOTIFY_LOG.exists():
+        return []
+    entries = []
+    for line in NOTIFY_LOG.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return entries
+
+
+def save_entries(entries):
+    """Write entries back to JSONL."""
+    NOTIFY_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(NOTIFY_LOG, 'w') as f:
+        for e in entries:
+            f.write(json.dumps(e) + '\n')
+
+
+def relative_time(ts):
+    """Return human-readable relative time string."""
+    delta = time.time() - ts
+    if delta < 60:
+        return 'just now'
+    elif delta < 3600:
+        m = int(delta / 60)
+        return f'{m}m ago'
+    elif delta < 86400:
+        h = int(delta / 3600)
+        return f'{h}h ago'
+    else:
+        d = int(delta / 86400)
+        return f'{d}d ago'
+
+
+def render_entries(entries):
+    """Render notification entries grouped by day, newest first."""
+    if not entries:
+        print(f"\n  {DIM}No notifications{RESET}\n")
+        return
+
+    # Sort newest first
+    entries = sorted(entries, key=lambda e: e.get('ts', 0), reverse=True)
+
+    print()
+    header_bar()
+    unread = sum(1 for e in entries if not e.get('read'))
+    total = len(entries)
+    label = f"{unread} unread" if unread else "all read"
+    print(f"  {WHITE}NOTIFICATIONS{RESET}  {GRAY}({label}, {total} total){RESET}")
+    header_bar()
+
+    current_day = None
+    for e in entries:
+        ts = e.get('ts', 0)
+        dt = datetime.fromtimestamp(ts)
+        day_label = dt.strftime('%a %d %b')
+
+        if day_label != current_day:
+            current_day = day_label
+            print(f"\n  {DIM}{day_label}{RESET}")
+            divider()
+
+        source = e.get('source', 'hub')
+        color = SOURCE_COLORS.get(source, GRAY)
+        read_marker = ' ' if e.get('read') else f'{YELLOW}*{RESET}'
+        time_str = relative_time(ts)
+        title = e.get('title', '')
+        body = e.get('body', '')
+
+        print(f"  {read_marker} {color}{source:>8s}{RESET}  {title}")
+        if body:
+            print(f"             {DIM}{body}{RESET}")
+        print(f"             {GRAY}{time_str}  ·  {dt.strftime('%H:%M')}{RESET}")
+
+    print()
+
+
+def cmd_unread():
+    """Show only unread notifications."""
+    entries = load_entries()
+    unread = [e for e in entries if not e.get('read')]
+    if not unread:
+        print(f"\n  {GREEN}✓{RESET} No unread notifications\n")
+        return
+    render_entries(unread)
+
+
+def cmd_all():
+    """Show all notifications from last 7 days."""
+    entries = load_entries()
+    cutoff = time.time() - 7 * 86400
+    recent = [e for e in entries if e.get('ts', 0) > cutoff]
+    render_entries(recent)
+
+
+def cmd_clear():
+    """Mark all notifications as read."""
+    entries = load_entries()
+    unread_count = sum(1 for e in entries if not e.get('read'))
+    if unread_count == 0:
+        print(f"\n  {DIM}Already all read{RESET}\n")
+        return
+    for e in entries:
+        e['read'] = True
+    save_entries(entries)
+    print(f"\n  {GREEN}✓{RESET} Marked {unread_count} notification(s) as read\n")
+
+
+def cmd_count():
+    """Print unread count (for dashboard integration)."""
+    entries = load_entries()
+    unread = sum(1 for e in entries if not e.get('read'))
+    print(unread)
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        cmd_unread()
+    elif args[0] == '--all':
+        cmd_all()
+    elif args[0] == '--clear':
+        cmd_clear()
+    elif args[0] == '--count':
+        cmd_count()
+    elif args[0] in ('--help', '-h'):
+        print(__doc__)
+    else:
+        print(f"Unknown option: {args[0]}")
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

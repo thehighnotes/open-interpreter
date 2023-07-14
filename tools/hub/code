@@ -1,0 +1,1444 @@
+#!/usr/bin/env python3
+"""code — Interactive code exploration + index management tool.
+
+Queries the AGX Code Assistant (semantic search, dependency graphs, RAG)
+across indexed projects, and manages project indexing.
+
+Usage:
+    code                             List indexed projects
+    code search <project> "query"    Find files matching a concept
+    code ask <project> "question"    RAG architecture question
+    code impact <project> "file"     What depends on this file
+    code graph <project>             Dependency graph overview
+    code scan <host>                 Discover + index new projects
+    code reindex <project>           Trigger reindex on existing project
+    code manage                      Interactive index management dashboard
+    code --help
+"""
+
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import (
+    BOLD, BRIGHT_GREEN, CYAN, CODE_ASSISTANT_PROJECTS, CODE_ASSISTANT_URL,
+    CODE_CACHE_DIR, DEFAULT_MODEL, HUB_CONFIG, HOSTS, IGNORED, LOCAL_HOST, OVERVIEW_CACHE_DIR, PROJECTS, PROJECT_ORDER,
+    DIM, GRAY, GREEN, HIGHLIGHT_BG, HIGHLIGHT_OFF, KEY_ENTER, RED, RESET, WHITE, YELLOW,
+    check_agx_ws_ssh, check_code_assistant, check_host_reachable,
+    code_assistant_get, code_assistant_post,
+    cols, divider, ensure_dir, header_bar, interactive_select, load_projects, print_right,
+    reload_projects, resolve_code_project, resolve_project, rsync_to_agx, rsync_to_ca_host, save_projects,
+    ssh_cmd, Spinner, thin_divider,
+)
+
+# Detect OI environment (plain text mode)
+IN_OI = 'OI_EXECUTION_TIMEOUT' in os.environ
+
+# Model selection — derived from config
+MODEL_ASK = DEFAULT_MODEL
+MODEL_TOOLS = DEFAULT_MODEL
+
+# Code Assistant host info for messages
+_CA_HOST = HUB_CONFIG['code_assistant']['host']
+_CA_PORT = HUB_CONFIG['code_assistant']['port']
+_CA_HOST_NAME = HOSTS.get(_CA_HOST, {}).get('name', _CA_HOST)
+_CA_LABEL = f'{_CA_HOST_NAME}:{_CA_PORT}'
+
+# Cache TTLs (seconds)
+TTL_SEARCH = 3600       # 1h
+TTL_ASK = 14400         # 4h
+TTL_IMPACT = 86400      # 24h
+TTL_GRAPH = 86400       # 24h
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cache_key(hub_key, cmd, query):
+    """Generate a short hash for cache filename."""
+    h = hashlib.md5(f'{hub_key}:{cmd}:{query}'.encode()).hexdigest()[:8]
+    return h
+
+
+def _read_cache(hub_key, cmd, query, ttl):
+    """Read cached result if fresh enough. Returns dict or None."""
+    h = _cache_key(hub_key, cmd, query)
+    cache_file = CODE_CACHE_DIR / f'{hub_key}_{cmd}_{h}.json'
+    if not cache_file.exists():
+        return None
+    try:
+        data = json.loads(cache_file.read_text())
+        if time.time() - data.get('ts', 0) < ttl:
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
+def _write_cache(hub_key, cmd, query, result):
+    """Write result to cache file."""
+    h = _cache_key(hub_key, cmd, query)
+    ensure_dir(CODE_CACHE_DIR)
+    cache_file = CODE_CACHE_DIR / f'{hub_key}_{cmd}_{h}.json'
+    data = {'ts': time.time(), 'hub_key': hub_key, 'cmd': cmd, 'query': query, 'data': result}
+    cache_file.write_text(json.dumps(data, indent=2))
+    return cache_file
+
+
+def _write_last(hub_key, cmd, result):
+    """Write latest query result for preamble injection."""
+    ensure_dir(CODE_CACHE_DIR)
+    last_file = CODE_CACHE_DIR / f'{hub_key}_last.json'
+    data = {'ts': time.time(), 'type': cmd, 'data': result}
+    last_file.write_text(json.dumps(data, indent=2))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _basename(path):
+    """Get filename from a full path."""
+    return path.rsplit('/', 1)[-1] if '/' in path else path
+
+
+def _truncate(text, max_chars=2000):
+    """Truncate text with ellipsis if over limit."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars - 3] + '...'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Subcommands
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_list():
+    """List indexed projects with status."""
+    if not check_code_assistant():
+        print(f"{'Code Assistant offline ({_CA_LABEL})' if IN_OI else f'{RED}Code Assistant offline{RESET} ({_CA_LABEL})'}")
+        sys.exit(1)
+
+    result = code_assistant_get('projects', timeout=5)
+    if not result or 'projects' not in result:
+        print('Failed to fetch project list')
+        sys.exit(1)
+
+    projects = result['projects']
+
+    if IN_OI:
+        print(f"Code Assistant: {len(projects)} indexed projects")
+        for p in projects:
+            total = p.get('code_count', 0) + p.get('doc_count', 0)
+            hub_keys = [k for k, v in CODE_ASSISTANT_PROJECTS.items() if v == p['name']]
+            hub_label = f" (hub: {hub_keys[0]})" if hub_keys else ''
+            print(f"  {p['name']}: {total} files ({p.get('code_count',0)} code, {p.get('doc_count',0)} docs){hub_label}")
+    else:
+        print()
+        header_bar()
+        print(f"{BRIGHT_GREEN}  CODE ASSISTANT{RESET}")
+        header_bar()
+        print()
+        print(f"  {WHITE}{'Project':<16s}{'Files':>8s}{'Code':>8s}{'Docs':>8s}  Hub Key{RESET}")
+        divider()
+        for p in projects:
+            total = p.get('code_count', 0) + p.get('doc_count', 0)
+            hub_keys = [k for k, v in CODE_ASSISTANT_PROJECTS.items() if v == p['name']]
+            hub_label = hub_keys[0] if hub_keys else f'{GRAY}--{RESET}'
+            print(f"  {GREEN}{p['name']:<16s}{RESET}{total:>8d}{p.get('code_count',0):>8d}{p.get('doc_count',0):>8d}  {hub_label}")
+        print()
+        print(f"  {GRAY}Use hub project keys: code search myproject \"memory\"{RESET}")
+        print()
+
+
+def _stream_ask_with_tools(ca_key, question, timeout=180, model=None, use_tools=True):
+    """Stream ask/stream endpoint. Yields (event_type, data) tuples.
+
+    Event types: 'meta', 'tool_call', 'tool_result', 'chunk', 'done'
+    """
+    url = f'{CODE_ASSISTANT_URL}/ask/stream'
+    payload = {
+        'question': question,
+        'project': ca_key,
+        'use_tools': use_tools,
+    }
+    if model:
+        payload['settings'] = {'model': model}
+    body = json.dumps(payload).encode()
+
+    req = urllib.request.Request(url, data=body,
+        headers={'Content-Type': 'application/json', 'Accept': 'text/event-stream'})
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        buf = b''
+        for raw in resp:
+            buf += raw
+            # SSE lines end with \n\n — process complete events
+            while b'\n\n' in buf:
+                event_data, buf = buf.split(b'\n\n', 1)
+                for line in event_data.decode('utf-8', errors='replace').split('\n'):
+                    line = line.strip()
+                    if line.startswith('data: '):
+                        try:
+                            obj = json.loads(line[6:])
+                            yield (obj.get('type', ''), obj)
+                        except json.JSONDecodeError:
+                            pass
+
+
+def cmd_search(hub_key, query):
+    """Search codebase using tools-enabled agent (reads files, chains searches, answers)."""
+    ca_key = resolve_code_project(hub_key)
+    if not ca_key:
+        print(f"Project '{hub_key}' is not indexed in Code Assistant")
+        print(f"Indexed: {', '.join(CODE_ASSISTANT_PROJECTS.keys())}")
+        sys.exit(1)
+
+    # Check cache — cached results contain the full answer
+    cached = _read_cache(hub_key, 'search', query, TTL_SEARCH)
+    if cached:
+        result = cached['data']
+        answer = result.get('answer', '')
+        files_used = result.get('files_used', [])
+
+        if IN_OI:
+            meta_parts = [hub_key]
+            if files_used:
+                meta_parts.append(f"{len(files_used)} files")
+            meta_parts.append('cached')
+            print(f"[Code Search — {', '.join(meta_parts)}]")
+            print(_truncate(answer, 1800))
+            if files_used:
+                fnames = [_basename(f) for f in files_used[:6]]
+                print(f"Files: {', '.join(fnames)}")
+        else:
+            print()
+            meta_parts = [hub_key]
+            if files_used:
+                meta_parts.append(f"{len(files_used)} files")
+            meta_parts.append('cached')
+            print_right(f"  {WHITE}Search: \"{query}\" in {hub_key}{RESET}",
+                         f"{GRAY}{', '.join(meta_parts)}{RESET}")
+            divider()
+            print()
+            for line in answer.split('\n'):
+                print(f"  {line}")
+            if files_used:
+                print()
+                print(f"  {CYAN}Files referenced:{RESET}")
+                for f in files_used[:8]:
+                    print(f"    {DIM}{_basename(f)}{RESET}")
+            print()
+        return
+
+    # Live query with tools
+    if not check_code_assistant():
+        print(f"{'Code Assistant offline ({_CA_LABEL})' if IN_OI else f'{RED}Code Assistant offline{RESET} ({_CA_LABEL})'}")
+        sys.exit(1)
+
+    if not IN_OI:
+        print()
+        print_right(f"  {WHITE}Search: \"{query}\" in {hub_key}{RESET}", f"{GRAY}tools enabled{RESET}")
+        divider()
+        print()
+
+    answer_chunks = []
+    files_used = []
+    tool_calls_seen = []
+    start = time.time()
+
+    try:
+        for evt_type, evt in _stream_ask_with_tools(ca_key, query, model=MODEL_TOOLS):
+            if evt_type == 'tool_call':
+                tool = evt.get('tool', '')
+                args = evt.get('arguments', {})
+                tool_calls_seen.append(tool)
+                if IN_OI:
+                    if tool == 'search_code':
+                        print(f"  [searching: {args.get('query', '')}]")
+                    elif tool == 'read_files':
+                        paths = args.get('paths', [])
+                        fnames = [_basename(p) for p in paths[:3]]
+                        print(f"  [reading: {', '.join(fnames)}]")
+                    elif tool == 'list_files':
+                        print(f"  [listing: {args.get('path', '/')}]")
+                    elif tool != 'respond':
+                        print(f"  [{tool}]")
+                else:
+                    if tool == 'search_code':
+                        print(f"  {DIM}⟳ searching: {args.get('query', '')}{RESET}")
+                    elif tool == 'read_files':
+                        paths = args.get('paths', [])
+                        fnames = [_basename(p) for p in paths[:3]]
+                        print(f"  {DIM}⟳ reading: {', '.join(fnames)}{RESET}")
+                    elif tool == 'list_files':
+                        print(f"  {DIM}⟳ listing: {args.get('path', '/')}{RESET}")
+                    elif tool != 'respond':
+                        print(f"  {DIM}⟳ {tool}{RESET}")
+
+            elif evt_type == 'chunk':
+                chunk = evt.get('content', '')
+                answer_chunks.append(chunk)
+                if IN_OI:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                else:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+
+            elif evt_type == 'done':
+                files_used = evt.get('files_used', [])
+
+    except Exception as e:
+        if not answer_chunks:
+            print(f"{'Search failed: ' + str(e) if IN_OI else f'{RED}Search failed:{RESET} {e}'}")
+            sys.exit(1)
+
+    answer = ''.join(answer_chunks)
+    elapsed = time.time() - start
+
+    # Trailing newline after streamed output
+    if answer_chunks:
+        print()
+
+    if IN_OI:
+        if files_used:
+            fnames = [_basename(f) for f in files_used[:6]]
+            print(f"Files: {', '.join(fnames)}")
+        print(f"[{len(tool_calls_seen)} tool calls, {elapsed:.1f}s]")
+    else:
+        if files_used:
+            print()
+            print(f"  {CYAN}Files referenced:{RESET}")
+            for f in files_used[:8]:
+                print(f"    {DIM}{_basename(f)}{RESET}")
+        print()
+        print(f"  {GRAY}{len(tool_calls_seen)} tool calls | {elapsed:.1f}s{RESET}")
+        print()
+
+    # Cache the result
+    _write_cache(hub_key, 'search', query, {
+        'answer': answer,
+        'files_used': files_used,
+        'tool_calls': tool_calls_seen,
+        'elapsed': elapsed,
+    })
+    _write_last(hub_key, 'search', {
+        'answer': answer,
+        'files_used': files_used,
+    })
+
+
+def cmd_ask(hub_key, question):
+    """RAG architecture question — uses LLM on AGX."""
+    ca_key = resolve_code_project(hub_key)
+    if not ca_key:
+        print(f"Project '{hub_key}' is not indexed in Code Assistant")
+        print(f"Indexed: {', '.join(CODE_ASSISTANT_PROJECTS.keys())}")
+        sys.exit(1)
+
+    # Check cache
+    cached = _read_cache(hub_key, 'ask', question, TTL_ASK)
+    if cached:
+        result = cached['data']
+        from_cache = True
+    else:
+        if not check_code_assistant():
+            print(f"{'Code Assistant offline ({_CA_LABEL})' if IN_OI else f'{RED}Code Assistant offline{RESET} ({_CA_LABEL})'}")
+            sys.exit(1)
+
+        from_cache = False
+        with Spinner(f"Asking Code Assistant about {hub_key}..."):
+            result = code_assistant_post('ask', {
+                'question': question, 'project': ca_key,
+                'model': MODEL_ASK,
+            }, timeout=120)
+
+        if result is None:
+            print('Ask request failed (timeout or error)')
+            sys.exit(1)
+
+        cache_file = _write_cache(hub_key, 'ask', question, result)
+        _write_last(hub_key, 'ask', result)
+
+    answer = result.get('answer', '')
+    files = result.get('files_used', [])
+    context_size = result.get('context_size', 0)
+
+    if IN_OI:
+        meta_parts = [hub_key]
+        if files:
+            meta_parts.append(f"{len(files)} files")
+        if context_size:
+            meta_parts.append(f"{context_size // 1000}K context")
+        if from_cache:
+            meta_parts.append('cached')
+        print(f"[Code Assistant — {', '.join(meta_parts)}]")
+        truncated = _truncate(answer, 1500)
+        print(truncated)
+        if files:
+            fnames = [_basename(f) if isinstance(f, str) else _basename(f.get('file_path', '')) for f in files[:6]]
+            print(f"Files: {', '.join(fnames)}")
+        if len(answer) > 1500:
+            h = _cache_key(hub_key, 'ask', question)
+            print(f"Full result: ~/.cache/code/{hub_key}_ask_{h}.json")
+    else:
+        print()
+        meta_parts = [hub_key]
+        if files:
+            meta_parts.append(f"{len(files)} files")
+        if context_size:
+            meta_parts.append(f"{context_size // 1000}K context")
+        if from_cache:
+            meta_parts.append('cached')
+        print_right(
+            f"  {WHITE}Ask: {hub_key}{RESET}",
+            f"{GRAY}{', '.join(meta_parts)}{RESET}"
+        )
+        divider()
+        print()
+        for line in answer.split('\n'):
+            print(f"  {line}")
+        if files:
+            print()
+            print(f"  {CYAN}Files referenced:{RESET}")
+            for f in files[:8]:
+                fname = f if isinstance(f, str) else f.get('file_path', '')
+                print(f"    {DIM}{_basename(fname)}{RESET}")
+        print()
+
+
+def cmd_impact(hub_key, file_path):
+    """Show what depends on a file."""
+    ca_key = resolve_code_project(hub_key)
+    if not ca_key:
+        print(f"Project '{hub_key}' is not indexed in Code Assistant")
+        print(f"Indexed: {', '.join(CODE_ASSISTANT_PROJECTS.keys())}")
+        sys.exit(1)
+
+    # Check cache
+    cached = _read_cache(hub_key, 'impact', file_path, TTL_IMPACT)
+    if cached:
+        result = cached['data']
+    else:
+        if not check_code_assistant():
+            print(f"{'Code Assistant offline ({_CA_LABEL})' if IN_OI else f'{RED}Code Assistant offline{RESET} ({_CA_LABEL})'}")
+            sys.exit(1)
+
+        result = code_assistant_post('impact', {
+            'file_path': file_path, 'project': ca_key
+        }, timeout=30)
+
+        if result is None:
+            print('Impact request failed')
+            sys.exit(1)
+
+        _write_cache(hub_key, 'impact', file_path, result)
+        _write_last(hub_key, 'impact', result)
+
+    direct = result.get('direct_dependents', [])
+    indirect = result.get('indirect_dependents', [])
+    risk = result.get('risk_level', 'unknown')
+    total = result.get('total_affected', 0)
+
+    if IN_OI:
+        print(f"Impact: {_basename(file_path)} in {hub_key} — {total} affected, risk: {risk}")
+        if direct:
+            print(f"Direct ({len(direct)}):")
+            for d in direct[:8]:
+                fname = d if isinstance(d, str) else d.get('file_path', str(d))
+                print(f"  {_basename(fname)}")
+        if indirect:
+            print(f"Indirect ({len(indirect)}):")
+            for d in indirect[:5]:
+                fname = d if isinstance(d, str) else d.get('file_path', str(d))
+                print(f"  {_basename(fname)}")
+    else:
+        print()
+        risk_color = GREEN if risk == 'low' else YELLOW if risk == 'medium' else RED
+        print(f"  {WHITE}Impact: {_basename(file_path)}{RESET}  {risk_color}{risk} risk{RESET}  ({total} affected)")
+        divider()
+        if direct:
+            print(f"  {CYAN}Direct dependents ({len(direct)}):{RESET}")
+            for d in direct[:10]:
+                fname = d if isinstance(d, str) else d.get('file_path', str(d))
+                print(f"    {_basename(fname)}")
+        if indirect:
+            print(f"  {CYAN}Indirect dependents ({len(indirect)}):{RESET}")
+            for d in indirect[:8]:
+                fname = d if isinstance(d, str) else d.get('file_path', str(d))
+                print(f"    {DIM}{_basename(fname)}{RESET}")
+        if not direct and not indirect:
+            print(f"  {GRAY}No dependents found{RESET}")
+        print()
+
+
+def cmd_graph(hub_key):
+    """Show dependency graph overview."""
+    ca_key = resolve_code_project(hub_key)
+    if not ca_key:
+        print(f"Project '{hub_key}' is not indexed in Code Assistant")
+        print(f"Indexed: {', '.join(CODE_ASSISTANT_PROJECTS.keys())}")
+        sys.exit(1)
+
+    # Check cache
+    cached = _read_cache(hub_key, 'graph', ca_key, TTL_GRAPH)
+    if cached:
+        result = cached['data']
+    else:
+        if not check_code_assistant():
+            print(f"{'Code Assistant offline ({_CA_LABEL})' if IN_OI else f'{RED}Code Assistant offline{RESET} ({_CA_LABEL})'}")
+            sys.exit(1)
+
+        result = code_assistant_get('graph/stats', {'project': ca_key}, timeout=10)
+        if result is None:
+            print('Graph stats request failed')
+            sys.exit(1)
+
+        _write_cache(hub_key, 'graph', ca_key, result)
+
+    total_files = result.get('total_files', 0)
+    total_edges = result.get('total_edges', 0)
+    avg_imports = result.get('avg_imports_per_file', 0)
+    most_imported = result.get('most_imported', [])
+    top_importers = result.get('top_importers', [])
+
+    if IN_OI:
+        print(f"Graph: {hub_key} — {total_files} files, {total_edges} edges, avg {avg_imports:.1f} imports/file")
+        if most_imported:
+            print("Most imported:")
+            for m in most_imported[:5]:
+                print(f"  {m.get('file','?')} ({m.get('count',0)})")
+        if top_importers:
+            print("Top importers:")
+            for t in top_importers[:5]:
+                print(f"  {_basename(t.get('file','?'))} ({t.get('count',0)})")
+    else:
+        print()
+        print(f"  {WHITE}Dependency Graph: {hub_key}{RESET}")
+        divider()
+        print(f"  Files: {WHITE}{total_files}{RESET}    Edges: {WHITE}{total_edges}{RESET}    Avg imports/file: {WHITE}{avg_imports:.1f}{RESET}")
+        print()
+        if most_imported:
+            print(f"  {CYAN}Most imported:{RESET}")
+            for m in most_imported[:8]:
+                name = m.get('file', '?')
+                count = m.get('count', 0)
+                bar = '█' * min(count // 10, 30)
+                print(f"    {name:<40s} {count:>4d}  {DIM}{bar}{RESET}")
+        if top_importers:
+            print()
+            print(f"  {CYAN}Top importers (most dependencies):{RESET}")
+            for t in top_importers[:8]:
+                fname = _basename(t.get('file', '?'))
+                count = t.get('count', 0)
+                print(f"    {fname:<40s} {count:>4d}")
+        print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scan — discover + index new projects
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prompt(msg, default=''):
+    """Prompt for input with a default. Returns default on empty/EOF/Ctrl-C."""
+    try:
+        val = input(msg).strip()
+        return val if val else default
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+
+
+def _count_code_files(host_alias, project_path):
+    """Count code files in a remote project via SSH. Returns int."""
+    cmd = (
+        f'find {project_path} -type f '
+        r'\( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.tsx" '
+        r'-o -name "*.jsx" -o -name "*.java" -o -name "*.go" -o -name "*.rs" '
+        r'-o -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.rb" '
+        r'-o -name "*.html" -o -name "*.css" -o -name "*.vue" -o -name "*.svelte" '
+        r'-o -name "*.md" -o -name "*.json" -o -name "*.yaml" -o -name "*.yml" \) '
+        r'-not -path "*/.git/*" -not -path "*/node_modules/*" '
+        r'-not -path "*/__pycache__/*" -not -path "*/.venv/*" '
+        r'-not -path "*/dist/*" -not -path "*/build/*" '
+        f'2>/dev/null | wc -l'
+    )
+    ok, output = ssh_cmd(host_alias, cmd, timeout=15)
+    if ok and output.strip():
+        try:
+            return int(output.strip())
+        except ValueError:
+            pass
+    return 0
+
+
+def _guess_language(host_alias, project_path):
+    """Guess primary language of a project. Returns short string."""
+    cmd = (
+        f'cd {project_path} 2>/dev/null && '
+        r'py=$(find . -name "*.py" -not -path "*/.git/*" -not -path "*/__pycache__/*" 2>/dev/null | wc -l) && '
+        r'js=$(find . -name "*.js" -o -name "*.ts" -o -name "*.tsx" -o -name "*.jsx" 2>/dev/null | grep -v node_modules | grep -v ".git" | wc -l) && '
+        r'go=$(find . -name "*.go" -not -path "*/.git/*" 2>/dev/null | wc -l) && '
+        r'rs=$(find . -name "*.rs" -not -path "*/.git/*" 2>/dev/null | wc -l) && '
+        r'web=$(find . \( -name "*.html" -o -name "*.css" -o -name "*.vue" -o -name "*.svelte" \) -not -path "*/.git/*" -not -path "*/node_modules/*" 2>/dev/null | wc -l) && '
+        'echo "$py $js $go $rs $web"'
+    )
+    ok, output = ssh_cmd(host_alias, cmd, timeout=10)
+    if ok and output.strip():
+        parts = output.strip().split()
+        if len(parts) == 5:
+            py, js, go, rs, web = [int(x) for x in parts]
+            counts = {'python': py, 'js/ts': js, 'go': go, 'rust': rs, 'html/css': web}
+            best = max(counts, key=counts.get)
+            if counts[best] > 0:
+                return best
+    return ''
+
+
+def _ws_setup_instructions():
+    """Print SSH setup instructions for cross-host project syncing."""
+    # Find the WS-like host (the one that needs syncing)
+    ws_host = HOSTS.get('ws', {})
+    ws_ip = ws_host.get('ip', '<WS_IP>')
+    ws_user = ws_host.get('user', '<WS_USER>')
+    ca_host_name = _CA_HOST_NAME
+
+    print()
+    print(f"  {YELLOW}{ca_host_name} cannot SSH to WS — setup required for syncing WS projects{RESET}")
+    print()
+    print(f"  Run these commands manually:")
+    print()
+    print(f"  {WHITE}# On {ca_host_name} — generate key if needed:{RESET}")
+    print(f"  {CYAN}ssh {_CA_HOST}{RESET}")
+    print(f"  {CYAN}[ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519{RESET}")
+    print()
+    print(f"  {WHITE}# Copy pubkey to WS:{RESET}")
+    print(f"  {CYAN}ssh-copy-id -i ~/.ssh/id_ed25519.pub {ws_user}@{ws_ip}{RESET}")
+    print()
+    print(f"  {WHITE}# Add WS alias to SSH config:{RESET}")
+    print(f"  {CYAN}cat >> ~/.ssh/config << 'EOF'")
+    print(f"  Host ws")
+    print(f"    HostName {ws_ip}")
+    print(f"    User {ws_user}")
+    print(f"  EOF{RESET}")
+    print()
+    print(f"  {WHITE}# Test connectivity:{RESET}")
+    print(f"  {CYAN}ssh ws echo ok{RESET}")
+    print()
+
+
+def cmd_scan(host_key):
+    """Discover projects on a host and offer to index them in Code Assistant."""
+    if host_key not in HOSTS:
+        print(f"{RED}Unknown host '{host_key}'. Available: {', '.join(HOSTS.keys())}{RESET}")
+        sys.exit(1)
+
+    host = HOSTS[host_key]
+    host_alias = host['alias']
+    host_name = host['name']
+
+    print()
+    print(f"  {CYAN}Scanning {host_name} ({host['ip']}) for indexable projects...{RESET}")
+
+    # Check host reachability
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {host_name} is offline{RESET}")
+        sys.exit(1)
+
+    # Check Code Assistant
+    if not check_code_assistant():
+        print(f"\n  {RED}Code Assistant offline{RESET} ({_CA_LABEL}) — cannot index")
+        sys.exit(1)
+
+    # For projects on a different host than CA, check CA→source SSH
+    ca_host = HUB_CONFIG['code_assistant']['host']
+    if host_key != ca_host and not check_agx_ws_ssh():
+        _ws_setup_instructions()
+        retry = _prompt(f"  {WHITE}Retry after setup? (y/N): {RESET}", 'n').lower()
+        if retry in ('y', 'yes') and check_agx_ws_ssh():
+            print(f"  {GREEN}✓{RESET} SSH working")
+        elif retry in ('y', 'yes'):
+            print(f"  {RED}Still can't connect. Check setup and try again.{RESET}")
+            sys.exit(1)
+        else:
+            sys.exit(0)
+
+    # Get currently indexed projects from CA
+    ca_result = code_assistant_get('projects', timeout=5)
+    indexed_projects = {}
+    if ca_result and 'projects' in ca_result:
+        for p in ca_result['projects']:
+            indexed_projects[p['name']] = p
+
+    # SSH scan for projects
+    scan_cmd = r'''
+for d in ~/projects/*/; do
+    [ -d "$d" ] || continue
+    dirname=$(basename "$d")
+    git=no; [ -d "$d/.git" ] && git=yes
+    claude_md=none
+    [ -f "$d/CLAUDE.md" ] && claude_md=CLAUDE.md
+    [ -f "$d/claude.md" ] && claude_md=claude.md
+    hub_env=no; [ -f "$d/.hub-env" ] && hub_env=yes
+    has_py=no; ls "$d"/*.py "$d"/**/*.py 2>/dev/null | head -1 | grep -q . && has_py=yes
+    has_code=no; ls "$d"/*.py "$d"/*.js "$d"/*.ts "$d"/*.go "$d"/*.rs "$d"/*.html "$d"/*.css "$d"/*.vue "$d"/*.svelte 2>/dev/null | head -1 | grep -q . && has_code=yes
+    if [ "$has_code" = "no" ]; then
+        find "$d" -maxdepth 3 -type f \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.rs" -o -name "*.go" -o -name "*.html" -o -name "*.css" -o -name "*.vue" -o -name "*.svelte" -o -name "*.jsx" -o -name "*.tsx" \) 2>/dev/null | head -1 | grep -q . && has_code=yes
+    fi
+    echo "${dirname}|${git}|${claude_md}|${hub_env}|${has_py}|${has_code}"
+done
+'''
+    ok, output = ssh_cmd(host_alias, scan_cmd, timeout=15)
+    if not ok or not output.strip():
+        print(f"\n  {GRAY}No ~/projects/ directory found or empty{RESET}")
+        sys.exit(0)
+
+    # Build candidate list
+    # Determine which dirname maps to which CA project by matching root_path
+    indexed_by_path = {}
+    for name, p in indexed_projects.items():
+        root = p.get('root_path', '')
+        if root:
+            indexed_by_path[root.rstrip('/').rsplit('/', 1)[-1].lower()] = name
+
+    # Also track hub project → CA name mappings
+    hub_ca_map = {}
+    for hub_key, ca_key in CODE_ASSISTANT_PROJECTS.items():
+        hub_ca_map[ca_key] = hub_key
+
+    host_ignored = set(IGNORED.get(host_key, []))
+    candidates = []
+    already_indexed = []
+    ignored_dirs = []
+
+    for line in output.strip().split('\n'):
+        parts = line.split('|', 5)
+        if len(parts) < 6:
+            continue
+        dirname, git, claude_md, hub_env, has_py, has_code = parts
+
+        entry = {
+            'dirname': dirname,
+            'path': f'~/projects/{dirname}',
+            'git': git == 'yes',
+            'claude_md': claude_md if claude_md != 'none' else None,
+            'hub_env': hub_env == 'yes',
+            'has_code': has_code == 'yes' or has_py == 'yes',
+        }
+
+        # Check if already indexed in CA
+        ca_name = indexed_by_path.get(dirname.lower())
+        if not ca_name:
+            # Check by iterating indexed projects for path match
+            user = host['user']
+            full_path = f'/home/{user}/projects/{dirname}'
+            for name, p in indexed_projects.items():
+                if p.get('root_path', '').rstrip('/') == full_path:
+                    ca_name = name
+                    break
+        if not ca_name:
+            # Check hub registry — WS projects are mirrored to AGX with
+            # a different name, so path matching against CA root_path fails.
+            # Use the code_index field from projects.json instead.
+            for pk, proj in PROJECTS.items():
+                if proj['host'] == host_key and proj['path'].rstrip('/').endswith(dirname):
+                    ci = proj.get('code_index')
+                    if ci and ci in indexed_projects:
+                        ca_name = ci
+                        break
+
+        if ca_name:
+            entry['ca_name'] = ca_name
+            entry['ca_info'] = indexed_projects[ca_name]
+            entry['hub_key'] = hub_ca_map.get(ca_name, '')
+            already_indexed.append(entry)
+        elif dirname in host_ignored:
+            ignored_dirs.append(dirname)
+        elif entry['has_code']:
+            candidates.append(entry)
+
+    # Display
+    if candidates:
+        # Get file counts and language for candidates
+        print(f"\n  {WHITE}Indexable projects (not yet in Code Assistant):{RESET}\n")
+
+        max_dir = max(len(c['dirname']) for c in candidates) if candidates else 20
+        dir_width = max(max_dir + 2, 20)
+
+        print(f"  {GRAY}{'#':<4}{'Directory':<{dir_width}}{'Git':<6}{'CLAUDE.md':<12}{'Lang'}{RESET}")
+        print(f"  {GRAY}{'─' * (dir_width + 30)}{RESET}")
+
+        for i, c in enumerate(candidates, 1):
+            git_str = f"{GREEN}git{RESET}" if c['git'] else f"{GRAY}-{RESET}"
+            claude_str = f"{GREEN}{c['claude_md']}{RESET}" if c['claude_md'] else f"{GRAY}-{RESET}"
+            git_vis = 'git' if c['git'] else '-'
+            claude_vis = c['claude_md'] or '-'
+            dirname_padded = c['dirname'] + ' ' * max(0, dir_width - len(c['dirname']))
+            git_padded = git_str + ' ' * max(0, 6 - len(git_vis))
+            claude_padded = claude_str + ' ' * max(0, 12 - len(claude_vis))
+
+            lang = _guess_language(host_alias, f"~/projects/{c['dirname']}")
+            lang_str = f"{GRAY}{lang}{RESET}" if lang else ''
+            print(f"  {WHITE}{i:<4}{RESET}{dirname_padded}{git_padded}{claude_padded}{lang_str}")
+    else:
+        print(f"\n  {GREEN}✓{RESET} All projects on {host_name} are already indexed")
+
+    # Show already indexed
+    if already_indexed:
+        print(f"\n  {GRAY}Already indexed:{RESET}")
+        for a in already_indexed:
+            ca_info = a['ca_info']
+            total = ca_info.get('code_count', 0) + ca_info.get('doc_count', 0)
+            hub_label = f" → hub:{a['hub_key']}" if a.get('hub_key') else ''
+            print(f"  {GRAY}  ·  {a['dirname']:<20s} {a['ca_name']} ({total} files){hub_label}{RESET}")
+
+    # Display ignored dirs (dimmed)
+    if ignored_dirs:
+        print(f"\n  {DIM}Ignored: {', '.join(sorted(ignored_dirs))}  (hub --scan --ignore {host_key} to manage){RESET}")
+
+    if not candidates:
+        print()
+        sys.exit(0)
+
+    # Interactive selection
+    print()
+    nums = ','.join(str(i) for i in range(1, len(candidates) + 1))
+    try:
+        choice = input(f"  {WHITE}Index which? ({nums} / all / q): {RESET}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+
+    if choice in ('q', 'quit', ''):
+        sys.exit(0)
+
+    if choice == 'all':
+        selected = list(range(len(candidates)))
+    else:
+        selected = []
+        for part in choice.split(','):
+            part = part.strip()
+            try:
+                idx = int(part) - 1
+                if 0 <= idx < len(candidates):
+                    selected.append(idx)
+            except ValueError:
+                print(f"  {RED}Invalid: {part}{RESET}")
+                sys.exit(1)
+
+    if not selected:
+        sys.exit(0)
+
+    # Configure each selected project
+    # If a project is already in the hub registry, use that key as the index name
+    # automatically. Only prompt for projects not in the hub.
+    needs_naming = False
+    for idx in selected:
+        c = candidates[idx]
+        found = False
+        for pk, proj in PROJECTS.items():
+            if proj['host'] == host_key and proj['path'].endswith(c['dirname']):
+                found = True
+                break
+        if not found:
+            needs_naming = True
+
+    if needs_naming:
+        print()
+        print(f"  {WHITE}Name each project for the index:{RESET}")
+        print(f"  {GRAY}This name is used everywhere: code search <name> \"query\"{RESET}")
+        divider()
+
+    entries = []
+    for idx in selected:
+        c = candidates[idx]
+
+        # Auto-detect hub key if project is already registered
+        existing_hub_key = None
+        for pk, proj in PROJECTS.items():
+            if proj['host'] == host_key and proj['path'].endswith(c['dirname']):
+                existing_hub_key = pk
+                break
+
+        if existing_hub_key:
+            # Hub project exists — use its key, no prompt needed
+            index_name = existing_hub_key
+            print(f"\n  {CYAN}{c['dirname']}{RESET} → {WHITE}{index_name}{RESET}  {GRAY}(matches hub project){RESET}")
+        else:
+            # New project — ask for a name
+            default_name = c['dirname'].lower().replace(' ', '-').replace('_', '-')
+            print(f"\n  {CYAN}{c['dirname']}{RESET}  {GRAY}(not in hub registry){RESET}")
+            index_name = _prompt(f"    Name [{WHITE}{default_name}{RESET}]: ", default_name)
+
+        entries.append({
+            'dirname': c['dirname'],
+            'path': c['path'],
+            'ca_name': index_name,
+            'hub_key': existing_hub_key or index_name,
+            'host': host_key,
+        })
+
+    # Review
+    print()
+    divider()
+    print(f"\n  {WHITE}Review:{RESET}\n")
+    for e in entries:
+        ca_host = HUB_CONFIG['code_assistant']['host']
+        sync_note = f"  {GRAY}(rsync → {HOSTS.get(ca_host, {}).get('name', ca_host)} then index){RESET}" if e['host'] != ca_host else ''
+        print(f"  {GREEN}+{RESET} {WHITE}{e['ca_name']}{RESET}  ← {e['dirname']}  (hub: {e['hub_key']}){sync_note}")
+
+    print()
+    confirm = _prompt(f"  {WHITE}Confirm? (Y/n): {RESET}", 'y').lower()
+    if confirm not in ('y', 'yes'):
+        print(f"  {GRAY}Cancelled{RESET}")
+        sys.exit(0)
+
+    # Index each project
+    print()
+    for e in entries:
+        user = HOSTS[e['host']]['user']
+        full_path = f"/home/{user}/projects/{e['dirname']}"
+
+        ca_host = HUB_CONFIG['code_assistant']['host']
+        if e['host'] != ca_host:
+            # Rsync from source host to CA host mirror
+            ca_mirror = f"~/projects/{e['ca_name']}"
+            ca_host_name = HOSTS.get(ca_host, {}).get('name', ca_host)
+            src_host_name = HOSTS.get(e['host'], {}).get('name', e['host'])
+            print(f"  {CYAN}Syncing {e['dirname']} from {src_host_name} to {ca_host_name}...{RESET}")
+            with Spinner(f"rsync {e['dirname']} → {ca_host_name}"):
+                ok, output = rsync_to_ca_host(e['host'], f"~/projects/{e['dirname']}", ca_mirror)
+            if not ok:
+                print(f"  {RED}rsync failed for {e['dirname']}{RESET}")
+                if output:
+                    print(f"  {GRAY}{output[:200]}{RESET}")
+                continue
+            print(f"  {GREEN}✓{RESET} Synced to {ca_host_name}")
+            # Use the CA host mirror path for indexing
+            ca_user = HOSTS[ca_host]['user']
+            full_path = f"/home/{ca_user}/projects/{e['ca_name']}"
+
+        # POST /index to Code Assistant
+        print(f"  {CYAN}Indexing {e['ca_name']}...{RESET}")
+        with Spinner(f"Indexing {e['ca_name']}"):
+            result = code_assistant_post('index', {
+                'project': e['ca_name'],
+                'code_paths': [full_path],
+                'doc_paths': [full_path],
+            }, timeout=300)
+
+        if result and result.get('success'):
+            code_info = result.get('code', {})
+            doc_info = result.get('doc', {})
+            code_processed = code_info.get('processed_files', 0) if code_info else 0
+            code_total = code_info.get('total_files', 0) if code_info else 0
+            doc_processed = doc_info.get('processed_files', 0) if doc_info else 0
+            doc_total = doc_info.get('total_files', 0) if doc_info else 0
+            elapsed = code_info.get('elapsed_time', 0) if code_info else 0
+            print(f"  {GREEN}✓{RESET} {e['ca_name']}: {code_processed} code + {doc_processed} docs indexed ({code_total + doc_total} total, {elapsed:.1f}s)")
+
+            # Persist code_index to projects.json if hub project exists
+            # Reload from disk in case hub --scan added it since we started
+            hub_key = e['hub_key']
+            fresh_projects, fresh_order, fresh_ignored = load_projects()
+            if hub_key in fresh_projects:
+                fresh_projects[hub_key]['code_index'] = e['ca_name']
+                save_projects(fresh_projects, fresh_order, fresh_ignored)
+                reload_projects()
+                print(f"  {GRAY}Persisted hub:{hub_key} → CA:{e['ca_name']} in projects.json{RESET}")
+            elif hub_key not in CODE_ASSISTANT_PROJECTS:
+                CODE_ASSISTANT_PROJECTS[hub_key] = e['ca_name']
+                print(f"  {YELLOW}⚠{RESET}  {GRAY}Mapped hub:{hub_key} → CA:{e['ca_name']} (in-memory only — run {CYAN}hub --scan{GRAY} to register){RESET}")
+        else:
+            err = result.get('error', 'unknown error') if result else 'no response'
+            print(f"  {RED}✗{RESET} Failed to index {e['ca_name']}: {err}")
+
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reindex — trigger reindex on existing project
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_reindex(hub_key):
+    """Trigger reindex on an existing indexed project."""
+    ca_key = resolve_code_project(hub_key)
+    if not ca_key:
+        print(f"Project '{hub_key}' is not indexed in Code Assistant")
+        print(f"Indexed: {', '.join(CODE_ASSISTANT_PROJECTS.keys())}")
+        sys.exit(1)
+
+    if not check_code_assistant():
+        print(f"{RED}Code Assistant offline{RESET} ({_CA_LABEL})")
+        sys.exit(1)
+
+    print(f"\n  {CYAN}Reindexing {ca_key}...{RESET}")
+    with Spinner(f"Reindexing {ca_key}"):
+        result = code_assistant_post(f'projects/{ca_key}/reindex', {}, timeout=300)
+
+    # Clear stale caches after reindex
+    import glob as _glob
+    for f in _glob.glob(str(CODE_CACHE_DIR / f'{ca_key}_*.json')):
+        os.remove(f)
+
+    if result and result.get('success'):
+        code_info = result.get('code', {}) or {}
+        doc_info = result.get('doc', {}) or {}
+        c_proc = code_info.get('processed_files', 0)
+        c_skip = code_info.get('skipped_files', 0)
+        c_total = code_info.get('total_files', 0)
+        d_proc = doc_info.get('processed_files', 0)
+        d_skip = doc_info.get('skipped_files', 0)
+        d_total = doc_info.get('total_files', 0)
+        elapsed = code_info.get('elapsed_time', 0) + doc_info.get('elapsed_time', 0)
+        errors = code_info.get('errors', 0) + doc_info.get('errors', 0)
+        print(f"  {GREEN}✓{RESET} {ca_key}: {c_proc} code + {d_proc} docs updated, "
+              f"{c_skip + d_skip} unchanged ({c_total + d_total} total, {elapsed:.1f}s)")
+        if errors:
+            print(f"  {YELLOW}{errors} errors{RESET}")
+        warnings = result.get('warnings', [])
+        if warnings:
+            for w in warnings[:5]:
+                print(f"  {YELLOW}⚠ {w}{RESET}")
+    else:
+        err = result.get('error', 'unknown') if result else 'no response'
+        print(f"  {RED}✗{RESET} Reindex failed: {err}")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manage — interactive dashboard for indexed projects
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_manage_dashboard():
+    """Fetch and display the management dashboard. Returns project list."""
+    projects_result = code_assistant_get('projects', timeout=5)
+    stats_result = code_assistant_get('stats', timeout=5)
+
+    if not projects_result or 'projects' not in projects_result:
+        print(f"  {RED}Failed to fetch projects{RESET}")
+        return []
+
+    projects = projects_result['projects']
+
+    # Watcher status
+    watcher = code_assistant_get('watcher/status', timeout=3)
+
+    print()
+    header_bar()
+    print(f"{BRIGHT_GREEN}  CODE INDEX MANAGER{RESET}")
+    header_bar()
+    print()
+
+    # Stats summary
+    if stats_result:
+        total = stats_result.get('total_files', 0)
+        db_size = stats_result.get('database_size_mb', 0)
+        deps = stats_result.get('total_dependencies', 0)
+        print(f"  {WHITE}{len(projects)} projects{RESET}  |  {total} files  |  {deps} deps  |  {db_size:.0f}MB DB")
+        print()
+
+    # Project table
+    print(f"  {WHITE}{'#':<4}{'Project':<16}{'Files':>8}{'Code':>8}{'Docs':>8}  {'Hub Key':<18}{'Host'}{RESET}")
+    divider()
+
+    for i, p in enumerate(projects, 1):
+        total = p.get('code_count', 0) + p.get('doc_count', 0)
+        hub_keys = [k for k, v in CODE_ASSISTANT_PROJECTS.items() if v == p['name']]
+        hub_label = hub_keys[0] if hub_keys else f'{GRAY}--{RESET}'
+
+        # Determine host from hub registry
+        ca_host = HUB_CONFIG['code_assistant']['host']
+        hub_key = hub_keys[0] if hub_keys else None
+        hub_host = PROJECTS[hub_key]['host'] if hub_key and hub_key in PROJECTS else None
+        needs_sync = hub_host is not None and hub_host != ca_host
+        if needs_sync:
+            host_label = f'{CYAN}{hub_host}{RESET}'
+        elif hub_host:
+            host_label = hub_host
+        else:
+            host_label = ca_host
+
+        # Build compact status tags
+        tags = []
+
+        # Sync status for remote-hosted projects (synced to CA host)
+        if needs_sync:
+            sync_file = CODE_CACHE_DIR / f'{p["name"]}_sync.json'
+            if sync_file.exists():
+                try:
+                    sync_data = json.loads(sync_file.read_text())
+                    sync_age = time.time() - sync_data.get('ts', 0)
+                    if sync_age < 3600:
+                        tags.append(f"{GRAY}sync:{int(sync_age/60)}m{RESET}")
+                    elif sync_age < 86400:
+                        tags.append(f"{GRAY}sync:{int(sync_age/3600)}h{RESET}")
+                    else:
+                        tags.append(f"{YELLOW}sync:{int(sync_age/86400)}d{RESET}")
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+        # Last indexed timestamp from CA API
+        idx_ts = p.get('last_indexed_at')
+        if idx_ts:
+            idx_age = time.time() - idx_ts
+            if idx_age < 3600:
+                tags.append(f"{GRAY}idx:{int(idx_age/60)}m{RESET}")
+            elif idx_age < 86400:
+                tags.append(f"{GRAY}idx:{int(idx_age/3600)}h{RESET}")
+            else:
+                tags.append(f"{YELLOW}idx:{int(idx_age/86400)}d{RESET}")
+
+        # Last worked on — from overview cache mtime
+        if hub_key:
+            ov_cache = OVERVIEW_CACHE_DIR / f'{hub_key}.json'
+            if ov_cache.exists():
+                try:
+                    ov_age = time.time() - ov_cache.stat().st_mtime
+                    if ov_age < 3600:
+                        tags.append(f"{GREEN}act:{int(ov_age/60)}m{RESET}")
+                    elif ov_age < 86400:
+                        tags.append(f"{GREEN}act:{int(ov_age/3600)}h{RESET}")
+                    elif ov_age < 604800:
+                        tags.append(f"{GRAY}act:{int(ov_age/86400)}d{RESET}")
+                    else:
+                        tags.append(f"{YELLOW}act:{int(ov_age/86400)}d{RESET}")
+                except OSError:
+                    pass
+
+        status_str = '  '.join(tags)
+        tag_suffix = f"  {status_str}" if tags else ""
+        print(f"  {WHITE}{i:<4}{RESET}{GREEN}{p['name']:<16}{RESET}{total:>8d}{p.get('code_count',0):>8d}"
+              f"{p.get('doc_count',0):>8d}  {hub_label:<18}{host_label}{tag_suffix}")
+
+    # Watcher status
+    print()
+    if watcher and watcher.get('running'):
+        watched = list(watcher.get('projects', {}).keys())
+        print(f"  {GREEN}●{RESET} File watcher: {WHITE}running{RESET}  watching: {', '.join(watched)}")
+    else:
+        avail = watcher.get('available', False) if watcher else False
+        if avail:
+            print(f"  {YELLOW}●{RESET} File watcher: {YELLOW}stopped{RESET}")
+        else:
+            print(f"  {GRAY}●{RESET} File watcher: {GRAY}unavailable{RESET}")
+
+    return projects
+
+
+def cmd_manage():
+    """Interactive dashboard for managing Code Assistant indexes."""
+    if not check_code_assistant():
+        print(f"{RED}Code Assistant offline{RESET} ({_CA_LABEL})")
+        sys.exit(1)
+
+    while True:
+        reload_projects()
+        projects = _render_manage_dashboard()
+        if not projects:
+            sys.exit(1)
+
+        def _code_render(item, idx, highlighted):
+            p = item
+            total = p.get('code_count', 0) + p.get('doc_count', 0)
+            hub_keys = [k for k, v in CODE_ASSISTANT_PROJECTS.items() if v == p['name']]
+            hub_label = hub_keys[0] if hub_keys else '--'
+            hub_key = hub_keys[0] if hub_keys else None
+            ca_host = HUB_CONFIG['code_assistant']['host']
+            hub_host = PROJECTS[hub_key]['host'] if hub_key and hub_key in PROJECTS else ca_host
+            host_label = hub_host
+            if highlighted:
+                return f"  {HIGHLIGHT_BG}{p['name']:<16}{total:>8d}  {hub_label:<18}{host_label}{HIGHLIGHT_OFF}"
+            return f"  {GREEN}{p['name']:<16}{RESET}{total:>8d}  {hub_label:<18}{host_label}"
+
+        action_keys = {
+            'r': ('reindex', 'Reindex project'),
+            's': ('sync', 'Sync+reindex (WS projects)'),
+            'w': ('watcher', 'Toggle file watcher'),
+        }
+        footer = f"  {GRAY}r=reindex  s=sync+reindex  w=toggle watcher  q=quit{RESET}"
+
+        action, idx = interactive_select(
+            projects, _code_render, actions=action_keys, footer=footer,
+        )
+
+        if action is None:
+            break
+
+        proj = projects[idx]
+
+        if action in ('r', KEY_ENTER):
+            # Reindex
+            print(f"\n  {CYAN}Reindexing {proj['name']}...{RESET}")
+            with Spinner(f"Reindexing {proj['name']}"):
+                result = code_assistant_post(f"projects/{proj['name']}/reindex", {}, timeout=300)
+            if result and result.get('success'):
+                code_info = result.get('code', {})
+                processed = code_info.get('processed_files', 0)
+                total = code_info.get('total_files', 0)
+                elapsed = code_info.get('elapsed_time', 0)
+                print(f"  {GREEN}✓{RESET} {proj['name']}: {processed} updated ({total} total, {elapsed:.1f}s)")
+            else:
+                err = result.get('error', 'unknown') if result else 'no response'
+                print(f"  {RED}✗{RESET} Failed: {err}")
+
+        elif action == 's':
+            # Sync + reindex (WS projects)
+            ca_name = proj['name']
+            proj_hub_key = None
+            for hk, ck in CODE_ASSISTANT_PROJECTS.items():
+                if ck == ca_name:
+                    proj_hub_key = hk
+                    break
+            ca_host = HUB_CONFIG['code_assistant']['host']
+            proj_host = PROJECTS[proj_hub_key]['host'] if proj_hub_key and proj_hub_key in PROJECTS else ca_host
+            if proj_host == ca_host:
+                print(f"  {YELLOW}{ca_name} is a {proj_host} project — use 'r' to reindex{RESET}")
+                continue
+
+            ws_path = _find_ws_source(proj)
+            if not ws_path:
+                print(f"  {YELLOW}Cannot determine WS source path for {proj['name']}{RESET}")
+                print(f"  {GRAY}Root path: {proj.get('root_path', '?')}{RESET}")
+                continue
+
+            if not check_agx_ws_ssh():
+                _ws_setup_instructions()
+                continue
+
+            ca_host = HUB_CONFIG['code_assistant']['host']
+            ca_host_name = HOSTS.get(ca_host, {}).get('name', ca_host)
+            ca_mirror = proj.get('root_path', '').replace(f'/home/{HOSTS[ca_host]["user"]}', '~')
+
+            print(f"\n  {CYAN}Syncing {ws_path} → {ca_host_name}...{RESET}")
+            with Spinner(f"rsync {proj['name']}"):
+                ok, output = rsync_to_ca_host(proj_host, ws_path, ca_mirror)
+            if not ok:
+                print(f"  {RED}rsync failed{RESET}")
+                if output:
+                    print(f"  {GRAY}{output[:200]}{RESET}")
+                continue
+            print(f"  {GREEN}✓{RESET} Synced")
+
+            ensure_dir(CODE_CACHE_DIR)
+            sync_file = CODE_CACHE_DIR / f'{proj["name"]}_sync.json'
+            sync_file.write_text(json.dumps({'ts': time.time(), 'source': ws_path}))
+
+            print(f"  {CYAN}Reindexing {proj['name']}...{RESET}")
+            with Spinner(f"Reindexing {proj['name']}"):
+                result = code_assistant_post(f"projects/{proj['name']}/reindex", {}, timeout=300)
+            if result and result.get('success'):
+                code_info = result.get('code', {})
+                processed = code_info.get('processed_files', 0)
+                total = code_info.get('total_files', 0)
+                elapsed = code_info.get('elapsed_time', 0)
+                print(f"  {GREEN}✓{RESET} {proj['name']}: {processed} updated ({total} total, {elapsed:.1f}s)")
+            else:
+                err = result.get('error', 'unknown') if result else 'no response'
+                print(f"  {RED}✗{RESET} Failed: {err}")
+
+        elif action == 'w':
+            # Toggle watcher (global, not per-project)
+            watcher = code_assistant_get('watcher/status', timeout=3)
+            if watcher and watcher.get('running'):
+                with Spinner("Stopping watcher"):
+                    result = code_assistant_post('watcher/stop', {}, timeout=10)
+                if result and result.get('success'):
+                    print(f"  {GREEN}✓{RESET} Watcher stopped")
+                else:
+                    print(f"  {RED}✗{RESET} Failed to stop watcher")
+            else:
+                with Spinner("Starting watcher"):
+                    result = code_assistant_post('watcher/start', {}, timeout=10)
+                if result and result.get('success'):
+                    watched = result.get('projects', [])
+                    print(f"  {GREEN}✓{RESET} Watcher started ({', '.join(watched)})")
+                else:
+                    print(f"  {RED}✗{RESET} Failed to start watcher")
+
+
+def _resolve_manage_project(projects, arg):
+    """Resolve a project from # index or name. Returns project dict or None."""
+    # Try as number first
+    try:
+        idx = int(arg) - 1
+        if 0 <= idx < len(projects):
+            return projects[idx]
+        print(f"  {YELLOW}Invalid #. Use 1-{len(projects)}{RESET}")
+        return None
+    except ValueError:
+        pass
+
+    # Try by name
+    for p in projects:
+        if p['name'].lower() == arg.lower():
+            return p
+
+    # Fuzzy
+    for p in projects:
+        if arg.lower() in p['name'].lower():
+            return p
+
+    print(f"  {YELLOW}Unknown project '{arg}'{RESET}")
+    return None
+
+
+def _find_ws_source(ca_project):
+    """Find the WS source path for a CA project that was synced from WS.
+
+    Looks up the hub PROJECTS registry to find the WS path.
+    """
+    ca_name = ca_project['name']
+
+    # Find hub key for this CA project
+    hub_key = None
+    for hk, ck in CODE_ASSISTANT_PROJECTS.items():
+        if ck == ca_name:
+            hub_key = hk
+            break
+
+    if hub_key and hub_key in PROJECTS:
+        proj = PROJECTS[hub_key]
+        ca_host = HUB_CONFIG['code_assistant']['host']
+        if proj['host'] != ca_host:
+            return proj['path']
+
+    # Fallback: check sync cache for previous source
+    sync_file = CODE_CACHE_DIR / f'{ca_name}_sync.json'
+    if sync_file.exists():
+        try:
+            sync_data = json.loads(sync_file.read_text())
+            return sync_data.get('source')
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_usage():
+    print(f"""
+{WHITE}code{RESET} — Code exploration + index management
+
+{WHITE}Query:{RESET}
+  code                             List indexed projects
+  code search <project> "query"    Find files matching a concept
+  code ask <project> "question"    Deep RAG architecture question
+  code impact <project> "file"     What depends on this file
+  code graph <project>             Dependency graph overview
+
+{WHITE}Index Management:{RESET}
+  code scan <host>                 Discover + index new projects (agx, ws)
+  code reindex <project>           Trigger reindex on existing project
+  code manage                      Interactive index management dashboard
+
+{WHITE}Projects:{RESET}  {', '.join(CODE_ASSISTANT_PROJECTS.keys())}
+  (Uses hub project keys, mapped to Code Assistant automatically)
+
+{WHITE}Examples:{RESET}
+  code search myproject "memory management"
+  code ask myapp "how does the pipeline work"
+  code scan gpu                     {GRAY}# discover unindexed GPU projects{RESET}
+  code reindex myproject            {GRAY}# refresh index{RESET}
+  code manage                       {GRAY}# interactive dashboard{RESET}
+
+{WHITE}Cache:{RESET}
+  Results cached in ~/.cache/code/ (search: 1h, ask: 4h, impact/graph: 24h)
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args:
+        print_usage()
+        sys.exit(0)
+
+    if not args:
+        cmd_list()
+        sys.exit(0)
+
+    subcmd = args[0]
+
+    if subcmd == 'search':
+        if len(args) < 3:
+            print(f"Usage: code search <project> \"query\"")
+            sys.exit(1)
+        hub_key = resolve_project(args[1])
+        if not hub_key:
+            sys.exit(1)
+        query = ' '.join(args[2:])
+        cmd_search(hub_key, query)
+
+    elif subcmd == 'ask':
+        if len(args) < 3:
+            print(f"Usage: code ask <project> \"question\"")
+            sys.exit(1)
+        hub_key = resolve_project(args[1])
+        if not hub_key:
+            sys.exit(1)
+        question = ' '.join(args[2:])
+        cmd_ask(hub_key, question)
+
+    elif subcmd == 'impact':
+        if len(args) < 3:
+            print(f"Usage: code impact <project> \"file_path\"")
+            sys.exit(1)
+        hub_key = resolve_project(args[1])
+        if not hub_key:
+            sys.exit(1)
+        file_path = args[2]
+        cmd_impact(hub_key, file_path)
+
+    elif subcmd == 'graph':
+        if len(args) < 2:
+            print(f"Usage: code graph <project>")
+            sys.exit(1)
+        hub_key = resolve_project(args[1])
+        if not hub_key:
+            sys.exit(1)
+        cmd_graph(hub_key)
+
+    elif subcmd == 'scan':
+        if len(args) < 2:
+            print(f"Usage: code scan <host>  (agx, ws)")
+            sys.exit(1)
+        cmd_scan(args[1])
+
+    elif subcmd == 'reindex':
+        if len(args) < 2:
+            print(f"Usage: code reindex <project>")
+            sys.exit(1)
+        hub_key = resolve_project(args[1])
+        if not hub_key:
+            sys.exit(1)
+        cmd_reindex(hub_key)
+
+    elif subcmd == 'manage':
+        cmd_manage()
+
+    else:
+        # Maybe they passed a project key directly — treat as list
+        hub_key = resolve_project(subcmd)
+        if hub_key and resolve_code_project(hub_key):
+            cmd_graph(hub_key)
+        elif hub_key:
+            print(f"Project '{hub_key}' is not indexed in Code Assistant")
+            print(f"Indexed: {', '.join(CODE_ASSISTANT_PROJECTS.keys())}")
+        else:
+            print_usage()
+            sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

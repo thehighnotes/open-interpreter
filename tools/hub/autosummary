@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""autosummary — Post-session auto-summary daemon for the Orin Nano hub.
+
+Polls Claude Code transcript mtimes across all projects. When a session
+ends (activity stops for ~10 minutes), writes a timeline journal entry
+and refreshes the overview cache so the next session starts with fresh context.
+
+Usage:
+    autosummary                  Start polling daemon (foreground)
+    autosummary --interval 30   Custom poll interval in seconds
+    autosummary --idle 15       Minutes of inactivity before session ends (default: 10)
+    autosummary --status         Check if daemon is running, show recent log
+    autosummary --help
+"""
+
+import atexit
+import json
+import os
+import signal
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import *
+
+CACHE_DIR = OVERVIEW_CACHE_DIR
+LOG_FILE = CACHE_DIR / 'autosummary.log'
+PID_FILE = CACHE_DIR / 'autosummary.pid'
+
+HEARTBEAT_INTERVAL = 10  # log heartbeat every N poll cycles
+IDLE_THRESHOLD = 10      # polls of inactivity before session ends (~10min at 60s interval)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PID file management
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_pid_file():
+    """Write current PID to file."""
+    ensure_dir(CACHE_DIR)
+    PID_FILE.write_text(str(os.getpid()))
+
+
+def remove_pid_file():
+    """Remove PID file on exit."""
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def read_pid():
+    """Read PID from file. Returns (pid, alive) or (None, False)."""
+    if not PID_FILE.exists():
+        return None, False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        # Check if process is alive
+        os.kill(pid, 0)
+        return pid, True
+    except (ValueError, OSError):
+        return None, False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log(message):
+    """Write a timestamped message to the log file and stdout."""
+    ts = datetime.now().strftime('[%Y-%m-%d %H:%M:%S]')
+    line = f"{ts} {message}"
+    print(line, flush=True)
+    try:
+        ensure_dir(CACHE_DIR)
+        with open(LOG_FILE, 'a') as f:
+            f.write(line + '\n')
+    except OSError:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mtime probing (get_transcript_mtime now in hub_common)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def probe_all_mtimes(host_reachable):
+    """Get transcript mtimes for all reachable projects. Returns {key: float_or_None}."""
+    tasks = {}
+    for key in PROJECT_ORDER:
+        proj = PROJECTS[key]
+        host = proj['host']
+        if not host_reachable.get(host):
+            continue
+        alias = HOSTS[host]['alias']
+        claude_dir = proj['claude_dir']
+        tasks[key] = lambda a=alias, d=claude_dir: get_transcript_mtime(a, d)
+
+    return run_parallel(tasks)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache refresh with journal writing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_overview_cache(project_key):
+    """Load current overview cache JSON. Returns dict or None."""
+    cache_file = OVERVIEW_CACHE_DIR / f"{project_key}.json"
+    if not cache_file.exists():
+        return None
+    try:
+        return json.loads(cache_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def refresh_cache(project_key):
+    """Refresh overview cache and write state transitions to timeline journal.
+
+    1. Read current cache (before)
+    2. Run overview --refresh
+    3. Read new cache (after)
+    4. Diff and append journal entries
+    """
+    before = load_overview_cache(project_key)
+
+    success = refresh_overview_cache(project_key, log_fn=log)
+
+    if success and before:
+        after = load_overview_cache(project_key)
+        if after:
+            events = diff_overview_states(before, after)
+            if events:
+                append_journal(project_key, events)
+                log(f"[{project_key}] journal: {len(events)} state transition(s) recorded")
+            else:
+                log(f"[{project_key}] journal: no state changes detected")
+
+    return success
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Polling loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Per-project state
+class ProjectState:
+    def __init__(self):
+        self.last_mtime = None
+        self.was_active = False
+        self.idle_count = 0
+
+
+def poll_loop(interval):
+    """Main polling loop. Runs until interrupted."""
+    states = {key: ProjectState() for key in PROJECT_ORDER}
+    cycle_count = 0
+
+    while True:
+        cycle_count += 1
+
+        # Heartbeat every N cycles
+        if cycle_count % HEARTBEAT_INTERVAL == 0:
+            log(f"heartbeat — cycle {cycle_count}")
+
+        # Check host reachability
+        host_reachable = run_parallel({
+            h: lambda a=HOSTS[h]['alias']: check_host_reachable(a)
+            for h in HOSTS
+        })
+
+        # Get all mtimes
+        mtimes = probe_all_mtimes(host_reachable)
+
+        # Process each project
+        for key in PROJECT_ORDER:
+            proj = PROJECTS[key]
+            if not host_reachable.get(proj['host']):
+                continue
+
+            state = states[key]
+            current_mtime = mtimes.get(key)
+
+            if current_mtime is None:
+                continue
+
+            if state.last_mtime is None:
+                # First observation — just record it
+                state.last_mtime = current_mtime
+                continue
+
+            if current_mtime != state.last_mtime:
+                # Activity detected
+                if not state.was_active:
+                    log(f"[{key}] session activity detected")
+                state.was_active = True
+                state.idle_count = 0
+                state.last_mtime = current_mtime
+            elif state.was_active:
+                # Was active, now idle
+                state.idle_count += 1
+                if state.idle_count >= IDLE_THRESHOLD:
+                    # Session ended — close via shared function if still open
+                    open_session = get_last_open_session(key)
+                    if open_session:
+                        log(f"[{key}] session ended — closing session + cache refresh")
+                        close_previous_session(key, log_fn=log)
+                    else:
+                        log(f"[{key}] session ended (already closed by prepare) — cache refresh")
+
+                    refresh_cache(key)
+                    # Stop dev services for this project
+                    dev_svcs = load_dev_services(key, enabled_only=True)
+                    if dev_svcs:
+                        proj = PROJECTS[key]
+                        host_alias = HOSTS[proj['host']]['alias']
+                        stopped = 0
+                        for ds in dev_svcs:
+                            if probe_service(host_alias, ds['port'], timeout=2):
+                                stop_dev_service(host_alias, ds)
+                                stopped += 1
+                                log(f"[{key}] stopped dev service: {ds['name']} :{ds['port']}")
+                        if stopped:
+                            hub_notify(f"Session ended: {PROJECTS[key]['name']}", f"Cache refreshed, {stopped} dev service(s) stopped", source='session')
+                        else:
+                            hub_notify(f"Session ended: {PROJECTS[key]['name']}", "Overview cache refreshed", source='session')
+                    else:
+                        hub_notify(f"Session ended: {PROJECTS[key]['name']}", "Overview cache refreshed", source='session')
+                    # Reset state
+                    state.was_active = False
+                    state.idle_count = 0
+
+        time.sleep(interval)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Signal handling
+# ─────────────────────────────────────────────────────────────────────────────
+
+def setup_signals():
+    """Set up clean shutdown on SIGINT/SIGTERM."""
+    def handler(signum, frame):
+        sig_name = 'SIGINT' if signum == signal.SIGINT else 'SIGTERM'
+        log(f"autosummary stopped ({sig_name})")
+        remove_pid_file()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --status command
+# ─────────────────────────────────────────────────────────────────────────────
+
+def show_status():
+    """Show daemon status and recent log lines."""
+    pid, alive = read_pid()
+
+    print()
+    header_bar()
+    print(f"{BRIGHT_GREEN}  AUTOSUMMARY STATUS{RESET}")
+    header_bar()
+    print()
+
+    if alive:
+        print(f"  {GREEN}● running{RESET}  (PID {pid})")
+    elif pid:
+        print(f"  {RED}● stale PID file{RESET}  (PID {pid} not running)")
+    else:
+        print(f"  {GRAY}● not running{RESET}")
+
+    print()
+
+    # Show last 5 log lines
+    if LOG_FILE.exists():
+        print(f"  {WHITE}Recent log:{RESET}")
+        divider()
+        try:
+            lines = LOG_FILE.read_text().strip().split('\n')
+            for line in lines[-5:]:
+                print(f"  {GRAY}{line}{RESET}")
+        except OSError:
+            print(f"  {RED}● Cannot read log{RESET}")
+    else:
+        print(f"  {GRAY}No log file yet{RESET}")
+
+    print()
+    header_bar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_usage():
+    print(f"""
+{WHITE}autosummary{RESET} — Post-session auto-summary daemon
+
+{WHITE}Usage:{RESET}
+  autosummary                  Start polling daemon (foreground)
+  autosummary --interval 30    Custom poll interval in seconds (default: 60)
+  autosummary --idle 15        Minutes of inactivity before session ends (default: 10)
+  autosummary --status         Check if daemon is running, show recent log
+
+{WHITE}What it does:{RESET}
+  Polls Claude Code transcript mtimes every 60s across all projects.
+  When a session ends (~10 min of inactivity after activity), writes a
+  timeline journal entry and refreshes the overview cache.
+
+{WHITE}Log file:{RESET}
+  ~/.cache/overview/autosummary.log
+
+{WHITE}Intended usage:{RESET}
+  tmux new-window -t hub -n autosummary '~/autosummary'
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args:
+        print_usage()
+        sys.exit(0)
+
+    if '--status' in args:
+        show_status()
+        sys.exit(0)
+
+    interval = 60
+    if '--interval' in args:
+        idx = args.index('--interval')
+        if idx + 1 < len(args):
+            try:
+                interval = int(args[idx + 1])
+                if interval < 10:
+                    interval = 10
+            except ValueError:
+                print(f"{RED}--interval requires a number{RESET}")
+                sys.exit(1)
+
+    global IDLE_THRESHOLD
+    if '--idle' in args:
+        idx = args.index('--idle')
+        if idx + 1 < len(args):
+            try:
+                idle_min = int(args[idx + 1])
+                if idle_min < 2:
+                    idle_min = 2
+                IDLE_THRESHOLD = max(1, (idle_min * 60) // interval)
+            except ValueError:
+                print(f"{RED}--idle requires a number (minutes){RESET}")
+                sys.exit(1)
+    else:
+        # Recalculate threshold based on interval (default 10 min)
+        IDLE_THRESHOLD = max(2, (10 * 60) // interval)
+
+    ensure_dir(CACHE_DIR)
+
+    # Write PID file and register cleanup
+    write_pid_file()
+    atexit.register(remove_pid_file)
+
+    setup_signals()
+    idle_min = (IDLE_THRESHOLD * interval) // 60
+    log(f"autosummary started — polling every {interval}s, session end after {idle_min}min idle (PID {os.getpid()})")
+    poll_loop(interval)
+
+
+if __name__ == '__main__':
+    main()

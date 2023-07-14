@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""hubgrep — Search across the entire hub ecosystem.
+
+Searches hub tools, config, caches, memory, and shell config files.
+Groups results by category with colored output.
+
+Usage:
+    hubgrep <pattern>          Search hub ecosystem
+    hubgrep --all <pattern>    Include OI patches + installed interpreter
+    hubgrep --help
+"""
+
+import os
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import GREEN, BRIGHT_GREEN, YELLOW, RED, CYAN, WHITE, GRAY, DIM, RESET
+
+HOME = Path.home()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Search categories
+# ─────────────────────────────────────────────────────────────────────────────
+
+def discover_tools():
+    """Find all executable hub tools in ~/."""
+    tools = []
+    for entry in sorted(os.listdir(HOME)):
+        if entry.startswith('.') or entry.startswith('__'):
+            continue
+        full = HOME / entry
+        if full.is_file() and os.access(full, os.X_OK):
+            tools.append(str(full))
+    # Always include hub_common.py
+    hc = HOME / 'hub_common.py'
+    if hc.exists() and str(hc) not in tools:
+        tools.append(str(hc))
+    return tools
+
+
+def collect_paths(include_oi=False):
+    """Build categorized search paths."""
+    categories = {}
+
+    # Hub tools
+    categories['Hub Tools'] = discover_tools()
+
+    # Config
+    config_paths = []
+    config_dir = HOME / '.config' / 'hub'
+    if config_dir.exists():
+        for f in config_dir.rglob('*'):
+            if f.is_file():
+                config_paths.append(str(f))
+    categories['Config'] = config_paths
+
+    # Caches
+    cache_paths = []
+    for cache_name in ('overview', 'research', 'notes', 'timeline', 'decisions',
+                       'code', 'deploy', 'health', 'oi-sessions'):
+        cache_dir = HOME / '.cache' / cache_name
+        if cache_dir.exists():
+            for f in cache_dir.rglob('*'):
+                if f.is_file() and f.suffix in ('.json', '.txt', '.log'):
+                    cache_paths.append(str(f))
+    categories['Cache'] = cache_paths
+
+    # Claude memory
+    memory_paths = []
+    claude_projects = HOME / '.claude' / 'projects'
+    if claude_projects.exists():
+        for f in claude_projects.rglob('memory/*'):
+            if f.is_file():
+                memory_paths.append(str(f))
+    claude_root = HOME / '.claude'
+    for name in ('CLAUDE.md', 'settings.json'):
+        p = claude_root / name
+        if p.exists():
+            memory_paths.append(str(p))
+    categories['Claude Memory'] = memory_paths
+
+    # Shell config
+    shell_paths = []
+    for name in ('.bashrc', '.tmux.conf', 'init-hub.sh', 'wake-workstation.sh'):
+        p = HOME / name
+        if p.exists():
+            shell_paths.append(str(p))
+    ssh_config = HOME / '.ssh' / 'config'
+    if ssh_config.exists():
+        shell_paths.append(str(ssh_config))
+    categories['Shell & Config'] = shell_paths
+
+    # Completions
+    comp_dir = HOME / '.local' / 'share' / 'bash-completion' / 'completions'
+    if comp_dir.exists():
+        comp_paths = [str(f) for f in comp_dir.iterdir() if f.is_file()]
+        categories['Completions'] = comp_paths
+
+    # OI (optional)
+    if include_oi:
+        oi_paths = []
+        patches_dir = HOME / 'oi-patches'
+        if patches_dir.exists():
+            for f in patches_dir.iterdir():
+                if f.is_file() and f.suffix in ('.py', '.txt', '.json', '.md'):
+                    oi_paths.append(str(f))
+        # Installed interpreter
+        interp_dir = HOME / '.local' / 'lib' / 'python3.10' / 'site-packages' / 'interpreter'
+        if interp_dir.exists():
+            for f in interp_dir.rglob('*.py'):
+                oi_paths.append(str(f))
+        # OI profile
+        profile = HOME / '.config' / 'open-interpreter' / 'profiles' / 'linux-admin.py'
+        if profile.exists():
+            oi_paths.append(str(profile))
+        categories['Open Interpreter'] = oi_paths
+
+    return categories
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Search
+# ─────────────────────────────────────────────────────────────────────────────
+
+def search_file(filepath, pattern, compiled):
+    """Search a single file. Returns list of (line_num, line_text) matches."""
+    matches = []
+    try:
+        with open(filepath, 'r', errors='replace') as f:
+            for i, line in enumerate(f, 1):
+                if compiled.search(line):
+                    matches.append((i, line.rstrip()))
+    except (OSError, UnicodeDecodeError):
+        pass
+    return matches
+
+
+def highlight(text, compiled):
+    """Highlight pattern matches in text."""
+    def replacer(m):
+        return f"{RED}{m.group()}{RESET}"
+    return compiled.sub(replacer, text)
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args or not args:
+        print(__doc__)
+        sys.exit(0)
+
+    include_oi = '--all' in args
+    clean_args = [a for a in args if a != '--all']
+
+    if not clean_args:
+        print(__doc__)
+        sys.exit(1)
+
+    pattern = clean_args[0]
+    try:
+        compiled = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        print(f"{RED}Invalid regex: {e}{RESET}")
+        sys.exit(1)
+
+    categories = collect_paths(include_oi=include_oi)
+    total_matches = 0
+    total_files = 0
+
+    for cat_name, paths in categories.items():
+        cat_matches = []
+        for filepath in paths:
+            matches = search_file(filepath, pattern, compiled)
+            if matches:
+                cat_matches.append((filepath, matches))
+
+        if not cat_matches:
+            continue
+
+        print(f"\n  {CYAN}{cat_name}{RESET}")
+        for filepath, matches in cat_matches:
+            # Show relative path
+            rel = filepath.replace(str(HOME) + '/', '~/')
+            print(f"    {WHITE}{rel}{RESET}")
+            total_files += 1
+            for line_num, line_text in matches[:5]:  # Max 5 matches per file
+                highlighted = highlight(line_text[:120], compiled)
+                print(f"      {GRAY}{line_num:>4}:{RESET} {highlighted}")
+                total_matches += 1
+            if len(matches) > 5:
+                print(f"      {DIM}... and {len(matches) - 5} more matches{RESET}")
+                total_matches += len(matches) - 5
+
+    if total_matches == 0:
+        print(f"\n  {GRAY}No matches for '{pattern}'{RESET}")
+    else:
+        print(f"\n  {GREEN}{total_matches} matches in {total_files} files{RESET}")
+        if not include_oi:
+            print(f"  {DIM}Use --all to also search OI patches + installed interpreter{RESET}")
+
+
+if __name__ == '__main__':
+    main()

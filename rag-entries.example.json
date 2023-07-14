@@ -1,0 +1,30 @@
+[
+  {
+    "topic": "jetson memory",
+    "description": "checking memory usage, RAM, GPU memory, free memory, tegrastats, unified memory",
+    "content": "Jetsons use unified CPU/GPU memory. nvidia-smi shows N/A. Use `free -h` for overview or `tegrastats --interval 1000 | head -1` for breakdown. Never run bare `tegrastats` (it streams forever).",
+    "source": "hub",
+    "category": "hardware"
+  },
+  {
+    "topic": "ollama api",
+    "description": "running LLM inference, Ollama API, chat completions, sending prompts, generating text",
+    "content": "Use /api/chat (not /api/generate) for system message separation. Add `\"format\": \"json\"` for structured output. For large payloads, write to a file and use `curl -d @file`.",
+    "source": "hub",
+    "category": "ollama"
+  },
+  {
+    "topic": "ssh commands",
+    "description": "running commands remotely, SSH execution, remote commands, interactive SSH hanging",
+    "content": "Use `ssh host \"command\"` with quoted command. Never bare `ssh` — it hangs in non-interactive contexts. Streaming commands (top, htop, tail -f, watch) also hang.",
+    "source": "hub",
+    "category": "ssh"
+  },
+  {
+    "topic": "python packages on jetson",
+    "description": "installing python packages, pip install, wheel, aarch64 ARM64 compilation",
+    "content": "Some PyPI wheels don't have aarch64 builds. If pip fails, try: pip install --no-build-isolation, or install build deps first (cmake, ninja). For torch, use NVIDIA's Jetson wheels from https://developer.nvidia.com/embedded/downloads.",
+    "source": "hub",
+    "category": "setup"
+  }
+]

@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""work — Project switcher for the Orin Nano hub.
+
+One command from idle to working: prepare → overview → begin.
+
+Usage:
+    work <project>               Full flow: prepare → overview → begin
+    work <project> --continue    Same but continues last session
+    work <project> --dry-run     Run prepare + overview, show preamble only
+    work <project> --oi          Launch Open Interpreter instead of Claude Code
+    work <project> --force       Force cache refresh (bypass smart skip)
+    work --help
+"""
+
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import *
+
+COUNTDOWN_SECONDS = 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main flow
+# ─────────────────────────────────────────────────────────────────────────────
+
+def work(project_key, continue_session=False, dry_run=False, use_oi=False, force=False):
+    """Full flow: prepare → overview → begin."""
+    proj = PROJECTS[project_key]
+    home = Path.home()
+
+    print()
+    header_bar()
+    mode = "DRY RUN" if dry_run else "OI" if use_oi else "CONTINUE" if continue_session else "NEW SESSION"
+    node_label = f" on {HOSTS.get(LOCAL_HOST, {}).get('name', LOCAL_HOST)}" if is_node() else ""
+    print(f"{BRIGHT_GREEN}  WORK SESSION — {proj['name']} ({mode}){node_label}{RESET}")
+    header_bar()
+    print()
+
+    # Step 1: Prepare (hub runs locally, node delegates to hub)
+    print(f"  {WHITE}[1/3]{RESET} Preparing...")
+    divider()
+    print()
+
+    force_flag = ' --force' if force else ''
+    if is_node() and HUB_HOST:
+        print(f"  {CYAN}Delegating to hub ({HUB_HOST})...{RESET}")
+        result = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', '-o', 'BatchMode=yes',
+             HUB_HOST, f'~/prepare {project_key}{force_flag}'],
+            timeout=300
+        )
+    else:
+        prepare_cmd = [str(home / 'prepare'), project_key]
+        if force:
+            prepare_cmd.append('--force')
+        result = subprocess.run(prepare_cmd, timeout=300)
+    if result.returncode != 0:
+        print(f"\n  {RED}● Prepare failed — aborting{RESET}")
+        sys.exit(1)
+
+    print()
+
+    # Step 2: Overview (hub runs locally, node delegates to hub)
+    print(f"  {WHITE}[2/3]{RESET} Overview...")
+    divider()
+    print()
+
+    if is_node() and HUB_HOST:
+        subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', '-o', 'BatchMode=yes',
+             HUB_HOST, f'~/overview {project_key}'],
+            timeout=120
+        )
+    else:
+        subprocess.run(
+            [str(home / 'overview'), project_key],
+            timeout=120
+        )
+
+    print()
+
+    # Step 3: Launch session
+    print(f"  {WHITE}[3/3]{RESET} Starting session...")
+    divider()
+    print()
+
+    if dry_run:
+        # Pass --dry-run through to begin
+        begin_cmd = [str(home / 'begin'), project_key, '--dry-run']
+        if continue_session:
+            begin_cmd.append('--continue')
+        if use_oi:
+            begin_cmd.append('--oi')
+        subprocess.run(begin_cmd, timeout=60)
+        return
+
+    # Countdown timer (auto-proceed, Ctrl+C cancels)
+    print(f"  {CYAN}Launching in {COUNTDOWN_SECONDS}s... (Ctrl+C to cancel){RESET}")
+    try:
+        for remaining in range(COUNTDOWN_SECONDS, 0, -1):
+            sys.stderr.write(f"\r  {GRAY}{remaining}...{RESET} ")
+            sys.stderr.flush()
+            time.sleep(1)
+        sys.stderr.write(f"\r{' ' * 20}\r")
+        sys.stderr.flush()
+    except KeyboardInterrupt:
+        print(f"\n  {GRAY}Cancelled.{RESET}")
+        sys.exit(0)
+
+    # Build begin command
+    begin_cmd = [str(home / 'begin'), project_key]
+    if continue_session:
+        begin_cmd.append('--continue')
+    if use_oi:
+        begin_cmd.append('--oi')
+
+    # exec into begin (replaces this process)
+    os.execv(begin_cmd[0], begin_cmd)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_usage():
+    print(f"""
+{WHITE}work{RESET} — Project switcher (one command to working)
+
+{WHITE}Usage:{RESET}
+  work <project>               Full flow: prepare → overview → begin
+  work <project> --continue    Same but continues last session
+  work <project> --dry-run     Run prepare + overview, show preamble only
+  work <project> --oi          Launch Open Interpreter instead of Claude Code
+  work <project> --force       Force cache refresh (bypass smart skip)
+
+{WHITE}Flow:{RESET}
+  [1/3] Prepare  — check host, warm Ollama, ensure env, refresh cache
+  [2/3] Overview — show project context
+  [3/3] Begin    — 5s countdown then launch Claude Code (or OI with --oi)
+
+{WHITE}Projects:{RESET}
+  {', '.join(PROJECT_ORDER) if PROJECT_ORDER else '(none — run hub --scan first)'}
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args or not args:
+        print_usage()
+        sys.exit(0)
+
+    continue_session = '--continue' in args or '-c' in args
+    dry_run = '--dry-run' in args
+    use_oi = '--oi' in args
+    force = '--force' in args
+    clean_args = [a for a in args if a not in ('--continue', '-c', '--dry-run', '--oi', '--force')]
+
+    if not clean_args:
+        print_usage()
+        sys.exit(1)
+
+    project_key = resolve_project(clean_args[0])
+    if not project_key:
+        sys.exit(1)
+
+    work(project_key, continue_session=continue_session, dry_run=dry_run, use_oi=use_oi, force=force)
+
+
+if __name__ == '__main__':
+    main()
