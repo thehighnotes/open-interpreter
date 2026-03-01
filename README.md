@@ -1,411 +1,311 @@
-<h1 align="center">● Open Interpreter</h1>
+# Open Interpreter — Jetson Hub Fork
 
-<p align="center">
-    <a href="https://discord.gg/Hvz9Axh84z">
-        <img alt="Discord" src="https://img.shields.io/discord/1146610656779440188?logo=discord&style=flat&logoColor=white"/></a>
-    <a href="docs/README_JA.md"><img src="https://img.shields.io/badge/ドキュメント-日本語-white.svg" alt="JA doc"/></a>
-    <a href="docs/README_ZH.md"><img src="https://img.shields.io/badge/文档-中文版-white.svg" alt="ZH doc"/></a>
-    <a href="docs/README_ES.md"> <img src="https://img.shields.io/badge/Español-white.svg" alt="ES doc"/></a>
-    <a href="docs/README_UK.md"><img src="https://img.shields.io/badge/Українська-white.svg" alt="UK doc"/></a>
-    <a href="docs/README_IN.md"><img src="https://img.shields.io/badge/Hindi-white.svg" alt="IN doc"/></a>
-    <a href="LICENSE"><img src="https://img.shields.io/static/v1?label=license&message=AGPL&color=white&style=flat" alt="License"/></a>
-    <br>
-    <br><a href="https://0ggfznkwh4j.typeform.com/to/G21i9lJ2">Get early access to the desktop app</a>‎ ‎ |‎ ‎ <a href="https://docs.openinterpreter.com/">Documentation</a><br>
-</p>
+> Fork of [OpenInterpreter/open-interpreter](https://github.com/OpenInterpreter/open-interpreter) v0.4.3 — AGPL-3.0
 
-<br>
+A modified Open Interpreter for **Jetson** (and other Linux ARM64/x86) devices running local LLMs via [Ollama](https://ollama.com). Designed for multi-machine development hubs where the LLM runs on one device and OI runs on another.
 
-<img alt="local_explorer" src="https://github.com/OpenInterpreter/open-interpreter/assets/63927363/d941c3b4-b5ad-4642-992c-40edf31e2e7a">
-
-<br>
-</p>
-<br>
-
-```shell
-pip install open-interpreter
-```
-
-> Not working? Read our [setup guide](https://docs.openinterpreter.com/getting-started/setup).
-
-```shell
-interpreter
-```
-
-<br>
-
-**Open Interpreter** lets LLMs run code (Python, Javascript, Shell, and more) locally. You can chat with Open Interpreter through a ChatGPT-like interface in your terminal by running `$ interpreter` after installing.
-
-This provides a natural-language interface to your computer's general-purpose capabilities:
-
-- Create and edit photos, videos, PDFs, etc.
-- Control a Chrome browser to perform research
-- Plot, clean, and analyze large datasets
-- ...etc.
-
-**⚠️ Note: You'll be asked to approve code before it's run.**
-
-<br>
-
-## Demo
-
-https://github.com/OpenInterpreter/open-interpreter/assets/63927363/37152071-680d-4423-9af3-64836a6f7b60
-
-#### An interactive demo is also available on Google Colab:
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1WKmRXZgsErej2xUriKzxrEAXdxMSgWbb?usp=sharing)
-
-#### Along with an example voice interface, inspired by _Her_:
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1NojYGHDgxH6Y1G1oxThEBBb2AtyODBIK)
-
-## Quick Start
-
-```shell
-pip install open-interpreter
-```
-
-### Terminal
-
-After installation, simply run `interpreter`:
-
-```shell
-interpreter
-```
-
-### Python
-
-```python
-from interpreter import interpreter
-
-interpreter.chat("Plot AAPL and META's normalized stock prices") # Executes a single command
-interpreter.chat() # Starts an interactive chat
-```
-
-### GitHub Codespaces
-
-Press the `,` key on this repository's GitHub page to create a codespace. After a moment, you'll receive a cloud virtual machine environment pre-installed with open-interpreter. You can then start interacting with it directly and freely confirm its execution of system commands without worrying about damaging the system.
-
-## Comparison to ChatGPT's Code Interpreter
-
-OpenAI's release of [Code Interpreter](https://openai.com/blog/chatgpt-plugins#code-interpreter) with GPT-4 presents a fantastic opportunity to accomplish real-world tasks with ChatGPT.
-
-However, OpenAI's service is hosted, closed-source, and heavily restricted:
-
-- No internet access.
-- [Limited set of pre-installed packages](https://wfhbrian.com/mastering-chatgpts-code-interpreter-list-of-python-packages/).
-- 100 MB maximum upload, 120.0 second runtime limit.
-- State is cleared (along with any generated files or links) when the environment dies.
+For upstream docs see the [original README](https://github.com/OpenInterpreter/open-interpreter/blob/main/README.md).
 
 ---
 
-Open Interpreter overcomes these limitations by running in your local environment. It has full access to the internet, isn't restricted by time or file size, and can utilize any package or library.
+## What's Different
 
-This combines the power of GPT-4's Code Interpreter with the flexibility of your local development environment.
+This fork adds two layers on top of stock OI:
 
-## Commands
+1. **Core OI improvements** — standalone fixes that make OI better regardless of your setup
+2. **Hub integration** — tools and commands for managing a multi-machine dev environment from inside OI
 
-**Update:** The Generator Update (0.1.5) introduced streaming:
+### Core Improvements (work standalone)
 
-```python
-message = "What operating system are we on?"
+| Feature | What it does |
+|---------|--------------|
+| **Callable auto_run** | Pass a function instead of `True/False` — approve/deny each command individually based on its content |
+| **Callable custom_instructions** | System message built dynamically at each turn, so you can inject live context (RAG results, project state, etc.) |
+| **Sudo detection** | Intercepts `sudo` commands before execution and warns the user instead of running them silently |
+| **Truncation fixes** | Large command outputs no longer lose their tail — spillover handling preserves the last N lines, and ANSI escape sequences are stripped cleanly |
+| **Refresh throttle** | Fast streaming output (e.g. `pip install` with 200 lines/sec) no longer floods the scrollback buffer. Base and message blocks throttle refreshes to ~10/sec |
+| **Rich output panels** | Final command output is rendered with structured Rich panels — diffs get colored, tables get aligned, errors get highlighted |
+| **Vendored tokentrim** | Fixes a [double-subtraction bug](https://github.com/KillianLucas/tokentrim/issues/11) that silently loses ~400-600 tokens of usable context window per turn |
 
-for chunk in interpreter.chat(message, display=False, stream=True):
-  print(chunk)
+### Hub Integration (requires hub tools)
+
+| Feature | What it does |
+|---------|--------------|
+| **Mini-RAG** | Semantic search over a local knowledge base (your projects, tools, commands) — injects the most relevant entries into each prompt automatically |
+| **Magic commands** | 12 `%commands` to operate your hub without leaving OI — check status, switch projects, commit code, run backups |
+| **Project switching** | `%switch` changes the LLM's project context (system message, env vars) so it knows which codebase you're working on |
+| **Status bar** | Shows context window usage and optional remote host memory usage after each response |
+
+---
+
+## Requirements
+
+- Python 3.9+ (tested on 3.10)
+- [Ollama](https://ollama.com) running on a reachable host (local or remote)
+- `sentence-transformers` for Mini-RAG (optional but recommended)
+- Linux recommended (Jetson, x86 Ubuntu, WSL2). macOS untested.
+
+## Install
+
+```bash
+git clone https://github.com/thehighnotes/open-interpreter.git
+cd open-interpreter
+git checkout hub-integration
+pip install -e .
+
+# For Mini-RAG support:
+pip install sentence-transformers
 ```
 
-### Interactive Chat
+> **Jetson note:** If `pip install` fails on `poetry-core`, run `pip install poetry-core` first.
+> On Jetson devices, prefer `pip3` and ensure you're using the system Python (not a venv) if you want OI available system-wide.
 
-To start an interactive chat in your terminal, either run `interpreter` from the command line:
+---
 
-```shell
-interpreter
-```
+## Quick Start with Ollama
 
-Or `interpreter.chat()` from a .py file:
-
-```python
-interpreter.chat()
-```
-
-**You can also stream each chunk:**
-
-```python
-message = "What operating system are we on?"
-
-for chunk in interpreter.chat(message, display=False, stream=True):
-  print(chunk)
-```
-
-### Programmatic Chat
-
-For more precise control, you can pass messages directly to `.chat(message)`:
-
-```python
-interpreter.chat("Add subtitles to all videos in /videos.")
-
-# ... Streams output to your terminal, completes task ...
-
-interpreter.chat("These look great but can you make the subtitles bigger?")
-
-# ...
-```
-
-### Start a New Chat
-
-In Python, Open Interpreter remembers conversation history. If you want to start fresh, you can reset it:
-
-```python
-interpreter.messages = []
-```
-
-### Save and Restore Chats
-
-`interpreter.chat()` returns a List of messages, which can be used to resume a conversation with `interpreter.messages = messages`:
-
-```python
-messages = interpreter.chat("My name is Killian.") # Save messages to 'messages'
-interpreter.messages = [] # Reset interpreter ("Killian" will be forgotten)
-
-interpreter.messages = messages # Resume chat from 'messages' ("Killian" will be remembered)
-```
-
-### Customize System Message
-
-You can inspect and configure Open Interpreter's system message to extend its functionality, modify permissions, or give it more context.
-
-```python
-interpreter.system_message += """
-Run shell commands with -y so the user doesn't have to confirm them.
-"""
-print(interpreter.system_message)
-```
-
-### Change your Language Model
-
-Open Interpreter uses [LiteLLM](https://docs.litellm.ai/docs/providers/) to connect to hosted language models.
-
-You can change the model by setting the model parameter:
-
-```shell
-interpreter --model gpt-3.5-turbo
-interpreter --model claude-2
-interpreter --model command-nightly
-```
-
-In Python, set the model on the object:
-
-```python
-interpreter.llm.model = "gpt-3.5-turbo"
-```
-
-[Find the appropriate "model" string for your language model here.](https://docs.litellm.ai/docs/providers/)
-
-### Running Open Interpreter locally
-
-#### Terminal
-
-Open Interpreter can use OpenAI-compatible server to run models locally. (LM Studio, jan.ai, ollama etc)
-
-Simply run `interpreter` with the api_base URL of your inference server (for LM studio it is `http://localhost:1234/v1` by default):
-
-```shell
-interpreter --api_base "http://localhost:1234/v1" --api_key "fake_key"
-```
-
-Alternatively you can use Llamafile without installing any third party software just by running
-
-```shell
-interpreter --local
-```
-
-for a more detailed guide check out [this video by Mike Bird](https://www.youtube.com/watch?v=CEs51hGWuGU?si=cN7f6QhfT4edfG5H)
-
-**How to run LM Studio in the background.**
-
-1. Download [https://lmstudio.ai/](https://lmstudio.ai/) then start it.
-2. Select a model then click **↓ Download**.
-3. Click the **↔️** button on the left (below 💬).
-4. Select your model at the top, then click **Start Server**.
-
-Once the server is running, you can begin your conversation with Open Interpreter.
-
-> **Note:** Local mode sets your `context_window` to 3000, and your `max_tokens` to 1000. If your model has different requirements, set these parameters manually (see below).
-
-#### Python
-
-Our Python package gives you more control over each setting. To replicate and connect to LM Studio, use these settings:
+Create a profile at `~/.config/open-interpreter/profiles/my-profile.py`:
 
 ```python
 from interpreter import interpreter
 
-interpreter.offline = True # Disables online features like Open Procedures
-interpreter.llm.model = "openai/x" # Tells OI to send messages in OpenAI's format
-interpreter.llm.api_key = "fake_key" # LiteLLM, which we use to talk to LM Studio, requires this
-interpreter.llm.api_base = "http://localhost:1234/v1" # Point this at any OpenAI compatible server
-
-interpreter.chat()
+interpreter.llm.model = "ollama/llama3:8b"         # any Ollama model
+interpreter.llm.api_base = "http://localhost:11434" # Ollama host (local or remote IP)
+interpreter.llm.api_key = "unused"
+interpreter.llm.context_window = 8000
+interpreter.llm.max_tokens = 1000
+interpreter.llm.supports_functions = False
+interpreter.llm.supports_vision = False
+interpreter.offline = True
 ```
 
-#### Context Window, Max Tokens
+Launch with:
 
-You can modify the `max_tokens` and `context_window` (in tokens) of locally running models.
-
-For local mode, smaller context windows will use less RAM, so we recommend trying a much shorter window (~1000) if it's failing / if it's slow. Make sure `max_tokens` is less than `context_window`.
-
-```shell
-interpreter --local --max_tokens 1000 --context_window 3000
+```bash
+interpreter --profile my-profile.py
 ```
 
-### Verbose mode
+For remote Ollama (running on a separate machine), change `api_base` to `http://<ollama-host>:11434`.
 
-To help you inspect Open Interpreter we have a `--verbose` mode for debugging.
+---
 
-You can activate verbose mode by using its flag (`interpreter --verbose`), or mid-chat:
+## Callable auto_run
 
-```shell
-$ interpreter
-...
-> %verbose true <- Turns on verbose mode
-
-> %verbose false <- Turns off verbose mode
-```
-
-### Interactive Mode Commands
-
-In the interactive mode, you can use the below commands to enhance your experience. Here's a list of available commands:
-
-**Available Commands:**
-
-- `%verbose [true/false]`: Toggle verbose mode. Without arguments or with `true` it
-  enters verbose mode. With `false` it exits verbose mode.
-- `%reset`: Resets the current session's conversation.
-- `%undo`: Removes the previous user message and the AI's response from the message history.
-- `%tokens [prompt]`: (_Experimental_) Calculate the tokens that will be sent with the next prompt as context and estimate their cost. Optionally calculate the tokens and estimated cost of a `prompt` if one is provided. Relies on [LiteLLM's `cost_per_token()` method](https://docs.litellm.ai/docs/completion/token_usage#2-cost_per_token) for estimated costs.
-- `%help`: Show the help message.
-
-### Configuration / Profiles
-
-Open Interpreter allows you to set default behaviors using `yaml` files.
-
-This provides a flexible way to configure the interpreter without changing command-line arguments every time.
-
-Run the following command to open the profiles directory:
-
-```
-interpreter --profiles
-```
-
-You can add `yaml` files there. The default profile is named `default.yaml`.
-
-#### Multiple Profiles
-
-Open Interpreter supports multiple `yaml` files, allowing you to easily switch between configurations:
-
-```
-interpreter --profile my_profile.yaml
-```
-
-## Sample FastAPI Server
-
-The generator update enables Open Interpreter to be controlled via HTTP REST endpoints:
+Stock OI's `auto_run` is a boolean — either every command runs automatically, or every command needs approval. This fork lets you pass a **function** that decides per-command:
 
 ```python
-# server.py
+# In your profile:
+def should_auto_run(code: str) -> bool:
+    """Approve read-only commands, block everything else."""
+    safe_prefixes = ['ls', 'cat', 'echo', 'pwd', 'git status', 'git log', 'git diff']
+    return any(code.strip().startswith(p) for p in safe_prefixes)
 
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-from interpreter import interpreter
-
-app = FastAPI()
-
-@app.get("/chat")
-def chat_endpoint(message: str):
-    def event_stream():
-        for result in interpreter.chat(message, stream=True):
-            yield f"data: {result}\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-@app.get("/history")
-def history_endpoint():
-    return interpreter.messages
+interpreter.auto_run = should_auto_run
 ```
 
-```shell
-pip install fastapi uvicorn
-uvicorn server:app --reload
+Now `ls`, `cat`, and `git status` run instantly, while `rm`, `pip install`, and other commands still ask for confirmation. The function receives the raw code string and returns `True` (auto-run) or `False` (ask user).
+
+---
+
+## Callable custom_instructions
+
+Stock OI's `custom_instructions` is a static string appended to the system message. This fork also accepts a **callable** — a function called at each conversation turn that returns a string:
+
+```python
+def build_instructions() -> str:
+    """Dynamic system instructions — called before each LLM request."""
+    base = "You are a Jetson development assistant."
+
+    # Inject RAG context based on recent conversation
+    if rag and rag.is_loaded:
+        recent = interpreter.messages[-1]["content"] if interpreter.messages else ""
+        hits = rag.query(recent, top_k=3)
+        if hits:
+            context = rag.format_context(hits)
+            base += f"\n\nRelevant context:\n{context}"
+
+    return base
+
+interpreter.custom_instructions = build_instructions
 ```
 
-You can also start a server identical to the one above by simply running `interpreter.server()`.
+This means the LLM always gets fresh, relevant context — not a stale blob of text from when the session started.
 
-## Android
+---
 
-The step-by-step guide for installing Open Interpreter on your Android device can be found in the [open-interpreter-termux repo](https://github.com/MikeBirdTech/open-interpreter-termux).
+## Mini-RAG
 
-## Safety Notice
+A lightweight semantic retrieval engine that makes the LLM aware of your specific setup. It loads knowledge entries from a local JSON file, embeds them with [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (384-dim, ~45MB), and injects the best matches into each prompt.
 
-Since generated code is executed in your local environment, it can interact with your files and system settings, potentially leading to unexpected outcomes like data loss or security risks.
-
-**⚠️ Open Interpreter will ask for user confirmation before executing code.**
-
-You can run `interpreter -y` or set `interpreter.auto_run = True` to bypass this confirmation, in which case:
-
-- Be cautious when requesting commands that modify files or system settings.
-- Watch Open Interpreter like a self-driving car, and be prepared to end the process by closing your terminal.
-- Consider running Open Interpreter in a restricted environment like Google Colab or Replit. These environments are more isolated, reducing the risks of executing arbitrary code.
-
-There is **experimental** support for a [safe mode](https://github.com/OpenInterpreter/open-interpreter/blob/main/docs/SAFE_MODE.md) to help mitigate some risks.
-
-## How Does it Work?
-
-Open Interpreter equips a [function-calling language model](https://platform.openai.com/docs/guides/gpt/function-calling) with an `exec()` function, which accepts a `language` (like "Python" or "JavaScript") and `code` to run.
-
-We then stream the model's messages, code, and your system's outputs to the terminal as Markdown.
-
-# Access Documentation Offline
-
-The full [documentation](https://docs.openinterpreter.com/) is accessible on-the-go without the need for an internet connection.
-
-[Node](https://nodejs.org/en) is a pre-requisite:
-
-- Version 18.17.0 or any later 18.x.x version.
-- Version 20.3.0 or any later 20.x.x version.
-- Any version starting from 21.0.0 onwards, with no upper limit specified.
-
-Install [Mintlify](https://mintlify.com/):
+### Setup
 
 ```bash
-npm i -g mintlify@latest
+# Copy the example entries and customize for your setup:
+mkdir -p ~/.config/hub
+cp rag-entries.example.json ~/.config/hub/rag-entries.json
 ```
 
-Change into the docs directory and run the appropriate command:
+### Entry format
+
+```json
+{
+  "topic": "ollama api",
+  "description": "running LLM inference, Ollama API, chat completions, sending prompts",
+  "content": "Use /api/chat not /api/generate. Add format:json for structured output.",
+  "source": "hub",
+  "category": "ollama"
+}
+```
+
+- **`description`** — semantic search matches against this field (add synonyms and related phrases)
+- **`content`** — the actual text injected into the prompt when matched
+- **`topic`** / **`source`** / **`category`** — metadata for organizing and filtering
+
+### Usage in a profile
+
+```python
+from interpreter.core.mini_rag import MiniRAG
+
+rag = MiniRAG()
+rag.load()  # loads model + embeds all entries (~2s first time)
+print(f"RAG: {rag.entry_count} entries, {rag.embedding_dim}d")
+
+# Use with callable custom_instructions (see above)
+```
+
+### Custom location
+
+Set `RAG_ENTRIES_PATH` to load entries from a different path:
 
 ```bash
-# Assuming you're at the project's root directory
-cd ./docs
-
-# Run the documentation server
-mintlify dev
+export RAG_ENTRIES_PATH=/path/to/my-entries.json
 ```
 
-A new browser window should open. The documentation will be available at [http://localhost:3000](http://localhost:3000) as long as the documentation server is running.
+---
 
-# Contributing
+## Hub Integration & Magic Commands
 
-Thank you for your interest in contributing! We welcome involvement from the community.
+The magic commands connect OI to an ecosystem of hub tools — small scripts in `~/` that manage projects, services, git repos, backups, and monitoring across multiple machines. They're designed for a setup where:
 
-Please see our [contributing guidelines](https://github.com/OpenInterpreter/open-interpreter/blob/main/docs/CONTRIBUTING.md) for more details on how to get involved.
+- **OI runs on one machine** (the "hub" — e.g. a Jetson Nano)
+- **Ollama runs on another** (e.g. a Jetson with more GPU memory)
+- **Projects live on various hosts** (accessed via SSH)
 
-# Roadmap
+The magic commands let you operate the entire environment without leaving the OI session.
 
-Visit [our roadmap](https://github.com/OpenInterpreter/open-interpreter/blob/main/docs/ROADMAP.md) to preview the future of Open Interpreter.
+### Project management
 
-**Note**: This software is not affiliated with OpenAI.
+| Command | What it does |
+|---------|--------------|
+| `%projects` | List all registered projects with host, name, and service count. Reads from `~/.config/hub/projects.json` |
+| `%switch <name>` | Switch project context — updates the system message so the LLM knows which codebase you're working on. Supports fuzzy matching (`%switch prom` → prometheus). Loads cached project overview for extra context |
+| `%overview [name]` | Show a project briefing — calls `~/overview` which queries the LLM to summarize project state, recent changes, and next steps |
 
-![thumbnail-ncu](https://github.com/OpenInterpreter/open-interpreter/assets/63927363/1b19a5db-b486-41fd-a7a1-fe2028031686)
+### Git operations
 
-> Having access to a junior programmer working at the speed of your fingertips ... can make new workflows effortless and efficient, as well as open the benefits of programming to new audiences.
->
-> — _OpenAI's Code Interpreter Release_
+| Command | What it does |
+|---------|--------------|
+| `%repo` | Show git dashboard — branch, dirty files, unpushed commits for every registered project |
+| `%repo status` | Detailed status for the current project |
+| `%repo commit` | Interactive commit for the current project |
+| `%repo push` | Push current project |
+| `%checkpoint [msg]` | Batch commit+push **all** dirty projects in one shot (with optional message) |
 
-<br>
+### Infrastructure
+
+| Command | What it does |
+|---------|--------------|
+| `%status` | Hub dashboard — shows which hosts are up, which services are running, project states |
+| `%health` | Health probe results — reads from `~/.cache/health/latest.json` (written by a cron-based health probe) |
+| `%services` | Service status across all projects — which ports are listening, which are down |
+| `%wake` | Send a Wake-on-LAN packet to bring a suspended machine online |
+
+### Utilities
+
+| Command | What it does |
+|---------|--------------|
+| `%backup [--dry-run]` | Run the backup script (`~/backup`) — rsyncs hub config to a remote host |
+| `%research [--fetch]` | Research digest — shows scored arxiv papers and GitHub releases relevant to your projects |
+| `%notify [--all\|--clear]` | Notification history — shows desktop notifications logged during the session |
+
+### Setting up the hub tools
+
+The magic commands expect these scripts in `~/`:
+
+| Script | Purpose |
+|--------|---------|
+| `~/hub` | Meta-tool — `--status`, `--next`, `--services`, `--explain` |
+| `~/git` | Git management — dashboard, commit, push, checkpoint |
+| `~/overview` | Project briefings via Ollama |
+| `~/research` | Arxiv + GitHub release monitoring |
+| `~/backup` | Rsync-based backup |
+| `~/notify` | Notification history viewer |
+| `~/wol.sh` | Wake-on-LAN script (path configurable via `OI_WOL_SCRIPT` env var) |
+| `~/hub_common.py` | Shared module — `HOSTS` dict, `ssh_cmd()`, project registry helpers |
+
+The project registry lives at `~/.config/hub/projects.json`. The health probe writes to `~/.cache/health/latest.json`. Overview cache lives in `~/.cache/overview/`.
+
+Without these tools installed, the magic commands will print a "tool not found" error and return gracefully — the core OI improvements still work fine.
+
+---
+
+## Other Built-in Commands
+
+These are OI's original commands plus a few additions:
+
+| Command | Description |
+|---------|-------------|
+| `%help` | Show all available commands |
+| `%reset` | Clear conversation history |
+| `%undo` | Remove last exchange |
+| `%view` | Open last truncated output in a pager |
+| `%model [name]` | Show or switch LLM model |
+| `%context [setting]` | Show or adjust context settings |
+| `%allow <pattern>` | Add a command prefix to persistent auto-run list |
+| `%deny <n\|all>` | Remove an auto-run pattern |
+| `%permissions` | Show auto-run permission list |
+| `%auto-edit` | Auto-apply `~~~edit` blocks without confirmation |
+| `%confirm-edit` | Require confirmation for `~~~edit` blocks (default) |
+
+---
+
+## File Reference
+
+### Modified files
+
+| File | Changes |
+|------|---------|
+| `interpreter/core/core.py` | Callable auto_run, callable custom_instructions |
+| `interpreter/core/respond.py` | Callable custom_instructions support |
+| `interpreter/core/llm/llm.py` | Vendored tokentrim import |
+| `interpreter/core/utils/truncate_output.py` | Spillover handling + ANSI strip |
+| `interpreter/core/computer/terminal/languages/subprocess_language.py` | Sudo detection |
+| `interpreter/terminal_interface/terminal_interface.py` | Auto-run flow, state indicators, configurable inference host probe |
+| `interpreter/terminal_interface/magic_commands.py` | Hub magic commands |
+| `interpreter/terminal_interface/components/code_block.py` | Rich output integration |
+| `interpreter/terminal_interface/components/base_block.py` | Refresh throttle |
+| `interpreter/terminal_interface/components/message_block.py` | Refresh throttle |
+
+### New files
+
+| File | Description |
+|------|-------------|
+| `interpreter/core/mini_rag.py` | RAG engine — loads entries from external JSON, embeds with all-MiniLM-L6-v2 |
+| `interpreter/terminal_interface/rich_output.py` | Rich diff panels + structured output renderer |
+| `interpreter/vendor/tokentrim/` | Vendored tokentrim with [double-subtraction fix](https://github.com/KillianLucas/tokentrim/issues/11) |
+| `rag-entries.example.json` | Sample RAG entries to get started |
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RAG_ENTRIES_PATH` | `~/.config/hub/rag-entries.json` | Path to RAG knowledge base |
+| `OI_INFERENCE_HOST` | *(none)* | SSH alias for remote inference host (shows memory usage in status bar) |
+| `OI_WOL_SCRIPT` | `~/wol.sh` | Script called by `%wake` |
+| `OI_PROJECT` | *(none)* | Current project key (set by `%switch`) |
+
+---
+
+## License
+
+AGPL-3.0, same as upstream. Modified files are marked with headers. See [LICENSE](LICENSE).

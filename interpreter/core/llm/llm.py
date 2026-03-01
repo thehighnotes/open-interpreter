@@ -1,3 +1,5 @@
+# Modified by thehighnotes (2026) — Jetson hub fork
+# See https://github.com/thehighnotes/open-interpreter
 import os
 
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
@@ -15,7 +17,7 @@ import time
 import uuid
 
 import requests
-import tokentrim as tt
+from interpreter.vendor import tokentrim as tt
 
 from .run_text_llm import run_text_llm
 

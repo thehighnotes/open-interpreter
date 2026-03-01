@@ -241,3 +241,6 @@ litellm_uuid.txt
 file.txt
 numbers.txt
 poetry.lock
+
+# Hub fork — local config (never commit)
+rag-entries.json

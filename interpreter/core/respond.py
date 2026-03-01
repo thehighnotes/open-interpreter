@@ -1,3 +1,5 @@
+# Modified by thehighnotes (2026) — Jetson hub fork
+# See https://github.com/thehighnotes/open-interpreter
 import json
 import os
 import re
@@ -30,9 +32,12 @@ def respond(interpreter):
             if hasattr(language, "system_message"):
                 system_message += "\n\n" + language.system_message
 
-        # Add custom instructions
-        if interpreter.custom_instructions:
-            system_message += "\n\n" + interpreter.custom_instructions
+        # Add custom instructions (supports callable for dynamic content, e.g. RAG)
+        _ci = interpreter.custom_instructions
+        if callable(_ci):
+            _ci = _ci(interpreter)
+        if _ci:
+            system_message += "\n\n" + _ci
 
         # Add computer API system message
         if interpreter.computer.import_computer_api:

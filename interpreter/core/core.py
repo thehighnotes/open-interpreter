@@ -1,3 +1,5 @@
+# Modified by thehighnotes (2026) — Jetson hub fork
+# See https://github.com/thehighnotes/open-interpreter
 """
 This file defines the Interpreter class.
 It's the main file. `from interpreter import interpreter` will import an instance of this class.
@@ -92,6 +94,8 @@ class OpenInterpreter:
         self.verbose = verbose
         self.debug = debug
         self.max_output = max_output
+        self.max_llm_output = max_output  # LLM sees up to this many chars; overridden by profile
+        self.display_collapse_lines = 15  # collapse terminal output longer than this
         self.safe_mode = safe_mode
         self.shrink_images = shrink_images
         self.disable_telemetry = disable_telemetry
@@ -347,7 +351,7 @@ class OpenInterpreter:
                         yield {**last_flag_base, "end": True}
                         last_flag_base = None
 
-                    if self.auto_run == False:
+                    if self.auto_run == False or callable(self.auto_run):
                         yield chunk
 
                     # We want to append this now, so even if content is never filled, we know that the execution didn't produce output.
@@ -390,9 +394,13 @@ class OpenInterpreter:
                                 for property in ["role", "type", "format"]
                             ]
                         ):
-                            self.messages.append(chunk)
+                            # Dual-channel: store llm_content for LLM, content for display
+                            stored = {k: v for k, v in chunk.items() if k != "llm_content"}
+                            if "llm_content" in chunk:
+                                stored["content"] = chunk["llm_content"]
+                            self.messages.append(stored)
                         else:
-                            self.messages[-1]["content"] += chunk["content"]
+                            self.messages[-1]["content"] += chunk.get("llm_content", chunk["content"])
                 else:
                     # If they don't match, yield a end message for the last message type and a start message for the new one
                     if last_flag_base:
@@ -408,16 +416,21 @@ class OpenInterpreter:
 
                     # Add the chunk as a new message
                     if not is_ephemeral(chunk):
-                        self.messages.append(chunk)
+                        # Dual-channel: store llm_content for LLM, content for display
+                        stored = {k: v for k, v in chunk.items() if k != "llm_content"}
+                        if "llm_content" in chunk:
+                            stored["content"] = chunk["llm_content"]
+                        self.messages.append(stored)
 
                 # Yield the chunk itself
                 yield chunk
 
-                # Truncate output if it's console output
+                # Truncate output if it's console output (LLM sees more than terminal)
                 if chunk["type"] == "console" and chunk["format"] == "output":
+                    _llm_limit = getattr(self, 'max_llm_output', self.max_output)
                     self.messages[-1]["content"] = truncate_output(
                         self.messages[-1]["content"],
-                        self.max_output,
+                        _llm_limit,
                         add_scrollbars=self.computer.import_computer_api,  # I consider scrollbars to be a computer API thing
                     )
 

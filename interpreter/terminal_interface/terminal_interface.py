@@ -1,3 +1,5 @@
+# Modified by thehighnotes (2026) — Jetson hub fork
+# See https://github.com/thehighnotes/open-interpreter
 """
 The terminal interface is just a view. Just handles the very top layer.
 If you were to build a frontend this would be a way to do it.
@@ -7,6 +9,67 @@ try:
     import readline
 except ImportError:
     pass
+
+
+# Load project keys dynamically for tab completion
+try:
+    import json as _json
+    from pathlib import Path as _Path
+    _pj = _Path.home() / ".config" / "hub" / "projects.json"
+    if _pj.exists():
+        with open(_pj) as _f:
+            _project_keys = list(_json.load(_f).get("projects", {}).keys())
+    else:
+        _project_keys = []
+except Exception:
+    _project_keys = []
+
+
+def _oi_completer(text, state):
+    MAGIC_COMMANDS = [
+        "%help", "%reset", "%undo", "%view",
+        "%verbose <true|false>", "%auto_run <true|false>",
+        "%save_message <path>", "%load_message <path>",
+        "%tokens <prompt>", "%markdown <path>",
+        "%info", "%jupyter",
+        "%context <llm|display|terminal|window|tokens> <value>",
+        "%allow <pattern>", "%deny <number|all>", "%permissions",
+        "%auto-edit", "%confirm-edit",
+        "%status", "%next", "%projects",
+        "%repo", "%checkpoint", "%backup",
+        "%wake", "%research", "%health",
+        "%services", "%switch", "%overview",
+        "%%",
+    ]
+    # Sub-options for commands that take known arguments
+    _SUB_OPTIONS = {
+        "%context": ["llm", "display", "terminal", "window", "tokens"],
+        "%verbose": ["true", "false"],
+        "%auto_run": ["true", "false"],
+        "%deny": ["all"],
+        "%repo": ["status", "log", "commit", "push", "pull", "deploy", "checkpoint", "create", "fix"],
+        "%backup": ["--dry-run", "--list"],
+        "%research": ["--fetch", "--calibrate", "--stats"],
+        "%switch": _project_keys,
+        "%overview": _project_keys,
+    }
+
+    buf = readline.get_line_buffer().lstrip()
+    # Check if we're completing a sub-option (user already typed a command + space)
+    for cmd, opts in _SUB_OPTIONS.items():
+        if buf.startswith(cmd + " "):
+            after = buf[len(cmd)+1:]
+            # Only complete the first sub-arg (the part being typed)
+            if " " not in after:
+                matches = [f"{cmd} {o}" for o in opts if o.startswith(after)]
+                return matches[state] if state < len(matches) else None
+
+    # Top-level command completion
+    if text.startswith("%"):
+        matches = [c for c in MAGIC_COMMANDS if c.startswith(text)]
+    else:
+        matches = []
+    return matches[state] if state < len(matches) else None
 
 import os
 import platform
@@ -18,7 +81,7 @@ import time
 
 from ..core.utils.scan_code import scan_code
 from ..core.utils.system_debug_info import system_info
-from ..core.utils.truncate_output import truncate_output
+from ..core.utils.truncate_output import truncate_output, collapse_for_display
 from .components.code_block import CodeBlock
 from .components.message_block import MessageBlock
 from .magic_commands import handle_magic_command
@@ -29,16 +92,20 @@ from .utils.find_image_path import find_image_path
 
 # Add examples to the readline history
 examples = [
-    "How many files are on my desktop?",
-    "What time is it in Seattle?",
-    "Make me a simple Pomodoro app.",
-    "Open Chrome and go to YouTube.",
-    "Can you set my system to light mode?",
+    "check the status of all services",
+    "show GPU memory usage",
+    "list files in the current directory",
+    "search for recent transformer architecture papers",
+    "what changed in the project recently?",
 ]
 random.shuffle(examples)
 try:
     for example in examples:
         readline.add_history(example)
+    readline.set_completer(_oi_completer)
+    readline.set_completer_delims(" \t\n")
+    readline.parse_and_bind("tab: complete")
+    readline.parse_and_bind("set enable-bracketed-paste on")
 except:
     # If they don't have readline, that's fine
     pass
@@ -159,6 +226,20 @@ def terminal_interface(interpreter, message):
                     }
 
         try:
+            # LLM inference tracking
+            _llm_wait_start = time.time()
+            _llm_first_token = None
+            _llm_token_count = 0
+            _llm_waiting = False
+            _llm_spinner = None
+
+            # Show thinking indicator for initial LLM call
+            if not interpreter.plain_text_display:
+                from rich.console import Console as _RCon
+                _llm_spinner = _RCon().status("  [dim]Thinking...[/dim]", spinner="dots")
+                _llm_spinner.start()
+                _llm_waiting = True
+
             for chunk in interpreter.chat(message, display=False, stream=True):
                 yield chunk
 
@@ -185,7 +266,14 @@ def terminal_interface(interpreter, message):
 
                 # Execution notice
                 if chunk["type"] == "confirmation":
-                    if not interpreter.auto_run:
+                    # Support callable auto_run for selective auto-approval
+                    _code_content = chunk["content"]["content"]
+                    _should_auto_run = (
+                        interpreter.auto_run(_code_content)
+                        if callable(interpreter.auto_run)
+                        else interpreter.auto_run
+                    )
+                    if not _should_auto_run:
                         # OI is about to execute code. The user wants to approve this
 
                         # End the active code block so you can run input() below it
@@ -217,21 +305,21 @@ def terminal_interface(interpreter, message):
 
                         if interpreter.plain_text_display:
                             response = input(
-                                "Would you like to run this code? (y/n)\n\n"
+                                "Run? y/n/e(dit)\n\n"
                             )
                         else:
                             response = input(
-                                "  Would you like to run this code? (y/n)\n\n  "
+                                "  Run? y/n/e(dit)\n\n  "
                             )
                         print("")  # <- Aesthetic choice
 
                         if response.strip().lower() == "y":
-                            # Create a new, identical block where the code will actually be run
-                            # Conveniently, the chunk includes everything we need to do this:
+                            # Create a new block for output only — code was already shown above
                             active_block = CodeBlock(interpreter)
                             active_block.margin_top = False  # <- Aesthetic choice
                             active_block.language = language
                             active_block.code = code
+                            active_block.output_only = True  # Don't re-render the code panel
                         elif response.strip().lower() == "e":
                             # Edit
 
@@ -258,12 +346,22 @@ def terminal_interface(interpreter, message):
                             active_block.language = language
                             active_block.code = code
                         else:
-                            # User declined to run code.
+                            # User declined — ask for redirect context
+                            _decline_msg = "I have declined to run this code."
+                            try:
+                                if interpreter.plain_text_display:
+                                    _reason = input("Why? (or Enter to skip)\n\n").strip()
+                                else:
+                                    _reason = input("  Why? (or Enter to skip)\n\n  ").strip()
+                                if _reason:
+                                    _decline_msg = f"I declined. {_reason}"
+                            except (KeyboardInterrupt, EOFError):
+                                pass
                             interpreter.messages.append(
                                 {
                                     "role": "user",
                                     "type": "message",
-                                    "content": "I have declined to run this code.",
+                                    "content": _decline_msg,
                                 }
                             )
                             break
@@ -288,16 +386,77 @@ def terminal_interface(interpreter, message):
                         "message",
                         "console",
                     ]:  # We don't stop on code's end — code + console output are actually one block.
-                        active_block.end()
-                        active_block = None
+                        if chunk["type"] == "console":
+                            active_block.end()
+                            active_block = None
+                        else:
+                            active_block.end()
+                            active_block = None
+
+                        # Message ended → show inference stats + context fill
+                        if chunk["type"] == "message" and _llm_first_token and not interpreter.plain_text_display:
+                            _now = time.time()
+                            _wait = _llm_first_token - _llm_wait_start
+                            _gen = _now - _llm_first_token
+                            _tps = _llm_token_count / _gen if _gen > 0.1 else 0
+                            from rich.console import Console as _RCon
+                            _stats_parts = []
+                            if _wait > 0.5:
+                                _stats_parts.append(f"prompt {_wait:.1f}s")
+                            _stats_parts.append(f"gen {_gen:.1f}s")
+                            if _tps > 0:
+                                _stats_parts.append(f"~{_tps:.0f} tok/s")
+                            # Context fill estimate (~4 chars per token)
+                            _ctx_win = getattr(interpreter.llm, 'context_window', 0)
+                            if _ctx_win > 0:
+                                _sys_chars = len(getattr(interpreter, 'system_message', '') or '')
+                                _msg_chars = sum(len(str(m.get('content', ''))) for m in interpreter.messages)
+                                _est_tokens = (_sys_chars + _msg_chars) // 4
+                                _ctx_pct = min(int(_est_tokens / _ctx_win * 100), 100)
+                                _ctx_color = "green" if _ctx_pct < 60 else "yellow" if _ctx_pct < 80 else "red"
+                                _stats_parts.append(f"[{_ctx_color}]ctx {_ctx_pct}%[/{_ctx_color}]")
+                            # Remote inference host memory usage (quick SSH probe)
+                            _inf_host = os.environ.get("OI_INFERENCE_HOST", "")
+                            if _inf_host:
+                                try:
+                                    _mem_result = subprocess.run(
+                                        ["ssh", "-o", "ConnectTimeout=1", _inf_host,
+                                         "awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf \"%d %d\", (t-a)/1024, t/1024}' /proc/meminfo"],
+                                        capture_output=True, text=True, timeout=2
+                                    )
+                                    if _mem_result.returncode == 0 and _mem_result.stdout.strip():
+                                        _used_mb, _total_mb = _mem_result.stdout.strip().split()
+                                        _mem_pct = int(int(_used_mb) / int(_total_mb) * 100)
+                                        _mem_color = "green" if _mem_pct < 60 else "yellow" if _mem_pct < 80 else "red"
+                                        _stats_parts.append(f"[{_mem_color}]{_inf_host} {_used_mb}M/{_total_mb}M[/{_mem_color}]")
+                                except (subprocess.TimeoutExpired, OSError):
+                                    pass
+                            _RCon().print(f"  [dim]{' | '.join(_stats_parts)}[/dim]")
+                            _llm_first_token = None
+
+                        # Console ended → LLM will be called next. Start waiting indicator.
+                        if chunk["type"] == "console" and not interpreter.plain_text_display:
+                            _llm_wait_start = time.time()
+                            from rich.console import Console as _RCon
+                            _llm_spinner = _RCon().status("  [dim]Thinking...[/dim]", spinner="dots")
+                            _llm_spinner.start()
+                            _llm_waiting = True
 
                 # Assistant message blocks
                 if chunk["type"] == "message":
                     if "start" in chunk:
+                        # Stop waiting indicator
+                        if _llm_spinner:
+                            _llm_spinner.stop()
+                            _llm_spinner = None
+                            _llm_waiting = False
+                        _llm_first_token = time.time()
+                        _llm_token_count = 0
                         active_block = MessageBlock()
                         render_cursor = True
 
                     if "content" in chunk:
+                        _llm_token_count += 1
                         active_block.message += chunk["content"]
 
                     if "end" in chunk and interpreter.os:
@@ -345,6 +504,11 @@ def terminal_interface(interpreter, message):
                 # Assistant code blocks
                 elif chunk["role"] == "assistant" and chunk["type"] == "code":
                     if "start" in chunk:
+                        # Stop waiting indicator if LLM went straight to code
+                        if _llm_spinner:
+                            _llm_spinner.stop()
+                            _llm_spinner = None
+                            _llm_waiting = False
                         active_block = CodeBlock()
                         active_block.language = chunk["format"]
                         render_cursor = True
@@ -424,17 +588,24 @@ def terminal_interface(interpreter, message):
                 if chunk["type"] == "console":
                     render_cursor = False
                     if "format" in chunk and chunk["format"] == "output":
-                        active_block.output += "\n" + chunk["content"]
-                        active_block.output = (
-                            active_block.output.strip()
-                        )  # ^ Aesthetic choice
+                        # Track raw output separately so collapse always
+                        # operates on unmodified data (streaming sends
+                        # multiple chunks — collapsing already-collapsed
+                        # output would hit the short-circuit and fail).
+                        if not hasattr(active_block, '_raw_output'):
+                            active_block._raw_output = ""
+                        active_block._raw_output += "\n" + chunk["content"]
+                        active_block._raw_output = (
+                            active_block._raw_output.strip()
+                        )
 
-                        # Truncate output
-                        active_block.output = truncate_output(
-                            active_block.output,
-                            interpreter.max_output,
-                            add_scrollbars=False,
-                        )  # ^ Notice that this doesn't add the "scrollbars" line, which I think is fine
+                        # Collapse or truncate output for terminal display
+                        _threshold = getattr(interpreter, 'display_collapse_lines', 15)
+                        active_block.output = collapse_for_display(
+                            active_block._raw_output,
+                            collapse_threshold=_threshold,
+                            max_display_chars=interpreter.max_output,
+                        )
                     if "format" in chunk and chunk["format"] == "active_line":
                         active_block.active_line = chunk["content"]
 
@@ -513,6 +684,11 @@ def terminal_interface(interpreter, message):
                 if active_block:
                     active_block.refresh(cursor=render_cursor)
 
+            # Clean up spinner if still active
+            if _llm_spinner:
+                _llm_spinner.stop()
+                _llm_spinner = None
+
             # (Sometimes -- like if they CTRL-C quickly -- active_block is still None here)
             if "active_block" in locals():
                 if active_block:
@@ -526,6 +702,9 @@ def terminal_interface(interpreter, message):
 
         except KeyboardInterrupt:
             # Exit gracefully
+            if _llm_spinner:
+                _llm_spinner.stop()
+                _llm_spinner = None
             if "active_block" in locals() and active_block:
                 active_block.end()
                 active_block = None

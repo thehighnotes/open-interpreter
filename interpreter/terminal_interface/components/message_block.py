@@ -1,3 +1,5 @@
+# Modified by thehighnotes (2026) — Jetson hub fork
+# See https://github.com/thehighnotes/open-interpreter
 import re
 
 from rich.box import MINIMAL
@@ -15,6 +17,10 @@ class MessageBlock(BaseBlock):
         self.message = ""
 
     def refresh(self, cursor=True):
+        # Throttle streaming refreshes to prevent scrollback pollution
+        if cursor and not self._should_refresh():
+            return
+
         # De-stylize any code blocks in markdown,
         # to differentiate from our Code Blocks
         content = textify_markdown_code_blocks(self.message)
