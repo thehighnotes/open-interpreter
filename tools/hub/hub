@@ -1,0 +1,2488 @@
+#!/usr/bin/env python3
+"""hub — Central entry point for the Orin Nano hub ecosystem.
+
+Provides system status dashboard, full reference with live probes,
+prioritized action list, and interactive project discovery.
+
+Usage:
+    hub                  Full reference with live system status (--explain)
+    hub --explain        Same as above
+    hub --status         Compact dashboard (fast, no LLM)
+    hub --next           Prioritized action list — what needs attention
+    hub --dev            Show/toggle npm dev services
+    hub --manage         Edit, delete, or reorder project entries
+    hub --scan <host>    Discover new projects on a host (agx, ws)
+    hub --help
+"""
+
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import *
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config-derived labels
+# ─────────────────────────────────────────────────────────────────────────────
+_CA_HOST_NAME = HOSTS.get(HUB_CONFIG['code_assistant']['host'], {}).get('name', 'CA')
+_CA_PORT = HUB_CONFIG['code_assistant']['port']
+_CA_LABEL = f'{_CA_HOST_NAME}:{_CA_PORT}'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notification helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_unread_count():
+    """Return number of unread notifications from NOTIFY_LOG."""
+    if not NOTIFY_LOG.exists():
+        return 0
+    count = 0
+    for line in NOTIFY_LOG.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            if not entry.get('read'):
+                count += 1
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return count
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Host probing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def probe_nano_health():
+    """Get local Nano health info."""
+    info = {}
+    try:
+        result = subprocess.run(['free', '-m'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'Mem:' in line:
+                    parts = line.split()
+                    info['ram_used'] = parts[2]
+                    info['ram_total'] = parts[1]
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(['uptime', '-p'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            info['uptime'] = result.stdout.strip()
+    except Exception:
+        pass
+    return info
+
+
+def probe_remote_host(host_key, reachable):
+    """Get remote host info (uptime, RAM, optionally Ollama). Returns dict."""
+    if not reachable:
+        return {'online': False}
+    info = {'online': True}
+
+    # Build SSH probe command — include Ollama check if this is the Ollama host
+    cmd = 'echo "===UPTIME===" && uptime -p 2>/dev/null && echo "===MEM===" && free -m 2>/dev/null | grep Mem'
+    if host_key == OLLAMA_HOST:
+        cmd += f' && echo "===OLLAMA===" && curl -s http://localhost:{OLLAMA_PORT}/api/ps 2>/dev/null'
+
+    ok, output = ssh_cmd(host_key, cmd, timeout=10)
+    if ok and output:
+        sections = output.split('===')
+        for i in range(1, len(sections), 2):
+            key = sections[i].strip()
+            val = sections[i + 1].strip() if i + 1 < len(sections) else ''
+            if key == 'UPTIME':
+                info['uptime'] = val
+            elif key == 'MEM':
+                parts = val.split()
+                if len(parts) >= 3:
+                    info['ram_used'] = parts[2]
+                    info['ram_total'] = parts[1]
+            elif key == 'OLLAMA':
+                try:
+                    import json
+                    data = json.loads(val)
+                    models = data.get('models', [])
+                    if models:
+                        info['ollama'] = ', '.join(m.get('name', '?') for m in models)
+                    else:
+                        info['ollama'] = 'idle'
+                except Exception:
+                    info['ollama'] = 'running'
+    return info
+
+
+def get_autosummary_status():
+    """Check if autosummary is running. Returns (running, pid)."""
+    pid_file = OVERVIEW_CACHE_DIR / 'autosummary.pid'
+    if not pid_file.exists():
+        return False, None
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)
+        return True, pid
+    except (ValueError, OSError):
+        return False, None
+
+
+def get_research_last_fetch():
+    """Get last research fetch time. Returns (age_str, age_seconds).
+
+    age_str is like '5m ago', '3h ago', or 'never'. age_seconds is float or None.
+    """
+    import json
+    state_file = RESEARCH_CACHE_DIR / 'state.json'
+    if not state_file.exists():
+        return 'never', None
+    try:
+        state = json.loads(state_file.read_text())
+        last = state.get('arxiv_last_fetch')
+        if not last:
+            return 'never', None
+        # Parse ISO timestamp
+        try:
+            dt = datetime.strptime(last, '%Y-%m-%dT%H:%M:%S')
+            age = (datetime.utcnow() - dt).total_seconds()
+            if age < 3600:
+                return f"{int(age / 60)}m ago", age
+            elif age < 86400:
+                return f"{int(age / 3600)}h ago", age
+            else:
+                return f"{int(age / 86400)}d ago", age
+        except ValueError:
+            return last, None
+    except (Exception):
+        return 'error', None
+
+
+def get_cache_ages():
+    """Get overview cache ages for all projects. Returns ({key: age_str}, {key: age_seconds})."""
+    ages = {}
+    ages_s = {}
+    for pk in PROJECT_ORDER:
+        cache_file = OVERVIEW_CACHE_DIR / f"{pk}.json"
+        if cache_file.exists():
+            try:
+                age = time.time() - cache_file.stat().st_mtime
+                ages_s[pk] = age
+                if age < 3600:
+                    ages[pk] = f"{int(age / 60)}m"
+                elif age < 86400:
+                    ages[pk] = f"{int(age / 3600)}h"
+                else:
+                    ages[pk] = f"{int(age / 86400)}d"
+            except OSError:
+                ages[pk] = '?'
+                ages_s[pk] = None
+        else:
+            ages[pk] = '--'
+            ages_s[pk] = None
+    return ages, ages_s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared state gathering
+# ─────────────────────────────────────────────────────────────────────────────
+
+def gather_state(include_extras=False):
+    """Probe all system state. Returns a dict consumed by render_status() and render_next().
+
+    When include_extras=True, also fetches backup_age (for --next).
+    """
+    # Probe hosts in parallel (dynamic from config)
+    remote_hosts = [k for k in HOSTS if k != LOCAL_HOST]
+    host_reachable = run_parallel({
+        k: (lambda h=k: check_host_reachable(h)) for k in remote_hosts
+    })
+
+    probe_tasks = {LOCAL_HOST: lambda: probe_nano_health()}
+    for k in remote_hosts:
+        probe_tasks[k] = (lambda h=k: probe_remote_host(h, host_reachable.get(h, False)))
+    results = run_parallel(probe_tasks)
+
+    as_running, as_pid = get_autosummary_status()
+    research_last, research_age_s = get_research_last_fetch()
+    cache_ages, cache_age_s = get_cache_ages()
+
+    # Code Assistant
+    ca_host = HUB_CONFIG['code_assistant']['host']
+    ca_reachable = host_reachable.get(ca_host, True) if ca_host != LOCAL_HOST else True
+    ca_up = check_code_assistant() if ca_reachable else False
+    ca_projects = None
+    ca_watcher = None
+    if ca_up:
+        ca_projects = code_assistant_get('projects', timeout=3)
+        ca_watcher = code_assistant_get('watcher/status', timeout=3)
+
+    # GIT summary (quick batch probe)
+    git_by_host = {}
+    for pk in PROJECT_ORDER:
+        p = PROJECTS[pk]
+        git_by_host.setdefault(p['host'], []).append((pk, p))
+    git_tasks = {}
+    for h, entries in git_by_host.items():
+        if host_reachable.get(h, False):
+            git_tasks[h] = (lambda h=h, e=entries: fetch_git_status_batch(h, e))
+    git_raw = run_parallel(git_tasks) if git_tasks else {}
+    git_all = {}
+    for h, r in git_raw.items():
+        if isinstance(r, dict):
+            git_all.update(r)
+
+    # Deploy states
+    deploy_states = {}
+    for pk in PROJECT_ORDER:
+        deploy_states[pk] = read_deploy_state(pk)
+
+    state = {
+        'host_reachable': host_reachable,
+        'host_info': results,
+        'as_running': as_running,
+        'as_pid': as_pid,
+        'research_last': research_last,
+        'research_age_s': research_age_s,
+        'cache_ages': cache_ages,
+        'cache_age_s': cache_age_s,
+        'ca_up': ca_up,
+        'ca_projects': ca_projects,
+        'ca_watcher': ca_watcher,
+        'git_all': git_all,
+        'deploy_states': deploy_states,
+    }
+
+    if include_extras:
+        backup_host = BACKUP_DEST.split(':')[0] if ':' in BACKUP_DEST else LOCAL_HOST
+        backup_reachable = host_reachable.get(backup_host, True) if backup_host != LOCAL_HOST else True
+        if backup_reachable:
+            backup_str, backup_s = get_backup_age()
+            state['backup_age'] = backup_str
+            state['backup_age_s'] = backup_s
+        else:
+            state['backup_age'] = 'unknown'
+            state['backup_age_s'] = None
+
+    return state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Contextual hints
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_hints(state):
+    """Generate contextual hints based on system state.
+
+    Returns {hosts: [], background: [], git: [], caches: []} — lists of hint strings.
+    Empty list = no hints = quiet section.
+    """
+    host_reachable = state['host_reachable']
+    git_all = state['git_all']
+    cache_ages = state['cache_ages']
+    cache_age_s = state['cache_age_s']
+
+    hints = {'hosts': [], 'background': [], 'git': [], 'caches': []}
+
+    # HOSTS hints (max 3, dynamic)
+    for hkey in HOSTS:
+        if hkey == LOCAL_HOST:
+            continue
+        hname = HOSTS[hkey]['name']
+        if not host_reachable.get(hkey):
+            is_wakeable = 'wakeable' in HOSTS[hkey].get('roles', [])
+            if is_wakeable:
+                # Check if any projects on this host have uncommitted work
+                host_dirty = sum(1 for pk, s in git_all.items()
+                                 if PROJECTS.get(pk, {}).get('host') == hkey
+                                 and s.get('is_git') and (s.get('dirty', 0) + s.get('untracked', 0)) > 0)
+                if host_dirty:
+                    hints['hosts'].append(f'{hname} suspended — {host_dirty} project(s) have uncommitted work')
+            else:
+                hints['hosts'].append(f'{hname} offline')
+        if len(hints['hosts']) >= 3:
+            break
+
+    # BACKGROUND hints (max 3)
+    if not state['as_running']:
+        hints['background'].append('autosummary — start in tmux for auto-caching between sessions')
+    research_age_s = state.get('research_age_s')
+    if research_age_s is None or research_age_s > 86400:
+        age_label = state['research_last'] if state['research_last'] != 'never' else 'never fetched'
+        hints['background'].append(f'research --fetch — data is {age_label}')
+    ca_host_2 = HUB_CONFIG['code_assistant']['host']
+    ca_reachable_2 = host_reachable.get(ca_host_2, True) if ca_host_2 != LOCAL_HOST else True
+    if not state['ca_up'] and ca_reachable_2:
+        hints['background'].append(f'Code Assistant offline on {_CA_LABEL} — code search unavailable')
+    elif state['ca_up'] and state['ca_watcher'] and not state['ca_watcher'].get('running'):
+        hints['background'].append('code manage — file watcher stopped, indexes may be stale')
+    unread = get_unread_count()
+    if unread > 0:
+        hints['background'].append(f'notify — {unread} unread notification(s)')
+
+    # GIT hints (max 3)
+    dirty_pks = [pk for pk, s in git_all.items()
+                 if s.get('is_git') and (s.get('dirty', 0) + s.get('untracked', 0)) > 0]
+    ahead_only_pks = [pk for pk, s in git_all.items()
+                      if s.get('is_git') and isinstance(s.get('ahead'), int) and s['ahead'] > 0
+                      and pk not in dirty_pks]
+    pat_pks = [pk for pk, s in git_all.items() if s.get('has_pat')]
+    no_git_pks = [pk for pk, s in git_all.items() if not s.get('is_git')]
+
+    git_hints = []
+    if dirty_pks:
+        git_hints.append(f'repo checkpoint — {len(dirty_pks)} project(s) have uncommitted changes')
+    if ahead_only_pks:
+        git_hints.append(f'repo checkpoint — {len(ahead_only_pks)} project(s) have unpushed commits')
+    if pat_pks:
+        git_hints.append(f'repo fix {pat_pks[0]} — PAT token exposed in remote URL')
+    if no_git_pks:
+        git_hints.append(f'repo init {no_git_pks[0]} — not a git repo yet')
+    hints['git'] = git_hints[:3]
+
+    # CACHES hints (max 2)
+    cache_hints = []
+    # Find stalest project (>3 days)
+    stalest_pk = None
+    stalest_age = 0
+    missing_pks = []
+    for pk in PROJECT_ORDER:
+        age_s = cache_age_s.get(pk)
+        if age_s is None and cache_ages.get(pk) == '--':
+            missing_pks.append(pk)
+        elif age_s is not None and age_s > 259200 and age_s > stalest_age:
+            stalest_age = age_s
+            stalest_pk = pk
+    if stalest_pk:
+        cache_hints.append(f'work {stalest_pk} — cache is {cache_ages[stalest_pk]} old (refreshes automatically)')
+    if missing_pks:
+        cache_hints.append(f'overview {missing_pks[0]} — no cache yet, run to generate')
+    hints['caches'] = cache_hints[:2]
+
+    return hints
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --status: Compact dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_status():
+    """Fast compact dashboard."""
+    now = datetime.now().strftime('%a %d %b %H:%M')
+    state = gather_state()
+
+    host_info = state['host_info']
+    as_running = state['as_running']
+    as_pid = state['as_pid']
+    research_last = state['research_last']
+    cache_ages = state['cache_ages']
+    host_reachable = state['host_reachable']
+    ca_up = state['ca_up']
+    ca_projects = state['ca_projects']
+    ca_watcher_status = state['ca_watcher']
+    git_all = state['git_all']
+
+    unread = get_unread_count()
+
+    print()
+    header_bar()
+    unread_label = f"  {YELLOW}{unread} unread{RESET}" if unread else ""
+    print_right(f"{BRIGHT_GREEN}  HUB STATUS{RESET}{unread_label}", f"{BRIGHT_GREEN}{now}{RESET}")
+    header_bar()
+
+    # HOSTS
+    print(f"  {WHITE}HOSTS{RESET}")
+    divider()
+
+    # Local host
+    local = host_info.get(LOCAL_HOST, {})
+    local_name = HOSTS.get(LOCAL_HOST, {}).get('name', LOCAL_HOST)
+    local_parts = []
+    if local.get('uptime'):
+        local_parts.append(local['uptime'])
+    if local.get('ram_used'):
+        local_parts.append(f"{local['ram_used']}M/{local['ram_total']}M RAM")
+    print(f"  {GREEN}●{RESET} {WHITE}{local_name:<8}{RESET} hub     | {' | '.join(local_parts) if local_parts else 'local'}")
+
+    # Remote hosts (dynamic)
+    for hkey in HOSTS:
+        if hkey == LOCAL_HOST:
+            continue
+        h = host_info.get(hkey, {})
+        hname = HOSTS[hkey]['name']
+        is_wakeable = 'wakeable' in HOSTS[hkey].get('roles', [])
+        if h.get('online'):
+            parts = []
+            if h.get('uptime'):
+                parts.append(h['uptime'])
+            if h.get('ram_used'):
+                parts.append(f"{h['ram_used']}M/{h['ram_total']}M RAM")
+            if h.get('ollama'):
+                parts.append(f"Ollama: {h['ollama']}")
+            print(f"  {GREEN}●{RESET} {WHITE}{hname:<8}{RESET} | {' | '.join(parts)}")
+        elif is_wakeable:
+            print(f"  {YELLOW}●{RESET} {WHITE}{hname:<8}{RESET} | {YELLOW}SUSPENDED{RESET} — run {WHITE}prepare <project>{RESET}")
+        else:
+            print(f"  {RED}●{RESET} {WHITE}{hname:<8}{RESET} | {RED}OFFLINE{RESET}")
+
+    # Host hints
+    hints = generate_hints(state)
+    for h in hints.get('hosts', []):
+        print(f"  {DIM}  → {h}{RESET}")
+
+    print()
+
+    # BACKGROUND
+    print(f"  {WHITE}BACKGROUND{RESET}")
+    divider()
+    if as_running:
+        print(f"  {GREEN}●{RESET} autosummary   running (PID {as_pid})")
+    else:
+        print(f"  {GRAY}●{RESET} autosummary   {GRAY}not running{RESET}")
+    print(f"  {GREEN}●{RESET} research      last fetch: {research_last}")
+
+    # Code Assistant
+    if ca_up:
+        if ca_projects and 'projects' in ca_projects:
+            ca_list = ca_projects['projects']
+            total_files = sum(p.get('code_count', 0) + p.get('doc_count', 0) for p in ca_list)
+            proj_parts = []
+            for p in ca_list:
+                n = p.get('code_count', 0) + p.get('doc_count', 0)
+                proj_parts.append(f"{p['name']}:{n}")
+            watcher_label = ''
+            if ca_watcher_status:
+                if ca_watcher_status.get('running'):
+                    watcher_label = f"  {GREEN}w{RESET}"
+                else:
+                    watcher_label = f"  {GRAY}w{RESET}"
+            print(f"  {GREEN}●{RESET} code assist    {_CA_LABEL}  {GRAY}{' · '.join(proj_parts)}  ({total_files} files){RESET}{watcher_label}")
+        else:
+            print(f"  {GREEN}●{RESET} code assist    {_CA_LABEL} ({len(CODE_ASSISTANT_PROJECTS)} projects)")
+    else:
+        print(f"  {GRAY}●{RESET} code assist    {GRAY}offline{RESET}")
+
+    # Dev services summary
+    all_dev_enabled = []
+    for pk in PROJECT_ORDER:
+        for ds in PROJECTS[pk].get('dev_services', []):
+            if ds.get('enabled'):
+                all_dev_enabled.append((pk, ds))
+    if all_dev_enabled:
+        dev_labels = []
+        for pk, ds in all_dev_enabled:
+            dev_labels.append(f"{pk}:{ds['port']}")
+        print(f"  {YELLOW}●{RESET} dev services   {GRAY}{' · '.join(dev_labels)}{RESET}     {GRAY}hub --dev{RESET}")
+
+    # GIT summary
+    n_repos = sum(1 for s in git_all.values() if s.get('is_git'))
+    n_dirty = sum(1 for s in git_all.values() if s.get('is_git') and (s.get('dirty', 0) + s.get('untracked', 0)) > 0)
+    n_ahead = sum(1 for s in git_all.values() if s.get('is_git') and isinstance(s.get('ahead'), int) and s['ahead'] > 0)
+    git_parts = [f"{n_repos}/{len(PROJECT_ORDER)} repos"]
+    if n_dirty:
+        git_parts.append(f"{YELLOW}{n_dirty} dirty{RESET}")
+    if n_ahead:
+        git_parts.append(f"{CYAN}{n_ahead} ahead{RESET}")
+    print(f"  {GREEN}●{RESET} git            {'  '.join(git_parts)}     {GRAY}repo{RESET}")
+
+    # Background + Git hints
+    for h in hints.get('background', []):
+        print(f"  {DIM}  → {h}{RESET}")
+    for h in hints.get('git', []):
+        print(f"  {DIM}  → {h}{RESET}")
+
+    print()
+
+    # CACHES
+    print(f"  {WHITE}CACHES{RESET}")
+    divider()
+    # Render in pairs
+    items = list(cache_ages.items())
+    line = '  '
+    for i, (pk, age) in enumerate(items):
+        age_color = GREEN if age not in ('--', '?') and not age.endswith('d') else YELLOW if age.endswith('d') else GRAY
+        line += f"{pk:<12s} {age_color}{age:>4s}{RESET}   "
+        if (i + 1) % 3 == 0 or i == len(items) - 1:
+            print(line)
+            line = '  '
+
+    # Cache hints
+    for h in hints.get('caches', []):
+        print(f"  {DIM}  → {h}{RESET}")
+
+    header_bar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --next: Prioritized action list
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_next_items(state):
+    """Scan all state and return prioritized action items.
+
+    Returns list of {priority, icon, desc, command, project} dicts, sorted by priority.
+    """
+    host_reachable = state['host_reachable']
+    git_all = state['git_all']
+    cache_ages = state['cache_ages']
+    cache_age_s = state['cache_age_s']
+    deploy_states = state['deploy_states']
+    items = []
+
+    # P1 — Data loss risk
+    for pk in PROJECT_ORDER:
+        s = git_all.get(pk)
+        if not s or not s.get('is_git'):
+            continue
+        dirty = s.get('dirty', 0) + s.get('untracked', 0)
+        if dirty > 0 and not s.get('remote_url'):
+            items.append({
+                'priority': 1, 'icon': f'{RED}!{RESET}',
+                'desc': f"{PROJECTS[pk]['name']}: {dirty} changes with no remote backup",
+                'command': f'repo create {pk}', 'project': pk,
+            })
+        elif dirty > 0:
+            items.append({
+                'priority': 1, 'icon': f'{RED}!{RESET}',
+                'desc': f"{PROJECTS[pk]['name']}: {dirty} uncommitted changes",
+                'command': f'repo commit {pk} "msg"', 'project': pk,
+            })
+        elif isinstance(s.get('ahead'), int) and s['ahead'] > 0:
+            items.append({
+                'priority': 1, 'icon': f'{RED}!{RESET}',
+                'desc': f"{PROJECTS[pk]['name']}: {s['ahead']} unpushed commits",
+                'command': f'repo push {pk}', 'project': pk,
+            })
+
+    # P2 — Production out of sync
+    for pk in PROJECT_ORDER:
+        ds = deploy_states.get(pk)
+        s = git_all.get(pk)
+        proj = PROJECTS[pk]
+        if ds and s and s.get('head') and ds.get('head') != s['head'] and proj.get('services'):
+            items.append({
+                'priority': 2, 'icon': f'{YELLOW}!{RESET}',
+                'desc': f"{proj['name']}: deploy stale, services running old code",
+                'command': f'repo deploy {pk}', 'project': pk,
+            })
+
+    # P3 — Degraded functionality (dynamic host checks)
+    for hkey in HOSTS:
+        if hkey == LOCAL_HOST:
+            continue
+        if not host_reachable.get(hkey):
+            hname = HOSTS[hkey]['name']
+            host_projects = sum(1 for pk in PROJECT_ORDER if PROJECTS[pk]['host'] == hkey)
+            if host_projects:
+                items.append({
+                    'priority': 3, 'icon': f'{YELLOW}●{RESET}',
+                    'desc': f"{hname} offline — {host_projects} project(s) unavailable",
+                    'command': '', 'project': None,
+                })
+    if not state['as_running']:
+        items.append({
+            'priority': 3, 'icon': f'{YELLOW}●{RESET}',
+            'desc': "autosummary not running — sessions won't auto-cache",
+            'command': 'autosummary (in tmux)', 'project': None,
+        })
+    ca_host_n = HUB_CONFIG['code_assistant']['host']
+    ca_reachable_n = host_reachable.get(ca_host_n, True) if ca_host_n != LOCAL_HOST else True
+    if not state['ca_up'] and ca_reachable_n:
+        items.append({
+            'priority': 3, 'icon': f'{YELLOW}●{RESET}',
+            'desc': 'Code Assistant offline — code search unavailable',
+            'command': '', 'project': None,
+        })
+
+    # P4 — Stale context
+    for pk in PROJECT_ORDER:
+        age_s = cache_age_s.get(pk)
+        if age_s is not None and age_s > 259200:
+            items.append({
+                'priority': 4, 'icon': f'{GRAY}●{RESET}',
+                'desc': f"{PROJECTS[pk]['name']}: overview cache {cache_ages[pk]} old",
+                'command': f'overview {pk} --refresh', 'project': pk,
+            })
+        elif cache_ages.get(pk) == '--':
+            items.append({
+                'priority': 4, 'icon': f'{GRAY}●{RESET}',
+                'desc': f"{PROJECTS[pk]['name']}: no overview cache",
+                'command': f'overview {pk}', 'project': pk,
+            })
+    research_age_s = state.get('research_age_s')
+    if research_age_s is None or research_age_s > 86400:
+        items.append({
+            'priority': 4, 'icon': f'{GRAY}●{RESET}',
+            'desc': f"Research data {state['research_last']}",
+            'command': 'research --fetch', 'project': None,
+        })
+    backup_age_s = state.get('backup_age_s')
+    backup_age = state.get('backup_age', 'unknown')
+    if backup_age_s is not None and backup_age_s > 604800:
+        items.append({
+            'priority': 4, 'icon': f'{GRAY}●{RESET}',
+            'desc': f"No recent backup ({backup_age})",
+            'command': 'backup', 'project': None,
+        })
+    elif backup_age == 'never':
+        items.append({
+            'priority': 4, 'icon': f'{GRAY}●{RESET}',
+            'desc': 'No recent backup (never)',
+            'command': 'backup', 'project': None,
+        })
+
+    # P5 — Maintenance
+    for pk in PROJECT_ORDER:
+        s = git_all.get(pk)
+        if not s:
+            continue
+        if s.get('has_pat'):
+            items.append({
+                'priority': 5, 'icon': f'{GRAY}·{RESET}',
+                'desc': f"{PROJECTS[pk]['name']}: PAT token in git remote",
+                'command': f'repo fix {pk}', 'project': pk,
+            })
+        if s.get('is_git') and not s.get('remote_url') and s.get('commits', 0) > 0:
+            # Only if not already in P1 (dirty + no remote)
+            dirty = s.get('dirty', 0) + s.get('untracked', 0)
+            if dirty == 0:
+                items.append({
+                    'priority': 5, 'icon': f'{GRAY}·{RESET}',
+                    'desc': f"{PROJECTS[pk]['name']}: no remote configured",
+                    'command': f'repo create {pk}', 'project': pk,
+                })
+    if state['ca_up'] and state['ca_watcher'] and not state['ca_watcher'].get('running'):
+        items.append({
+            'priority': 5, 'icon': f'{GRAY}·{RESET}',
+            'desc': 'Code Assistant file watcher stopped',
+            'command': 'code manage', 'project': None,
+        })
+
+    # Sort by priority, then PROJECT_ORDER for same-priority items
+    order_map = {pk: i for i, pk in enumerate(PROJECT_ORDER)}
+    items.sort(key=lambda x: (x['priority'], order_map.get(x.get('project'), 999)))
+
+    return items
+
+
+def render_next():
+    """Prioritized action list — what needs attention."""
+    now = datetime.now().strftime('%a %d %b %H:%M')
+    state = gather_state(include_extras=True)
+    items = generate_next_items(state)
+
+    print()
+    header_bar()
+    print_right(f"{BRIGHT_GREEN}  NEXT ACTIONS{RESET}", f"{BRIGHT_GREEN}{now}{RESET}")
+    header_bar()
+
+    if not items:
+        print()
+        print(f"  {GREEN}✓{RESET} All good. {WHITE}work <project>{RESET} to start a session.")
+        print()
+        header_bar()
+        return
+
+    print()
+    max_show = 8
+    for item in items[:max_show]:
+        desc = item['desc']
+        cmd = item['command']
+        icon = item['icon']
+        p = item['priority']
+
+        # Color desc based on priority
+        if p <= 2:
+            desc_str = f"{WHITE}{desc}{RESET}"
+        elif p == 3:
+            desc_str = desc
+        elif p == 4:
+            desc_str = f"{GRAY}{desc}{RESET}"
+        else:
+            desc_str = f"{DIM}{desc}{RESET}"
+
+        # Color command based on priority
+        if p <= 3:
+            cmd_str = f"{CYAN}{cmd}{RESET}" if cmd else ''
+        elif p == 4:
+            cmd_str = f"{WHITE}{cmd}{RESET}" if cmd else ''
+        else:
+            cmd_str = f"{GRAY}{cmd}{RESET}" if cmd else ''
+
+        left = f"  {icon} {desc_str}"
+        if cmd_str:
+            padding = cols() - len(strip_ansi(left)) - len(strip_ansi(cmd_str)) - 2
+            if padding < 2:
+                padding = 2
+            print(f"{left}{' ' * padding}{cmd_str}")
+        else:
+            print(left)
+
+    if len(items) > max_show:
+        print(f"  {DIM}... and {len(items) - max_show} more{RESET}")
+
+    print()
+    print(f"  {DIM}hub --explain → Contextual Guidance section explains each suggestion{RESET}")
+    header_bar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --services: Service status across all projects
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_services():
+    """Show all registered services grouped by host with live status."""
+    print()
+    header_bar()
+    print(f"{BRIGHT_GREEN}  HUB — Services{RESET}")
+    header_bar()
+
+    # Group services by host
+    by_host = {}
+    for key in PROJECT_ORDER:
+        proj = PROJECTS[key]
+        services = proj.get('services', [])
+        if not services:
+            continue
+        host_key = proj['host']
+        if host_key not in by_host:
+            by_host[host_key] = []
+        for svc in services:
+            by_host[host_key].append({
+                'project': key,
+                'project_name': proj['name'],
+                'name': svc['name'],
+                'port': svc['port'],
+                'start_cmd': svc.get('start_cmd', ''),
+                'host_alias': HOSTS[host_key]['alias'],
+            })
+
+    if not by_host:
+        print(f"\n  {GRAY}No services configured in any project{RESET}")
+        header_bar()
+        return
+
+    # Probe all services in parallel
+    probe_tasks = {}
+    host_reachable = {}
+    for host_key, svcs in by_host.items():
+        alias = HOSTS[host_key]['alias']
+        host_reachable[host_key] = check_host_reachable(alias)
+        if host_reachable[host_key]:
+            for svc in svcs:
+                task_key = f"{host_key}:{svc['port']}"
+                port = svc['port']
+                probe_tasks[task_key] = lambda a=alias, p=port: probe_service(a, p, timeout=3)
+
+    with Spinner("Probing services..."):
+        probe_results = run_parallel(probe_tasks) if probe_tasks else {}
+
+    # Render by host
+    for host_key, svcs in by_host.items():
+        host = HOSTS[host_key]
+        reachable = host_reachable.get(host_key, False)
+        host_dot = f"{GREEN}●{RESET}" if reachable else f"{RED}●{RESET}"
+        print(f"\n  {host_dot} {WHITE}{host['name']}{RESET} ({host['ip']})")
+        thin_divider()
+
+        # Column widths
+        max_name = max(len(s['name']) for s in svcs)
+        name_w = max(max_name + 2, 20)
+
+        for svc in svcs:
+            task_key = f"{host_key}:{svc['port']}"
+            if not reachable:
+                dot = f"{RED}●{RESET}"
+                status_str = f"{RED}host offline{RESET}"
+            elif task_key in probe_results:
+                up = probe_results[task_key]
+                dot = f"{GREEN}●{RESET}" if up else f"{RED}●{RESET}"
+                status_str = f"{GREEN}running{RESET}" if up else f"{RED}down{RESET}"
+            else:
+                dot = f"{GRAY}●{RESET}"
+                status_str = f"{GRAY}unknown{RESET}"
+
+            name_padded = svc['name'] + ' ' * max(0, name_w - len(svc['name']))
+            cmd_info = f"  {DIM}{svc['start_cmd']}{RESET}" if svc['start_cmd'] else ''
+            print(f"    {dot} {name_padded}:{svc['port']:<6} {status_str}  {GRAY}{svc['project']}{RESET}{cmd_info}")
+
+    # Summary
+    total = sum(len(svcs) for svcs in by_host.values())
+    up_count = sum(1 for v in probe_results.values() if v)
+    print()
+    print(f"  {GRAY}{up_count}/{total} services running across {len(by_host)} host(s){RESET}")
+    header_bar()
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --explain: Full reference
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_explain():
+    """Full reference with live system status."""
+    import json
+    now = datetime.now().strftime('%a %d %b %H:%M')
+
+    # Probe hosts in parallel (dynamic)
+    remote_hosts = [k for k in HOSTS if k != LOCAL_HOST]
+    host_reachable = run_parallel({
+        k: (lambda h=k: check_host_reachable(h)) for k in remote_hosts
+    })
+
+    probe_tasks = {LOCAL_HOST: lambda: probe_nano_health()}
+    for k in remote_hosts:
+        probe_tasks[k] = (lambda h=k: probe_remote_host(h, host_reachable.get(h, False)))
+    results = run_parallel(probe_tasks)
+
+    as_running, as_pid = get_autosummary_status()
+    research_last, _ = get_research_last_fetch()
+    cache_ages, _ = get_cache_ages()
+
+    print()
+    header_bar()
+    hub_name = HUB_CONFIG['hub'].get('name', 'Dev Hub').upper()
+    print_right(f"{BRIGHT_GREEN}  {hub_name}{RESET}", f"{BRIGHT_GREEN}{now}{RESET}")
+    print(f"  {DIM}Always-on orchestration hub for {len(PROJECT_ORDER)} projects across {len(HOSTS)} machines{RESET}")
+    header_bar()
+
+    # ── SECTION 1: SYSTEM MAP ──
+    print()
+    print(f"  {WHITE}SYSTEM MAP{RESET}")
+    divider()
+
+    # Per-host descriptions (auto-generated from roles and project counts)
+    _host_desc = {}
+    for hk in HOSTS:
+        roles = HOSTS[hk].get('roles', [])
+        proj_count = sum(1 for pk in PROJECT_ORDER if PROJECTS[pk]['host'] == hk)
+        parts = []
+        if 'local' in roles:
+            parts.append('hub — orchestration, caching')
+        if 'ollama' in roles:
+            parts.append('Ollama')
+        if 'code_assistant' in roles:
+            parts.append('Code Assistant')
+        if proj_count:
+            parts.append(f'{proj_count} project{"s" if proj_count != 1 else ""}')
+        _host_desc[hk] = ' | '.join(parts) if parts else ''
+    _host_offline = {
+        hk: (YELLOW, 'SUSPENDED') for hk in HOSTS if 'wakeable' in HOSTS[hk].get('roles', [])
+    }
+    _default_offline = (RED, 'OFFLINE')
+
+    # Local host first, then remotes in config order
+    _host_order = [LOCAL_HOST] + [k for k in HOSTS if k != LOCAL_HOST]
+    for hk in _host_order:
+        host_info = HOSTS[hk]
+        h_name = host_info['name']
+        h_ip = host_info['ip']
+        h_desc = _host_desc.get(hk, '')
+        probe = results.get(hk, {})
+
+        # Pad name+IP for alignment: name left-padded to 6, IP right-padded to 16
+        name_pad = f"{h_name:<6s}"
+        ip_pad = f"{h_ip:<16s}"
+
+        # Build detail parts (uptime, RAM, extras)
+        parts = []
+        if probe.get('uptime'):
+            parts.append(probe['uptime'])
+        if probe.get('ram_used'):
+            parts.append(f"{probe['ram_used']}M/{probe['ram_total']}M RAM")
+        if probe.get('ollama'):
+            parts.append(f"Ollama: {probe['ollama']}")
+
+        is_local = (hk == LOCAL_HOST)
+        is_online = is_local or probe.get('online', False)
+
+        if is_online:
+            print(f"  {GREEN}●{RESET} {WHITE}{name_pad}{RESET}{ip_pad}{h_desc}")
+            if parts:
+                print(f"    {GRAY}{' | '.join(parts)}{RESET}")
+        else:
+            off_color, off_label = _host_offline.get(hk, _default_offline)
+            print(f"  {off_color}●{RESET} {WHITE}{name_pad}{RESET}{ip_pad}{h_desc.split(' — ')[0]} — {off_color}{off_label}{RESET}")
+
+    # ── SECTION 2: TOOLS ──
+    print()
+    print(f"  {WHITE}TOOLS{RESET}")
+    divider()
+
+    # ── Session Flow ──
+    print(f"  {CYAN}Session Flow{RESET}")
+    print(f"  {GRAY}Start a dev session with context. prepare gathers intelligence, begin{RESET}")
+    print(f"  {GRAY}injects it as a preamble into Claude Code so it knows where you left off.{RESET}")
+    print()
+    print(f"    {WHITE}work <project>{RESET}       full flow in one command: prepare → overview → begin")
+    print(f"      {GRAY}The recommended way to start. Runs all steps with a 5s countdown{RESET}")
+    print(f"      {GRAY}between overview and begin. Ctrl+C at countdown to stop early.{RESET}")
+    print(f"      {WHITE}--oi{RESET}  launch Open Interpreter instead of Claude Code")
+    print()
+    print(f"    {WHITE}prepare <project>{RESET}    get everything ready before a session")
+    print(f"      {GRAY}1. Wake host (sends WoL to WS if suspended, waits for SSH){RESET}")
+    print(f"      {GRAY}2. Warm Ollama on AGX (loads model into GPU memory){RESET}")
+    print(f"      {GRAY}3. Start services from registry if not running{RESET}")
+    print(f"      {GRAY}4. Close previous session → journal (duration, git stats){RESET}")
+    print(f"      {GRAY}5. Refresh overview cache via Ollama (CLAUDE.md + transcript + git){RESET}")
+    print(f"      {GRAY}6. Diff old/new cache → journal (phase changes, blocker updates){RESET}")
+    print(f"      {GRAY}7. Extract design decisions from transcript → decision log{RESET}")
+    print(f"      {GRAY}8. Refresh code pulse (graph stats + focus-area search){RESET}")
+    print()
+    print(f"    {WHITE}begin <project>{RESET}      build preamble and launch Claude Code on the remote host")
+    print(f"      {GRAY}Preamble includes: phase, focus, blockers, breakthroughs, trajectory,{RESET}")
+    print(f"      {GRAY}persistent blockers, research, code pulse, notes, recent commits,{RESET}")
+    print(f"      {GRAY}key decisions, and today's work on other projects.{RESET}")
+    print(f"      {WHITE}--continue{RESET}  resume last session  |  {WHITE}--dry-run{RESET}  print preamble only")
+    print(f"      {WHITE}--oi{RESET}  launch OI with compressed preamble + project mode (~/edit for files)")
+
+    # ── Awareness ──
+    print()
+    print(f"  {CYAN}Awareness{RESET}")
+    print(f"  {GRAY}Tools for understanding project state without opening the codebase.{RESET}")
+    print()
+    print(f"    {WHITE}overview{RESET}             compact summary of all projects (phase, status, focus)")
+    print(f"    {WHITE}overview <project>{RESET}   deep view: architecture, metrics, blockers, services,")
+    print(f"      {GRAY}recent activity, connections, research context, decisions, entry points{RESET}")
+    print(f"      {WHITE}--refresh{RESET}  force re-analysis  |  {WHITE}--raw{RESET}  show LLM JSON  |  {WHITE}--watch{RESET}  auto-refresh")
+    print(f"    {GRAY}Every cache refresh saves a snapshot to ~/.cache/overview/history/{RESET}")
+    print(f"    {GRAY}for tracking how projects evolve over time.{RESET}")
+    print()
+    print(f"    {WHITE}timeline{RESET}             today's session events across all projects")
+    print(f"    {WHITE}timeline <project>{RESET}   filter to one project")
+    print(f"      {WHITE}--trajectory <project>{RESET}  session-by-session evolution with git stats")
+    print()
+    print(f"    {WHITE}note <project> \"msg\"{RESET}  quick timestamped note (stored locally, works offline)")
+    print(f"      {GRAY}Also written to timeline journal. Shown in begin preamble.{RESET}")
+    print()
+    print(f"    {WHITE}decide <project> \"msg\"{RESET}  manually log a design decision")
+    print(f"    {WHITE}decide <project>{RESET}          view recent decisions for a project")
+    print(f"    {WHITE}decide{RESET}                    view all decisions across projects")
+    print(f"      {WHITE}-c <category>{RESET}  specify category: architecture, tooling, design, performance, abandoned")
+    print(f"      {GRAY}Decisions are also auto-extracted from transcripts during prepare.{RESET}")
+    print(f"      {GRAY}Shown in begin preamble and overview deep view with color-coded categories.{RESET}")
+    print()
+    print(f"    {WHITE}research{RESET}             digest of relevant arxiv papers + GitHub releases")
+    print(f"    {WHITE}research <project>{RESET}   papers scored for one project (with reasons)")
+    print(f"      {WHITE}--fetch{RESET}  run fetch cycle (also runs via cron every 6h)")
+    print(f"      {GRAY}Feeds into overview LLM prompt and begin preamble as research context.{RESET}")
+    print()
+    print(f"    {WHITE}edit <file> --show{RESET}   view file with line numbers (local or remote)")
+    print(f"    {WHITE}edit <file> --find \"X\" --replace \"Y\"{RESET}  safe search-and-replace")
+    print(f"    {WHITE}edit <file> --after \"anchor\" --insert \"line\"{RESET}  insert after anchor")
+    print(f"    {WHITE}edit <file> --patch /tmp/edit.json{RESET}  JSON-based batch edit")
+    print(f"      {GRAY}Remote files: edit agx:~/projects/speech/main.py --show{RESET}")
+    print(f"      {GRAY}Safety: uniqueness validation, atomic writes, .bak on first edit, colored diff{RESET}")
+    print(f"      {GRAY}Used by OI in project mode (work --oi) for structured remote file editing.{RESET}")
+
+    # ── Code Intelligence ──
+    print()
+    print(f"  {CYAN}Code Intelligence{RESET}")
+    print(f"  {GRAY}Semantic search and dependency analysis across indexed codebases.{RESET}")
+    print(f"  {GRAY}Code Assistant runs on {_CA_LABEL}, accessed via HTTP from {HOSTS[LOCAL_HOST]['name']}.{RESET}")
+    print()
+    ca_host_e = HUB_CONFIG['code_assistant']['host']
+    ca_reachable_e = host_reachable.get(ca_host_e, True) if ca_host_e != LOCAL_HOST else True
+    ca_up = check_code_assistant() if ca_reachable_e else False
+    ca_status = f"{GREEN}●{RESET} online" if ca_up else f"{GRAY}● offline{RESET}"
+
+    # Fetch live CA data for enriched display
+    ca_projects_data = []
+    ca_watcher = None
+    ca_stats = None
+    if ca_up:
+        ca_result = code_assistant_get('projects', timeout=3)
+        if ca_result and 'projects' in ca_result:
+            ca_projects_data = ca_result['projects']
+        ca_watcher = code_assistant_get('watcher/status', timeout=3)
+        ca_stats = code_assistant_get('stats', timeout=3)
+
+    print(f"    {ca_status}  Code Assistant on {_CA_LABEL}")
+    if ca_projects_data:
+        total_files = sum(p.get('code_count', 0) + p.get('doc_count', 0) for p in ca_projects_data)
+        total_deps = ca_stats.get('total_dependencies', 0) if ca_stats else 0
+        db_mb = ca_stats.get('database_size_mb', 0) if ca_stats else 0
+        print(f"    {GRAY}{len(ca_projects_data)} indexed projects, {total_files} files, {total_deps} deps, {db_mb:.0f}MB DB{RESET}")
+        for p in ca_projects_data:
+            n = p.get('code_count', 0) + p.get('doc_count', 0)
+            hub_keys = [k for k, v in CODE_ASSISTANT_PROJECTS.items() if v == p['name']]
+            hub_label = f" (hub: {hub_keys[0]})" if hub_keys else ''
+            print(f"    {GRAY}  {p['name']:<14s} {n:>5d} files ({p.get('code_count',0)} code, {p.get('doc_count',0)} docs){hub_label}{RESET}")
+        if ca_watcher:
+            if ca_watcher.get('running'):
+                watched = list(ca_watcher.get('projects', {}).keys())
+                print(f"    {GREEN}●{RESET} {GRAY}file watcher running ({', '.join(watched)}){RESET}")
+            else:
+                print(f"    {YELLOW}●{RESET} {GRAY}file watcher stopped{RESET}")
+    print()
+    print(f"    {WHITE}Querying{RESET}")
+    print(f"      {WHITE}code{RESET}                     list indexed projects")
+    print(f"      {WHITE}code search <proj> \"q\"{RESET}    find files by meaning, not just text match")
+    print(f"      {WHITE}code ask <proj> \"q\"{RESET}      RAG answer grounded in actual code")
+    print(f"      {WHITE}code impact <proj> \"file\"{RESET}  show what depends on a file (upstream + downstream)")
+    print(f"      {WHITE}code graph <proj>{RESET}         dependency graph statistics")
+    print()
+    print(f"    {WHITE}Index Management{RESET}")
+    print(f"      {WHITE}code scan <host>{RESET}      discover projects on a host, select, and index them")
+    print(f"      {WHITE}code reindex <proj>{RESET}   trigger incremental reindex after code changes")
+    print(f"      {WHITE}code manage{RESET}           interactive dashboard (reindex, sync, watcher toggle)")
+    print(f"      {GRAY}WS projects are rsynced to AGX before indexing (requires AGX→WS SSH){RESET}")
+    print(f"      {GRAY}Code pulse (graph stats + focus-area hits) refreshed during prepare,{RESET}")
+    print(f"      {GRAY}injected into begin preamble so Claude knows the codebase shape.{RESET}")
+
+    # ── Project Management ──
+    print()
+    print(f"  {CYAN}Project Management{RESET}")
+    print(f"    {WHITE}hub --manage{RESET}             edit, delete, or reorder existing project entries")
+    print(f"      {GRAY}Interactive editor: change name/path/host/index/remote, rename keys,{RESET}")
+    print(f"      {GRAY}delete entries, reorder. Validates hosts and paths, saves to projects.json.{RESET}")
+    print(f"    {WHITE}hub --scan <host>{RESET}        discover new projects on AGX or WS")
+    print(f"      {GRAY}SSH scans ~/projects/*, detects git/CLAUDE.md, extracts taglines.{RESET}")
+    print(f"      {GRAY}Interactive: pick which to add, edit key/name, confirm → projects.json.{RESET}")
+    print(f"      {GRAY}Ignored dirs are hidden from candidates (shown dimmed at bottom).{RESET}")
+    print(f"    {WHITE}hub --scan --ignore <host>{RESET}  manage which dirs to ignore")
+    print(f"      {GRAY}Shows ignored + unregistered dirs. Add/remove from ignore list interactively.{RESET}")
+    print(f"      {GRAY}All hub tools read from ~/.config/hub/projects.json automatically.{RESET}")
+
+    # ── Git Management ──
+    print()
+    print(f"  {CYAN}Git Management{RESET}")
+    print(f"  {GRAY}Manage git across all projects from one place. All commands run via SSH{RESET}")
+    print(f"  {GRAY}on the project's host. GitHub repos created via WS (only host with gh).{RESET}")
+    print()
+    print(f"    {WHITE}repo{RESET}                     unified dashboard — branch, dirty files, remote, warnings")
+    print(f"      {GRAY}Shows stale indicator when deployed HEAD differs from current HEAD.{RESET}")
+    print(f"    {WHITE}repo status <proj>{RESET}       detailed status: branch, remote, user config, working tree")
+    print(f"    {WHITE}repo log <proj>{RESET}          recent commit history")
+    print()
+    print(f"    {GRAY}New project from scratch:{RESET}")
+    print(f"    {WHITE}repo init <proj>{RESET}         git init + auto-detect languages + .gitignore + first commit")
+    print(f"    {WHITE}repo create <proj>{RESET}       create private GitHub repo via WS gh CLI, configure remote, push")
+    print()
+    print(f"    {GRAY}Daily workflow:{RESET}")
+    print(f"    {WHITE}repo commit <proj> \"msg\"{RESET}  stage all changes + commit")
+    print(f"    {WHITE}repo push <proj>{RESET}         push to remote  |  {WHITE}repo pull <proj>{RESET}  pull from remote")
+    print(f"    {WHITE}repo checkpoint [\"msg\"]{RESET}  batch commit+push all dirty projects with remotes")
+    print(f"      {WHITE}--yes{RESET}  skip confirmation")
+    print()
+    print(f"    {GRAY}Deploy (projects with services):{RESET}")
+    print(f"    {WHITE}repo deploy <proj>{RESET}       commit if dirty → push if ahead → restart all services")
+    print(f"      {GRAY}→ stop each service (Ctrl+C tmux window) → start fresh → health check{RESET}")
+    print(f"      {GRAY}→ record deployed HEAD. Dashboard shows stale when HEAD moves past it.{RESET}")
+    print()
+    print(f"    {WHITE}repo fix <proj>{RESET}          audit + interactive repair: PAT tokens, user.name/email, .gitignore")
+    print()
+    print(f"    {GRAY}Pre-flight safety (automatic before commit/push/deploy/checkpoint):{RESET}")
+    print(f"      {GRAY}• index.lock — detects stale lock files from crashed git operations, offers removal{RESET}")
+    print(f"      {GRAY}• large files — scans for >95MB files (GitHub rejects >100MB), offers .gitignore{RESET}")
+    print(f"      {GRAY}• PAT tokens — detects exposed tokens in remote URL before push, offers fix{RESET}")
+    print(f"      {GRAY}• stderr capture — shows actual git error messages instead of generic failures{RESET}")
+
+    # ── Terminal ──
+    print()
+    print(f"  {CYAN}Terminal{RESET}")
+    print(f"    {WHITE}assist{RESET}               Open Interpreter — local AI assistant via AGX Ollama")
+    print(f"      {GRAY}Model: qwen3:14b-instruct (~14 tok/s). Read-auto/write-confirm.{RESET}")
+    print(f"      {GRAY}Good at: file inspection, system admin, running commands. Not a strategist.{RESET}")
+    print(f"      {GRAY}%reset  clear history  |  %undo  remove last exchange{RESET}")
+    print()
+    print(f"    {GRAY}tmux vi copy:   prefix+[  →  hjkl navigate  →  v select  →  y yank to clipboard{RESET}")
+    print(f"    {GRAY}tmux panes:     >/<  swap   |  b  break to window  |  j  join  |  S  sync toggle{RESET}")
+    print(f"    {GRAY}tmux resurrect: Ctrl-b Ctrl-s save  |  Ctrl-b Ctrl-r restore{RESET}")
+    print(f"    {GRAY}XFCE:           AltGr+B toggle panels  |  F1-F4 workspaces  |  Alt+F1-F6 windows{RESET}")
+
+    # ── Maintenance ──
+    print()
+    print(f"  {CYAN}Maintenance{RESET}")
+    print(f"    {WHITE}backup{RESET}               rsync entire hub ecosystem to {BACKUP_DEST}")
+    print(f"      {GRAY}Hub tools, config, SSH keys, OI patches, XFCE/display, VNC, completions,{RESET}")
+    print(f"      {GRAY}timeline journals, Claude Code memory, Desktop docs (~800KB, <1s).{RESET}")
+    print(f"      {WHITE}--list{RESET}  full manifest with sizes  |  {WHITE}--dry-run{RESET}  preview transfer")
+    print(f"      {GRAY}System files (EDID, xorg, lightdm, rustdesk) printed as sudo commands.{RESET}")
+
+    # ── Background ──
+    print()
+    print(f"  {CYAN}Background Services{RESET}")
+    if as_running:
+        print(f"    {GREEN}●{RESET} {WHITE}autosummary{RESET}      running (PID {as_pid})  |  {WHITE}autosummary --status{RESET}")
+    else:
+        print(f"    {GRAY}●{RESET} {WHITE}autosummary{RESET}      {GRAY}not running (optional — prepare/begin handle journal){RESET}")
+    print(f"      {GRAY}Polls transcript mtime every 60s. ~10min idle → session end → journal + cache refresh.{RESET}")
+    print(f"    {GREEN}●{RESET} {WHITE}research cron{RESET}     last fetch: {research_last}")
+    print(f"      {GRAY}Runs every 6h: fetches arxiv + GitHub releases, scores via Ollama.{RESET}")
+    if ca_up:
+        ca_proj_count = len(ca_projects_data) if ca_projects_data else len(CODE_ASSISTANT_PROJECTS)
+        print(f"    {GREEN}●{RESET} {WHITE}code assistant{RESET}    {_CA_LABEL} ({ca_proj_count} indexed projects)")
+    else:
+        print(f"    {GRAY}●{RESET} {WHITE}code assistant{RESET}    {GRAY}offline{RESET}")
+    print(f"      {GRAY}Semantic graph DB on AGX. Queried by code tool (HTTP) and code pulse (prepare).{RESET}")
+
+    # ── SECTION 3: PROJECTS ──
+    # Build set of code-indexed project keys
+    ca_indexed_keys = set()
+    if ca_projects_data:
+        ca_names = {p['name'] for p in ca_projects_data}
+        for hk, ck in CODE_ASSISTANT_PROJECTS.items():
+            if ck in ca_names:
+                ca_indexed_keys.add(hk)
+
+    print()
+    print(f"  {WHITE}PROJECTS{RESET}")
+    divider()
+    print(f"  {GRAY}{'Key':<14s}{'Name':<24s}{'Host':<6s}{'Cache':>6s}  {'Code':>4s}{RESET}")
+    print(f"  {GRAY}{'─' * 56}{RESET}")
+
+    for pk in PROJECT_ORDER:
+        proj = PROJECTS[pk]
+        host_name = HOSTS[proj['host']]['name'][:4]
+        age = cache_ages.get(pk, '--')
+        age_color_str = GREEN if age not in ('--', '?') and not age.endswith('d') else YELLOW if age.endswith('d') else GRAY
+        code_idx = f"{GREEN}●{RESET}" if pk in ca_indexed_keys else f"{GRAY}·{RESET}"
+        print(f"  {WHITE}{pk:<14s}{RESET}{proj['name']:<24s}{host_name:<6s}{age_color_str}{age:>6s}{RESET}  {code_idx}")
+
+    print(f"  {GRAY}Use project keys as arguments: overview speech, begin prometheus, etc.{RESET}")
+    if ca_indexed_keys:
+        not_indexed = [pk for pk in PROJECT_ORDER if pk not in ca_indexed_keys]
+        if not_indexed:
+            print(f"  {GRAY}Code column: {GREEN}●{RESET}{GRAY} indexed in Code Assistant  {GRAY}· not indexed — use {WHITE}code scan{GRAY} to add{RESET}")
+
+    # ── SECTION 4: QUICK REFERENCE ──
+    print()
+    print(f"  {WHITE}QUICK REFERENCE{RESET}")
+    divider()
+    print(f"  {CYAN}SSH{RESET}     {WHITE}agx{RESET} → tmux on AGX   {WHITE}ws{RESET} → tmux on WS   {WHITE}wake-ws{RESET} → WoL")
+    print(f"  {CYAN}tmux{RESET}    {WHITE}ta hub{RESET} → attach   {WHITE}tl{RESET} → list   {WHITE}tn <name>{RESET} → new session")
+    print(f"  {CYAN}init{RESET}    {WHITE}~/init-hub.sh{RESET} → create hub tmux session with all windows")
+    print(f"  {CYAN}XFCE{RESET}    {WHITE}AltGr+B{RESET} → toggle panels   {GRAY}right-edge bar, autohide, fullscreen windows{RESET}")
+
+    # ── SECTION 5: ARCHITECTURE ──
+    print()
+    print(f"  {WHITE}ARCHITECTURE{RESET}")
+    divider()
+    print(f"  The hub is an always-on Jetson Orin Nano that orchestrates development")
+    print(f"  sessions across an AGX (GPU compute, Ollama LLM), a Workstation")
+    print(f"  (full-stack dev), and a VPS (tunnels, API proxy). Tools share state")
+    print(f"  via hub_common.py and cached JSON.")
+    print()
+    print(f"  {DIM}  ┌─────────┐      SSH       ┌─────────┐{RESET}")
+    print(f"  {DIM}  │{RESET} {WHITE}Nano{RESET}    {DIM}│──────────────▶│{RESET} {WHITE}AGX{RESET}     {DIM}│  Ollama, GPU, projects{RESET}")
+    print(f"  {DIM}  │{RESET} hub     {DIM}│      SSH       │{RESET}         {DIM}│  Code Assistant :{_CA_PORT}{RESET}")
+    print(f"  {DIM}  │{RESET} tools   {DIM}│──────────────▶│{RESET} {WHITE}WS{RESET}      {DIM}│  Full-stack dev, projects{RESET}")
+    print(f"  {DIM}  │{RESET} cache   {DIM}│      SSH       │{RESET}         {DIM}│{RESET}")
+    print(f"  {DIM}  │{RESET}         {DIM}│──────────────▶│{RESET} {WHITE}VPS{RESET}     {DIM}│  Tunnels, API proxy{RESET}")
+    print(f"  {DIM}  │{RESET}         {DIM}│      HTTP      │{RESET}         {DIM}│  WireGuard endpoint{RESET}")
+    print(f"  {DIM}  └─────────┘──────▶ {_CA_LABEL} │{RESET}  {DIM}rsync  {DIM}│{RESET}")
+    print(f"  {DIM}                   (code API)  └────◀────┘{RESET}")
+    print(f"  {GRAY}                               AGX pulls from WS for code indexing{RESET}")
+    print()
+    print(f"  {DIM}  Session:   prepare ──▶ cache + decisions + code pulse ──▶ journal{RESET}")
+    print(f"  {DIM}            begin   ──▶ preamble (focus, blockers, decisions, cross-project){RESET}")
+    print(f"  {DIM}                    ──▶ Claude Code on remote host{RESET}")
+    print(f"  {DIM}  Code:     code search/ask/impact/graph ──▶ Code Assistant (HTTP){RESET}")
+    print(f"  {DIM}            code scan/reindex/manage ──▶ index lifecycle{RESET}")
+    print(f"  {DIM}  Cache:    overview ──▶ begin    research ──▶ overview + begin{RESET}")
+    print(f"  {DIM}            overview history ──▶ tracks project evolution over time{RESET}")
+    print(f"  {DIM}  Git:      repo ──▶ SSH batch probe ──▶ dashboard (stale detection){RESET}")
+    print(f"  {DIM}            repo init ──▶ repo create (WS gh) ──▶ repo deploy{RESET}")
+
+    # ── SECTION 6: CONTEXTUAL GUIDANCE ──
+    print()
+    print(f"  {WHITE}CONTEXTUAL GUIDANCE{RESET}")
+    divider()
+    print(f"  {GRAY}hub --status shows inline hints and hub --next shows prioritized actions.{RESET}")
+    print(f"  {GRAY}This section explains what each suggestion means and why it matters.{RESET}")
+
+    print()
+    print(f"  {CYAN}Hosts{RESET}")
+    print(f"    {WHITE}AGX offline{RESET}")
+    print(f"      {GRAY}The AGX is the GPU compute node running Ollama and Code Assistant.{RESET}")
+    print(f"      {GRAY}When offline, LLM analysis, code search, and 3 AGX projects are unavailable.{RESET}")
+    print(f"    {WHITE}WS suspended{RESET}")
+    print(f"      {GRAY}The Workstation auto-suspends after inactivity. prepare auto-wakes it.{RESET}")
+    print(f"      {GRAY}3 WS projects unreachable until woken. Run wake-workstation.sh or prepare.{RESET}")
+    print(f"    {WHITE}VPS offline{RESET}")
+    print(f"      {GRAY}WireGuard VPN endpoint and reverse SSH tunnels. Remote access unavailable.{RESET}")
+
+    print()
+    print(f"  {CYAN}Git{RESET}")
+    print(f"    {WHITE}Uncommitted changes (dirty){RESET}")
+    print(f"      {GRAY}Files modified but not committed. Risk of data loss if disk fails.{RESET}")
+    print(f"      {GRAY}Fix: repo commit <project> \"msg\" or repo checkpoint for all projects.{RESET}")
+    print(f"    {WHITE}Unpushed commits (ahead){RESET}")
+    print(f"      {GRAY}Commits exist only on the local machine, not on GitHub.{RESET}")
+    print(f"      {GRAY}Fix: repo push <project> or repo checkpoint for all projects.{RESET}")
+    print(f"    {WHITE}Deploy stale{RESET}")
+    print(f"      {GRAY}Running services use old code — deployed HEAD differs from current HEAD.{RESET}")
+    print(f"      {GRAY}Fix: repo deploy <project> to commit, push, and restart services.{RESET}")
+    print(f"    {WHITE}PAT token exposed{RESET}")
+    print(f"      {GRAY}A Personal Access Token is visible in the git remote URL (security risk).{RESET}")
+    print(f"      {GRAY}Fix: repo fix <project> to switch to SSH-based authentication.{RESET}")
+    print(f"    {WHITE}No remote / no git repo{RESET}")
+    print(f"      {GRAY}Project has no off-machine backup. One disk failure = lost work.{RESET}")
+    print(f"      {GRAY}Fix: repo init <project> then repo create <project> for GitHub remote.{RESET}")
+    print(f"    {WHITE}Stale index.lock{RESET}")
+    print(f"      {GRAY}A previous git operation crashed or was killed, leaving a lock file.{RESET}")
+    print(f"      {GRAY}Blocks all git operations. Auto-detected by commit/deploy/checkpoint.{RESET}")
+    print(f"    {WHITE}Large files (>95MB){RESET}")
+    print(f"      {GRAY}GitHub rejects pushes containing files >100MB. Caught before staging.{RESET}")
+    print(f"      {GRAY}Auto-detected by commit/init/deploy/checkpoint. Offers .gitignore fix.{RESET}")
+
+    print()
+    print(f"  {CYAN}Background Services{RESET}")
+    print(f"    {WHITE}autosummary not running{RESET}")
+    print(f"      {GRAY}Polls transcript mtime every 60s. After ~10min idle: writes journal entry{RESET}")
+    print(f"      {GRAY}and refreshes overview cache. Optional since prepare/begin handle the{RESET}")
+    print(f"      {GRAY}same work, but keeps caches fresh between sessions. Start in a tmux window.{RESET}")
+    print(f"      {GRAY}Configurable: autosummary --idle 15 for 15-minute threshold.{RESET}")
+    print(f"    {WHITE}Research data stale{RESET}")
+    print(f"      {GRAY}Cron runs every 6h, fetching arxiv papers + GitHub releases.{RESET}")
+    print(f"      {GRAY}Papers feed into overview analysis and begin preambles as research context.{RESET}")
+    print(f"    {WHITE}Code Assistant offline / watcher stopped{RESET}")
+    print(f"      {GRAY}Semantic code search + dependency graphs + RAG on {_CA_LABEL}.{RESET}")
+    print(f"      {GRAY}Run code manage for the interactive dashboard to check and restart.{RESET}")
+
+    print()
+    print(f"  {CYAN}Caches{RESET}")
+    print(f"    {WHITE}Overview cache stale or missing{RESET}")
+    print(f"      {GRAY}Built by Ollama analysis of CLAUDE.md + transcript + git state.{RESET}")
+    print(f"      {GRAY}Read by begin preamble and overview tool. Stale = Claude Code starts{RESET}")
+    print(f"      {GRAY}with outdated context. Fix: overview --refresh or work <project>.{RESET}")
+    print(f"    {WHITE}Backup not recent{RESET}")
+    print(f"      {GRAY}Rsyncs entire hub ecosystem to AGX (~800KB, <1s). Protects against{RESET}")
+    print(f"      {GRAY}Nano disk failure — all tools, config, memory, and completions backed up.{RESET}")
+
+    print()
+    header_bar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --scan: Interactive project discovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prompt(msg, default=''):
+    """Prompt for input with a default. Returns default on empty/EOF/Ctrl-C."""
+    try:
+        val = input(msg).strip()
+        return val if val else default
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+
+
+def _discover_services_on_host(host_alias):
+    """Discover all listening TCP ports and their process info via SSH.
+
+    Returns list of dicts: {port, pid, cmd, cwd}
+    """
+    # Step 1: Get ss output and extract port+pid pairs
+    ok, raw = ssh_cmd(host_alias, 'ss -tlnp 2>/dev/null', timeout=10)
+    if not ok or not raw.strip():
+        return []
+
+    # Parse ss output locally (avoids shell quoting issues)
+    port_pids = []
+    for line in raw.strip().split('\n'):
+        if 'LISTEN' not in line:
+            continue
+        # Extract port from local address (4th column, after last colon)
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        addr = parts[3]
+        port_str = addr.rsplit(':', 1)[-1]
+        try:
+            port = int(port_str)
+        except ValueError:
+            continue
+        # Skip low/system ports
+        if port < 1024:
+            continue
+        # Extract pid from "pid=NNN"
+        pid_match = re.search(r'pid=(\d+)', line)
+        if not pid_match:
+            continue
+        port_pids.append((port, pid_match.group(1)))
+
+    if not port_pids:
+        return []
+
+    # Step 2: For each pid, get cmd and cwd (batch SSH call)
+    pid_set = set(pid for _, pid in port_pids)
+    info_parts = []
+    for pid in pid_set:
+        info_parts.append(
+            f'echo "{pid}|$(readlink /proc/{pid}/cwd 2>/dev/null)|$(cat /proc/{pid}/cmdline 2>/dev/null | tr "\\0" " " | head -c 200)"'
+        )
+    info_cmd = '; '.join(info_parts)
+    ok2, info_raw = ssh_cmd(host_alias, info_cmd, timeout=10)
+
+    pid_info = {}
+    if ok2 and info_raw.strip():
+        for line in info_raw.strip().split('\n'):
+            parts = line.split('|', 2)
+            if len(parts) >= 3:
+                pid_info[parts[0]] = {'cwd': parts[1], 'cmd': parts[2].strip()}
+
+    # Build service list
+    services = []
+    seen_ports = set()
+    for port, pid in port_pids:
+        if port in seen_ports:
+            continue
+        seen_ports.add(port)
+        info = pid_info.get(pid, {})
+        services.append({
+            'port': port,
+            'pid': pid,
+            'cwd': info.get('cwd', ''),
+            'cmd': info.get('cmd', ''),
+        })
+    return services
+
+
+def _match_services_to_project(all_services, project_path_expanded, registered_ports):
+    """Filter discovered services to those running from a project's directory.
+
+    Returns list of service dicts not already registered.
+    """
+    candidates = []
+    for svc in all_services:
+        if not svc['cwd']:
+            continue
+        # Match if process cwd starts with the project path
+        if svc['cwd'].startswith(project_path_expanded) and svc['port'] not in registered_ports:
+            candidates.append(svc)
+    return candidates
+
+
+def _interactive_service_curation(host_alias, project_path, all_host_services, existing_services):
+    """Show discovered services for a project, let user pick which to register.
+
+    Returns list of new service dicts to add (with name, port, start_cmd, dir).
+    """
+    # Expand ~ in project path for matching
+    ok, expanded = ssh_cmd(host_alias, f'echo {project_path}', timeout=5)
+    expanded_path = expanded.strip() if ok and expanded.strip() else project_path
+
+    registered_ports = {s['port'] for s in existing_services}
+    candidates = _match_services_to_project(all_host_services, expanded_path, registered_ports)
+
+    if not candidates:
+        return []
+
+    # Tag each with selection state
+    for svc in candidates:
+        svc['_selected'] = False
+
+    def _svc_render(item, idx, highlighted):
+        sel = f"{GREEN}[+]{RESET}" if item['_selected'] else f"{GRAY}[ ]{RESET}"
+        cmd_short = item['cmd'][:60]
+        if highlighted:
+            return f"    {sel} {HIGHLIGHT_BG}:{item['port']}  {cmd_short}{HIGHLIGHT_OFF}"
+        return f"    {sel} :{item['port']}  {DIM}{cmd_short}{RESET}"
+
+    print()
+    saved = interactive_toggle(
+        candidates, _svc_render,
+        get_state=lambda item: item['_selected'],
+        set_state=lambda item, v: item.__setitem__('_selected', v),
+        title=f"    {WHITE}Discovered services{RESET}  {GRAY}— space=select  enter=confirm  q=skip{RESET}",
+    )
+
+    if not saved:
+        return []
+
+    chosen = [svc for svc in candidates if svc['_selected']]
+    if not chosen:
+        return []
+
+    new_services = []
+    for svc in chosen:
+        # Guess a name from the command
+        cmd = svc['cmd']
+        default_name = ''
+        if 'python' in cmd:
+            parts = cmd.split()
+            for p in parts:
+                if p.endswith('.py'):
+                    default_name = p.rsplit('/', 1)[-1].replace('.py', '').replace('_', ' ').title()
+                    break
+        elif 'node' in cmd:
+            parts = cmd.split()
+            for p in parts:
+                if p.endswith('.js'):
+                    default_name = p.rsplit('/', 1)[-1].replace('.js', '').replace('-', ' ').title()
+                    break
+        if not default_name:
+            default_name = f"Service :{svc['port']}"
+
+        # Guess start_cmd from the running command
+        default_start = cmd.strip()
+        default_start = re.sub(r'^/usr/bin/(python3|node)\s+', r'\1 ', default_start)
+        default_start = re.sub(r'^/usr/local/bin/(python3|node)\s+', r'\1 ', default_start)
+        if ok and expanded.strip():
+            default_start = default_start.replace(expanded.strip() + '/', '')
+
+        name = _prompt(f"      name      [{WHITE}{default_name}{RESET}]: ", default_name)
+        start_cmd = _prompt(f"      start_cmd [{WHITE}{default_start}{RESET}]: ", default_start)
+
+        new_services.append({
+            'port': svc['port'],
+            'name': name,
+            'start_cmd': start_cmd,
+            'dir': '.',
+        })
+
+    return new_services
+
+
+def _discover_npm_dev_services(host_alias, project_path):
+    """Discover npm dev services from package.json in project dir + 1-level subdirs.
+
+    Returns list of dev service candidate dicts:
+        {name, port, dev_cmd, dir, subdir}
+    Only returns entries where a port is detectable.
+    """
+    # SCP a small Python script to remote, run it there (avoids shell quoting hell)
+    import tempfile as _tf
+    scanner_script = f'''import json, os, sys
+base = os.path.realpath(os.path.expanduser("{project_path}"))
+parent = os.path.dirname(base)
+seen = set()
+# Collect package.json from: project root, children, siblings
+dirs_to_scan = [base]
+for d in os.listdir(base):
+    p = os.path.join(base, d)
+    if os.path.isdir(p):
+        dirs_to_scan.append(p)
+if os.path.isdir(parent):
+    for d in os.listdir(parent):
+        p = os.path.join(parent, d)
+        if os.path.isdir(p):
+            dirs_to_scan.append(p)
+for d in dirs_to_scan:
+    pj = os.path.join(d, "package.json")
+    rp = os.path.realpath(d)
+    if rp in seen or not os.path.isfile(pj):
+        continue
+    seen.add(rp)
+    try:
+        data = json.load(open(pj))
+    except Exception:
+        continue
+    scripts = data.get("scripts", {{}})
+    reldir = os.path.relpath(rp, base)
+    for name, cmd in scripts.items():
+        print(f"PKG|{{reldir}}|{{name}}|{{cmd}}")
+'''
+    # Write to temp, SCP, run, clean up
+    with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
+        tmp.write(scanner_script)
+        local_path = tmp.name
+    remote_path = f'/tmp/_npm_scan_{uuid.uuid4().hex[:8]}.py'
+    subprocess.run(['scp', '-q', local_path, f'{host_alias}:{remote_path}'],
+                   capture_output=True, timeout=10)
+    os.unlink(local_path)
+    ok, output = ssh_cmd(host_alias, f'python3 {remote_path}; rm -f {remote_path}', timeout=15)
+    if not ok or not output.strip():
+        return []
+
+    import re as _re
+
+    # Auto-detect port from command string (and optionally dir context)
+    def _guess_port(cmd, reldir=''):
+        m = _re.search(r'(?:-p|--port)\s+(\d{4,5})', cmd)
+        if m: return int(m.group(1))
+        m = _re.search(r'PORT=(\d{4,5})', cmd)
+        if m: return int(m.group(1))
+        if 'react-scripts' in cmd: return 3000
+        if 'next' in cmd: return 3000
+        if 'vite' in cmd: return 5173
+        if 'func start' in cmd or 'func ' in cmd: return 7071
+        # Directory-based heuristic: API/functions dirs likely serve on 7071
+        dir_lower = reldir.lower().rstrip('/')
+        if dir_lower in ('api', 'functions', 'azure-functions') and 'func' not in cmd:
+            # Node wrapper in API dir — likely Azure Functions on 7071
+            if cmd.startswith('node ') and ('start' in cmd or 'server' in cmd or 'logging' in cmd):
+                return 7071
+        return None
+
+    candidates = []
+    for line in output.strip().split('\n'):
+        if not line.startswith('PKG|'):
+            continue
+        parts = line.split('|', 3)
+        if len(parts) < 4:
+            continue
+        _, reldir, script_name, script_cmd = parts
+
+        dev_cmd = 'npm start' if script_name == 'start' else f'npm run {script_name}'
+        port = _guess_port(script_cmd, reldir)
+
+        candidates.append({
+            'script_name': script_name,
+            'script_cmd': script_cmd,
+            'dev_cmd': dev_cmd,
+            'port': port,
+            'dir': reldir,
+        })
+
+    return candidates
+
+
+def _interactive_npm_dev_curation(host_alias, project_path, candidates, existing_dev_services):
+    """Interactive toggle menu to pick npm scripts to register as dev services.
+
+    Only shows scripts with a detectable port. Groups by subdir with
+    non-toggleable header rows.
+    Returns list of new dev_service dicts.
+    """
+    # Filter out already-registered and portless scripts
+    existing_keys = {(s.get('dev_cmd', ''), s.get('dir', '.')) for s in existing_dev_services}
+    new_candidates = [c for c in candidates
+                      if (c['dev_cmd'], c['dir']) not in existing_keys and c.get('port')]
+
+    if not new_candidates:
+        return []
+
+    # Build flat item list with group headers
+    menu_items = []
+    current_dir = None
+    for c in new_candidates:
+        if c['dir'] != current_dir:
+            current_dir = c['dir']
+            dir_label = current_dir if current_dir != '.' else 'root'
+            menu_items.append(('header', dir_label, None))
+        c['_selected'] = False
+        menu_items.append(('script', None, c))
+
+    def _npm_render(item, idx, highlighted):
+        kind, label, c = item
+        if kind == 'header':
+            return f"    {GRAY}({label}){RESET}"
+        sel = f"{GREEN}[+]{RESET}" if c['_selected'] else f"{GRAY}[ ]{RESET}"
+        cmd_short = c['script_cmd'][:45]
+        if highlighted:
+            return f"    {sel} {HIGHLIGHT_BG}{c['script_name']:<22} :{c['port']:<6} {cmd_short}{HIGHLIGHT_OFF}"
+        return f"    {sel} {c['script_name']:<22} :{c['port']:<6} {DIM}{cmd_short}{RESET}"
+
+    print()
+    saved = interactive_toggle(
+        menu_items, _npm_render,
+        get_state=lambda item: None if item[0] == 'header' else item[2]['_selected'],
+        set_state=lambda item, v: item[2].__setitem__('_selected', v) if item[0] != 'header' else None,
+        title=f"    {WHITE}npm dev services{RESET}  {GRAY}— space=select  enter=confirm  q=skip{RESET}",
+    )
+
+    if not saved:
+        return []
+
+    chosen = [item[2] for item in menu_items if item[0] == 'script' and item[2]['_selected']]
+    if not chosen:
+        return []
+
+    # For each chosen, prompt for name (port already known)
+    new_devs = []
+    print()
+    for c in chosen:
+        default_name = c['script_name']
+        if c['dir'] != '.':
+            default_name = f"{c['dir']}/{c['script_name']}"
+
+        print(f"    {CYAN}●{RESET} {c['dev_cmd']}  :{c['port']}  {DIM}{c['script_cmd'][:60]}{RESET}")
+        name = _prompt(f"      name [{WHITE}{default_name}{RESET}]: ", default_name)
+
+        new_devs.append({
+            'name': name,
+            'port': c['port'],
+            'dev_cmd': c['dev_cmd'],
+            'dir': c['dir'],
+            'enabled': False,
+        })
+
+    return new_devs
+
+
+def scan_projects(host_key):
+    """Discover new projects on a remote host and interactively add them."""
+    if host_key not in HOSTS:
+        print(f"{RED}Unknown host '{host_key}'. Available: {', '.join(HOSTS.keys())}{RESET}")
+        sys.exit(1)
+
+    host = HOSTS[host_key]
+    host_alias = host['alias']
+    host_name = host['name']
+
+    print()
+    print(f"  {CYAN}Scanning {host_name} ({host['ip']})...{RESET}")
+
+    # Check reachability
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {host_name} is offline{RESET}")
+        sys.exit(1)
+
+    # Single SSH call to discover projects
+    # For each dir in ~/projects/: check git, CLAUDE.md, .py files, and extract title
+    scan_cmd = r'''
+for d in ~/projects/*/; do
+    [ -d "$d" ] || continue
+    dirname=$(basename "$d")
+    git=no; [ -d "$d/.git" ] && git=yes
+    claude_md=none
+    [ -f "$d/CLAUDE.md" ] && claude_md=CLAUDE.md
+    [ -f "$d/claude.md" ] && claude_md=claude.md
+    has_py=no; ls "$d"/*.py "$d"/**/*.py 2>/dev/null | head -1 | grep -q . && has_py=yes
+    title=""
+    if [ "$claude_md" != "none" ]; then
+        title=$(head -5 "$d/$claude_md" 2>/dev/null | grep "^#" | head -1 | sed "s/^#\+\s*//")
+    fi
+    echo "${dirname}|${git}|${claude_md}|${has_py}|${title}"
+done
+'''
+    ok, output = ssh_cmd(host_alias, scan_cmd, timeout=15)
+    if not ok or not output.strip():
+        print(f"\n  {GRAY}No ~/projects/ directory found or empty{RESET}")
+        sys.exit(0)
+
+    # Discover all listening services on this host (one SSH call)
+    all_host_services = _discover_services_on_host(host_alias)
+
+    # Parse results, separate into new candidates and already-registered
+    existing_paths = {}  # dirname_lower → project key
+    for pk, proj in PROJECTS.items():
+        if proj['host'] == host_key:
+            existing_paths[proj['path'].rsplit('/', 1)[-1].lower()] = pk
+
+    host_ignored = set(IGNORED.get(host_key, []))
+    candidates = []
+    registered = []
+    ignored_dirs = []
+    for line in output.strip().split('\n'):
+        parts = line.split('|', 4)
+        if len(parts) < 5:
+            continue
+        dirname, git, claude_md, has_py, title = parts
+
+        entry = {
+            'dirname': dirname,
+            'git': git == 'yes',
+            'claude_md': claude_md if claude_md != 'none' else None,
+            'title': title.strip() if title.strip() else None,
+            'strong': git == 'yes' or claude_md != 'none',  # git or CLAUDE.md = prominent
+        }
+
+        if dirname.lower() in existing_paths:
+            entry['key'] = existing_paths[dirname.lower()]
+            registered.append(entry)
+        elif dirname in host_ignored:
+            ignored_dirs.append(dirname)
+        elif git == 'yes' or claude_md != 'none' or has_py == 'yes':
+            candidates.append(entry)
+
+    if not candidates and not registered:
+        print(f"\n  {GRAY}No ~/projects/ directory found or empty{RESET}")
+        sys.exit(0)
+
+    # Compute column width from all entries (candidates + registered)
+    all_entries = candidates + registered
+    max_dir = max(len(e['dirname']) for e in all_entries) if all_entries else 20
+    dir_width = max(max_dir + 2, 20)
+
+    # Display new candidates
+    if candidates:
+        print(f"\n  {WHITE}New projects found:{RESET}\n")
+        print(f"  {GRAY}{'#':<4}{'Directory':<{dir_width}}{'Git':<6}{'CLAUDE.md':<12}{'Name'}{RESET}")
+        print(f"  {GRAY}{'─' * (dir_width + 40)}{RESET}")
+
+        for i, c in enumerate(candidates, 1):
+            if c['strong']:
+                git_str = f"{GREEN}git{RESET}" if c['git'] else f"{GRAY}-{RESET}"
+                claude_str = f"{GREEN}{c['claude_md']}{RESET}" if c['claude_md'] else f"{GRAY}-{RESET}"
+                name_str = c['title'] or f"{GRAY}{c['dirname']}{RESET}"
+                dirname_padded = c['dirname'] + ' ' * max(0, dir_width - len(c['dirname']))
+                git_padded = git_str + ' ' * max(0, 6 - (3 if c['git'] else 1))
+                claude_vis = c['claude_md'] or '-'
+                claude_padded = claude_str + ' ' * max(0, 12 - len(claude_vis))
+                print(f"  {WHITE}{i:<4}{RESET}{dirname_padded}{git_padded}{claude_padded}{name_str}")
+            else:
+                # Weak candidate (only .py files) — dim the entire row
+                dirname_padded = c['dirname'] + ' ' * max(0, dir_width - len(c['dirname']))
+                print(f"  {DIM}{i:<4}{dirname_padded}-     -           {c['dirname']}{RESET}")
+    else:
+        print(f"\n  {GREEN}✓{RESET} No new projects found on {host_name}")
+
+    # Display already-registered projects (dimmed) + service drift
+    if registered:
+        print(f"\n  {GRAY}Already registered:{RESET}")
+        drift_projects = []
+        for r in registered:
+            pk = r['key']
+            proj = PROJECTS[pk]
+            existing_svcs = proj.get('services', [])
+            registered_ports = {s['port'] for s in existing_svcs}
+            # Expand path for matching
+            ok_exp, expanded = ssh_cmd(host_alias, f'echo {proj["path"]}', timeout=5)
+            expanded_path = expanded.strip() if ok_exp and expanded.strip() else proj['path']
+            new_svcs = _match_services_to_project(all_host_services, expanded_path, registered_ports)
+            svc_info = f"  {GRAY}{len(existing_svcs)} svc{RESET}" if existing_svcs else ''
+            drift_label = f"  {YELLOW}+{len(new_svcs)} unregistered{RESET}" if new_svcs else ''
+            print(f"  {GRAY}  ·  {r['dirname']:<{dir_width}}{RESET}{DIM}→ {pk}{RESET}{svc_info}{drift_label}")
+            if new_svcs:
+                drift_projects.append((pk, proj, new_svcs))
+
+        # Offer to register drifted services
+        if drift_projects:
+            print(f"\n  {YELLOW}Unregistered services found on existing projects:{RESET}")
+            for pk, proj, new_svcs in drift_projects:
+                print(f"    {WHITE}{pk}{RESET}:")
+                for svc in new_svcs:
+                    cmd_short = svc['cmd'][:60]
+                    print(f"      :{svc['port']}  {DIM}{cmd_short}{RESET}")
+            try:
+                fix = input(f"\n  {WHITE}Register these? (y/N): {RESET}").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                fix = 'n'
+            if fix in ('y', 'yes'):
+                projects_dict = dict(PROJECTS)
+                order = list(PROJECT_ORDER)
+                for pk, proj, new_svcs in drift_projects:
+                    added = _interactive_service_curation(
+                        host_alias, proj['path'], all_host_services, proj.get('services', []))
+                    if added:
+                        current_svcs = list(proj.get('services', []))
+                        current_svcs.extend(added)
+                        projects_dict[pk]['services'] = current_svcs
+                        for s in added:
+                            print(f"    {GREEN}+{RESET} {pk}: {s['name']} :{s['port']}")
+                save_projects(projects_dict, order, IGNORED)
+                reload_projects()
+                print(f"  {GREEN}✓{RESET} Services updated")
+
+        # Check for npm dev services on registered projects
+        npm_drift_projects = []
+        for r in registered:
+            pk = r['key']
+            proj = PROJECTS[pk]
+            npm_candidates = _discover_npm_dev_services(host_alias, proj['path'])
+            existing_devs = proj.get('dev_services', [])
+            existing_dev_ports = {d['port'] for d in existing_devs}
+            new_npm = [c for c in npm_candidates if c.get('port') and c['port'] not in existing_dev_ports]
+            if new_npm:
+                npm_drift_projects.append((pk, proj, new_npm))
+
+        if npm_drift_projects:
+            print(f"\n  {YELLOW}Unregistered npm dev services on existing projects:{RESET}")
+            for pk, proj, new_npm in npm_drift_projects:
+                print(f"    {WHITE}{pk}{RESET}:")
+                for c in new_npm:
+                    dir_info = f" ({c['dir']})" if c['dir'] != '.' else ''
+                    print(f"      :{c['port']}  {c['dev_cmd']}{DIM}{dir_info}{RESET}")
+            try:
+                fix_npm = input(f"\n  {WHITE}Register npm dev services? (y/N): {RESET}").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                fix_npm = 'n'
+            if fix_npm in ('y', 'yes'):
+                projects_dict = dict(PROJECTS)
+                order = list(PROJECT_ORDER)
+                for pk, proj, new_npm in npm_drift_projects:
+                    added = _interactive_npm_dev_curation(
+                        host_alias, proj['path'], new_npm, proj.get('dev_services', []))
+                    if added:
+                        current_devs = list(proj.get('dev_services', []))
+                        current_devs.extend(added)
+                        projects_dict[pk]['dev_services'] = current_devs
+                        for d in added:
+                            en = f"{GRAY}off{RESET}"
+                            print(f"    {GREEN}+{RESET} {pk}: {d['name']} :{d['port']}  [{en}]")
+                save_projects(projects_dict, order, IGNORED)
+                reload_projects()
+                print(f"  {GREEN}✓{RESET} Dev services updated (use {WHITE}hub --dev{RESET} to enable)")
+
+    # Display ignored dirs (dimmed)
+    if ignored_dirs:
+        print(f"\n  {DIM}Ignored: {', '.join(sorted(ignored_dirs))}  (hub --scan --ignore {host_key} to manage){RESET}")
+
+    if not candidates:
+        print()
+        sys.exit(0)
+
+    # Interactive selection — toggle menu
+    # Tag each candidate with a 'selected' flag
+    for c in candidates:
+        c['_selected'] = False
+
+    def _scan_render(item, idx, highlighted):
+        c = item
+        sel = f"{GREEN}[+]{RESET}" if c['_selected'] else f"{GRAY}[ ]{RESET}"
+        name_str = c['title'] or c['dirname']
+        git_str = 'git' if c['git'] else '-'
+        if highlighted:
+            return f"  {sel} {HIGHLIGHT_BG}{c['dirname']:<{dir_width}}{git_str}  {name_str}{HIGHLIGHT_OFF}"
+        git_col = f"{GREEN}{git_str}{RESET}" if c['git'] else f"{GRAY}{git_str}{RESET}"
+        return f"  {sel} {c['dirname']:<{dir_width}}{git_col}  {name_str}"
+
+    print()
+    title = f"  {WHITE}Select projects to add{RESET}  {GRAY}— space=toggle  enter=confirm  q=cancel{RESET}"
+    saved = interactive_toggle(
+        candidates, _scan_render,
+        get_state=lambda c: c['_selected'],
+        set_state=lambda c, v: c.__setitem__('_selected', v),
+        title=title,
+    )
+
+    if not saved:
+        sys.exit(0)
+
+    selected = [i for i, c in enumerate(candidates) if c['_selected']]
+    if not selected:
+        sys.exit(0)
+
+    # Build project entries with inline editing
+    print()
+    print(f"  {WHITE}Configure each project{RESET} {GRAY}(Enter to accept, or type replacement){RESET}")
+    divider()
+
+    entries = []
+    for idx in selected:
+        c = candidates[idx]
+        default_key = c['dirname'].lower().replace(' ', '-')
+        default_name = (c['title'] or c['dirname']).upper()
+        claude_md = c['claude_md'] or 'CLAUDE.md'
+        path = f"~/projects/{c['dirname']}"
+
+        # Try to get tagline from CLAUDE.md — only accept the line
+        # immediately after the title heading (1 blank line gap max).
+        # Reject structural/instruction lines.
+        tagline = ''
+        if c['claude_md']:
+            tag_cmd = f'head -10 ~/projects/{c["dirname"]}/{c["claude_md"]} 2>/dev/null'
+            tag_ok, tag_out = ssh_cmd(host_alias, tag_cmd, timeout=5)
+            if tag_ok and tag_out:
+                lines = tag_out.strip().split('\n')
+                for j, line in enumerate(lines):
+                    if line.startswith('# '):
+                        # Look at only j+1 and j+2 (immediate vicinity)
+                        for k in range(j + 1, min(j + 3, len(lines))):
+                            candidate_line = lines[k].strip()
+                            if not candidate_line:
+                                continue  # skip one blank line
+                            # Reject headings, code fences, list items, tables, key:value metadata
+                            if (candidate_line.startswith(('#', '`', '|', '-', '*', '>'))
+                                    or re.match(r'^[A-Za-z][\w\s]{0,18}:', candidate_line)
+                                    or len(candidate_line) > 80):
+                                break  # no tagline available
+                            tagline = candidate_line[:80]
+                            break
+                        break
+
+        print(f"\n  {CYAN}{c['dirname']}{RESET}  {GRAY}({path}){RESET}")
+        key = _prompt(f"    key     [{WHITE}{default_key}{RESET}]: ", default_key)
+        name = _prompt(f"    name    [{WHITE}{default_name}{RESET}]: ", default_name)
+        tagline = _prompt(f"    tagline [{WHITE}{tagline or '(none)'}{RESET}]: ", tagline)
+
+        # Auto-discover services for this project
+        discovered_svcs = _interactive_service_curation(
+            host_alias, path, all_host_services, existing_services=[])
+
+        # Auto-discover npm dev services
+        npm_candidates = _discover_npm_dev_services(host_alias, path)
+        discovered_devs = _interactive_npm_dev_curation(
+            host_alias, path, npm_candidates, existing_dev_services=[]) if npm_candidates else []
+
+        entries.append({
+            'key': key,
+            'name': name,
+            'tagline': tagline if tagline != '(none)' else '',
+            'host': host_key,
+            'path': path,
+            'claude_md': claude_md,
+            'services': discovered_svcs,
+            'dev_services': discovered_devs,
+        })
+
+    # Confirmation review
+    print()
+    divider()
+    print(f"\n  {WHITE}Review:{RESET}\n")
+    for e in entries:
+        tag_display = f"  {GRAY}{e['tagline']}{RESET}" if e['tagline'] else ''
+        print(f"  {GREEN}+{RESET} {WHITE}{e['key']}{RESET}  {e['name']}{tag_display}")
+        print(f"    {GRAY}{e['host']}:{e['path']}  ({e['claude_md']}){RESET}")
+        if e.get('services'):
+            for svc in e['services']:
+                print(f"    {CYAN}●{RESET} {svc['name']} :{svc['port']}  {DIM}{svc.get('start_cmd', '')}{RESET}")
+        if e.get('dev_services'):
+            for ds in e['dev_services']:
+                en = f"{GREEN}on{RESET}" if ds.get('enabled') else f"{GRAY}off{RESET}"
+                dir_info = f" ({ds['dir']})" if ds['dir'] != '.' else ''
+                print(f"    {YELLOW}●{RESET} {ds['name']} :{ds['port']}  {ds['dev_cmd']}{DIM}{dir_info}{RESET}  [{en}]")
+
+    print()
+    confirm = _prompt(f"  {WHITE}Confirm? (Y/n): {RESET}", 'y').lower()
+    if confirm not in ('y', 'yes'):
+        print(f"  {GRAY}Cancelled{RESET}")
+        sys.exit(0)
+
+    # Write to projects.json
+    projects = dict(PROJECTS)
+    order = list(PROJECT_ORDER)
+
+    for e in entries:
+        proj_data = {
+            'name': e['name'],
+            'tagline': e['tagline'],
+            'host': e['host'],
+            'path': e['path'],
+            'claude_md': e['claude_md'],
+            'services': e.get('services', []),
+        }
+        if e.get('dev_services'):
+            proj_data['dev_services'] = e['dev_services']
+        projects[e['key']] = proj_data
+        if e['key'] not in order:
+            order.append(e['key'])
+
+    save_projects(projects, order, IGNORED)
+    reload_projects()
+
+    print()
+    for e in entries:
+        print(f"  {GREEN}+{RESET} {WHITE}{e['key']}{RESET}  ({e['name']})")
+    print(f"\n  {GREEN}✓{RESET} {len(entries)} project(s) added to {PROJECTS_JSON}")
+    print(f"  {GRAY}Run {WHITE}overview {entries[0]['key']}{GRAY} to generate initial cache{RESET}")
+    print()
+
+
+def scan_ignore(host_key):
+    """Interactive ignore management — add/remove dirs from the ignored list."""
+    if host_key not in HOSTS:
+        print(f"{RED}Unknown host '{host_key}'. Available: {', '.join(HOSTS.keys())}{RESET}")
+        sys.exit(1)
+
+    host = HOSTS[host_key]
+    host_alias = host['alias']
+    host_name = host['name']
+
+    print()
+    print(f"  {CYAN}Scanning {host_name} for ignore management...{RESET}")
+
+    if not check_host_reachable(host_alias):
+        print(f"\n  {RED}● {host_name} is offline{RESET}")
+        sys.exit(1)
+
+    # Get all dirs
+    scan_cmd = r'''
+for d in ~/projects/*/; do
+    [ -d "$d" ] || continue
+    basename "$d"
+done
+'''
+    ok, output = ssh_cmd(host_alias, scan_cmd, timeout=15)
+    if not ok or not output.strip():
+        print(f"\n  {GRAY}No ~/projects/ directory found or empty{RESET}")
+        sys.exit(0)
+
+    all_dirs = [d.strip() for d in output.strip().split('\n') if d.strip()]
+
+    # Classify each dir
+    existing_paths = set()
+    for pk, proj in PROJECTS.items():
+        if proj['host'] == host_key:
+            existing_paths.add(proj['path'].rsplit('/', 1)[-1].lower())
+
+    host_ignored = list(IGNORED.get(host_key, []))
+    host_ignored_set = set(host_ignored)
+
+    currently_ignored = []
+    unregistered = []
+    for d in sorted(all_dirs):
+        if d.lower() in existing_paths:
+            continue  # registered project — skip
+        if d in host_ignored_set:
+            currently_ignored.append(d)
+        else:
+            unregistered.append(d)
+
+    if not currently_ignored and not unregistered:
+        print(f"\n  {GREEN}✓{RESET} All dirs on {host_name} are either registered projects or empty")
+        print()
+        sys.exit(0)
+
+    # Build toggle list — all non-registered dirs, with ignored=ON
+    all_dirs_sorted = sorted(currently_ignored + unregistered)
+    items = []
+    for d in all_dirs_sorted:
+        items.append({'name': d, 'ignored': d in host_ignored_set})
+
+    # Snapshot original states
+    orig_states = {item['name']: item['ignored'] for item in items}
+
+    def _ignore_render(item, idx, highlighted):
+        if item['ignored']:
+            toggle = f"{YELLOW}[IGN]{RESET}"
+        else:
+            toggle = f"{GRAY}[   ]{RESET}"
+        if highlighted:
+            return f"  {toggle} {HIGHLIGHT_BG}{item['name']}{HIGHLIGHT_OFF}"
+        return f"  {toggle} {item['name']}"
+
+    title = f"  {WHITE}Ignore list — {host_name}{RESET}  {GRAY}— space=toggle  enter=save  q=discard{RESET}"
+
+    def _ignore_save():
+        new_ignored = dict(IGNORED)
+        current_list = [item['name'] for item in items if item['ignored']]
+        if current_list:
+            new_ignored[host_key] = sorted(current_list)
+        elif host_key in new_ignored:
+            del new_ignored[host_key]
+        save_projects(PROJECTS, PROJECT_ORDER, new_ignored)
+        reload_projects()
+
+    saved = interactive_toggle(
+        items, _ignore_render,
+        get_state=lambda item: item['ignored'],
+        set_state=lambda item, v: item.__setitem__('ignored', v),
+        title=title, on_save=_ignore_save,
+    )
+
+    if saved:
+        # Report changes
+        to_ignore = [item['name'] for item in items if item['ignored'] and not orig_states[item['name']]]
+        to_unignore = [item['name'] for item in items if not item['ignored'] and orig_states[item['name']]]
+        for d in to_ignore:
+            print(f"  {GRAY}+ ignored: {d}{RESET}")
+        for d in to_unignore:
+            print(f"  {GREEN}- unignored: {d}{RESET}")
+        if to_ignore or to_unignore:
+            print(f"\n  {GREEN}✓{RESET} Updated {PROJECTS_JSON}")
+        else:
+            print(f"  {GREEN}✓{RESET} No changes")
+    else:
+        print(f"  {GRAY}Discarded{RESET}")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --manage: Interactive project editor
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _manage_list(projects, order):
+    """Display numbered project table."""
+    w = cols()
+    print()
+    print(f"  {WHITE}{'PROJECT MANAGER':^{w-4}}{RESET}")
+    print(f"  {'═' * (w - 4)}")
+    print()
+    print(f"  {GRAY}{'#':<4}{'Key':<18}{'Name':<25}{'Host':<7}{'Index'}{RESET}")
+    print(f"  {'─' * (w - 4)}")
+    for i, key in enumerate(order, 1):
+        proj = projects[key]
+        host_label = proj['host'].upper()
+        idx = proj.get('code_index', '--')
+        print(f"  {WHITE}{i:<4}{RESET}{key:<18}{proj['name']:<25}{host_label:<7}{idx}")
+    print()
+
+
+def _manage_edit_at(projects, order, ignored, idx):
+    """Edit a single project's fields at the given index."""
+    old_key = order[idx]
+    proj = projects[old_key]
+
+    print(f"\n  {WHITE}{old_key}{RESET}")
+    print(f"  {'─' * 38}")
+
+    # Editable fields: key, name, tagline, host, path, claude_md, code_index, git_remote, git_branch
+    new_key = _prompt(f"    key     [{old_key}]: ", old_key)
+    new_name = _prompt(f"    name    [{proj['name']}]: ", proj['name'])
+    new_tagline = _prompt(f"    tagline [{proj.get('tagline', '')}]: ", proj.get('tagline', ''))
+    valid_hosts = ', '.join(sorted(HOSTS.keys()))
+    new_host = _prompt(f"    host    [{proj['host']}]: ({valid_hosts}) ", proj['host']).lower()
+    if new_host not in HOSTS:
+        print(f"  {RED}Invalid host '{new_host}' — must be one of: {valid_hosts}{RESET}")
+        return
+    new_path = _prompt(f"    path    [{proj['path']}]: ", proj['path'])
+    if not new_path.startswith('~/') and not new_path.startswith('/'):
+        print(f"  {RED}Path must start with ~/ or /{RESET}")
+        return
+    new_claude = _prompt(f"    claude  [{proj.get('claude_md', 'CLAUDE.md')}]: ", proj.get('claude_md', 'CLAUDE.md'))
+    new_index = _prompt(f"    index   [{proj.get('code_index', '')}]: ", proj.get('code_index', ''))
+    new_remote = _prompt(f"    remote  [{proj.get('git_remote', '')}]: ", proj.get('git_remote', ''))
+    new_branch = _prompt(f"    branch  [{proj.get('git_branch', '')}]: ", proj.get('git_branch', ''))
+
+    # Build changes list
+    changes = []
+    for field, old_val, new_val in [
+        ('name', proj['name'], new_name),
+        ('tagline', proj.get('tagline', ''), new_tagline),
+        ('host', proj['host'], new_host),
+        ('path', proj['path'], new_path),
+        ('claude_md', proj.get('claude_md', 'CLAUDE.md'), new_claude),
+    ]:
+        if old_val != new_val:
+            changes.append(field)
+    proj['name'] = new_name
+    proj['tagline'] = new_tagline
+    proj['host'] = new_host
+    proj['path'] = new_path
+    proj['claude_md'] = new_claude
+
+    # Optional fields: empty string → remove
+    for field, val in [('code_index', new_index), ('git_remote', new_remote), ('git_branch', new_branch)]:
+        if val:
+            if proj.get(field) != val:
+                changes.append(field)
+            proj[field] = val
+        else:
+            if field in proj:
+                changes.append(field)
+                del proj[field]
+
+    # Recompute claude_dir
+    proj['claude_dir'] = derive_claude_dir(proj['host'], proj['path'])
+
+    # Handle key rename
+    if new_key != old_key:
+        if new_key in projects:
+            print(f"  {RED}Key '{new_key}' already exists{RESET}")
+            return
+        changes.append('key')
+        projects[new_key] = proj
+        del projects[old_key]
+        order[idx] = new_key
+
+    save_projects(projects, order, ignored)
+    reload_projects()
+    if changes:
+        print(f"\n  {GREEN}✓{RESET} Updated {new_key} ({', '.join(changes)} changed)")
+    else:
+        print(f"\n  {GREEN}✓{RESET} Saved {new_key} (no changes)")
+    print()
+
+
+def _manage_delete_at(projects, order, ignored, idx):
+    """Delete a project entry at the given index (not the files)."""
+    key = order[idx]
+    proj = projects[key]
+
+    print(f"\n  {YELLOW}⚠{RESET} Remove {WHITE}{key}{RESET} ({proj['name']})?")
+    print(f"  {GRAY}This only removes the hub entry, not the project files.{RESET}")
+    confirm = _prompt("  Confirm? (y/N): ", 'n').lower()
+    if confirm != 'y':
+        print(f"  {GRAY}Cancelled{RESET}")
+        return
+
+    del projects[key]
+    order.pop(idx)
+    save_projects(projects, order, ignored)
+    reload_projects()
+    print(f"\n  {GREEN}✓{RESET} Removed {key}")
+    print()
+
+
+def _manage_reorder(projects, order, ignored):
+    """Reorder projects via comma-separated numbers."""
+    n = len(order)
+    print(f"  {GRAY}Current order: {', '.join(order)}{RESET}")
+    raw = _prompt(f"  New order (e.g. {','.join(str(i) for i in range(1, n+1))}): ")
+    if not raw:
+        return
+
+    try:
+        nums = [int(x.strip()) for x in raw.split(',')]
+    except ValueError:
+        print(f"  {RED}Enter comma-separated numbers{RESET}")
+        return
+
+    if sorted(nums) != list(range(1, n + 1)):
+        print(f"  {RED}Must include each number 1-{n} exactly once{RESET}")
+        return
+
+    new_order = [order[i - 1] for i in nums]
+    save_projects(projects, new_order, ignored)
+    reload_projects()
+
+    # Show what moved
+    first_key = new_order[0]
+    print(f"\n  {GREEN}✓{RESET} Reordered ({first_key} now first)")
+    print()
+
+
+def manage_projects():
+    """Interactive project editor — arrow-key selection with action keys."""
+    projects, order, ignored = load_projects()
+
+    while True:
+        # Build item list from current order
+        items = []
+        for key in order:
+            proj = projects[key]
+            items.append((key, proj))
+
+        if not items:
+            print(f"\n  {GRAY}No projects configured{RESET}\n")
+            break
+
+        def _manage_render(item, idx, highlighted):
+            key, proj = item
+            host_label = proj['host'].upper()
+            ci = proj.get('code_index', '--')
+            hl_start = HIGHLIGHT_BG if highlighted else ''
+            hl_end = HIGHLIGHT_OFF if highlighted else ''
+            return f"  {hl_start}{key:<18}{proj['name']:<25}{host_label:<7}{ci}{hl_end}"
+
+        print()
+        w = cols()
+        print(f"  {WHITE}{'PROJECT MANAGER':^{w-4}}{RESET}")
+        print(f"  {'═' * (w - 4)}")
+        print()
+        print(f"  {GRAY}{'Key':<18}{'Name':<25}{'Host':<7}{'Index'}{RESET}")
+        print(f"  {'─' * (w - 4)}")
+
+        action_keys = {
+            'e': ('edit', 'Edit project fields'),
+            'd': ('delete', 'Remove project entry'),
+            'r': ('reorder', 'Reorder projects'),
+        }
+        footer = f"  {GRAY}e=edit  d=delete  r=reorder  enter=edit  q=quit{RESET}"
+
+        action, idx = interactive_select(
+            items, _manage_render, actions=action_keys, footer=footer,
+        )
+
+        if action is None:
+            break
+        elif action in ('e', KEY_ENTER):
+            _manage_edit_at(projects, order, ignored, idx)
+            # Reload after edit (key may have changed)
+            projects, order, ignored = load_projects()
+        elif action == 'd':
+            _manage_delete_at(projects, order, ignored, idx)
+            projects, order, ignored = load_projects()
+        elif action == 'r':
+            _manage_reorder(projects, order, ignored)
+            projects, order, ignored = load_projects()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --dev: Dev service management
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_dev(args=None):
+    """Show, enable, or disable npm dev services.
+
+    hub --dev               Show all dev services with enabled status
+    hub --dev enable <pk>   Enable all dev services for a project (or specific by name)
+    hub --dev disable <pk>  Disable all dev services for a project (or specific by name)
+    """
+    # Collect all dev services
+    all_devs = []
+    for pk in PROJECT_ORDER:
+        proj = PROJECTS[pk]
+        for ds in proj.get('dev_services', []):
+            all_devs.append((pk, proj, ds))
+
+    if not all_devs and not args:
+        print(f"\n  {GRAY}No dev services configured{RESET}")
+        print(f"  {DIM}Run {WHITE}hub --scan <host>{RESET}{DIM} to discover npm dev services{RESET}\n")
+        return
+
+    # Parse sub-action
+    action = args[0].lower() if args else None
+
+    if action in ('enable', 'disable'):
+        if len(args) < 2:
+            print(f"\n  Usage: hub --dev {action} <project> [service-name]\n")
+            return
+
+        target_pk = resolve_project(args[1])
+        if not target_pk:
+            print(f"\n  {RED}Unknown project: {args[1]}{RESET}\n")
+            return
+
+        proj = PROJECTS[target_pk]
+        dev_svcs = proj.get('dev_services', [])
+        if not dev_svcs:
+            print(f"\n  {GRAY}No dev services for {target_pk}{RESET}\n")
+            return
+
+        # Optional: filter by service name
+        target_name = ' '.join(args[2:]).strip() if len(args) > 2 else None
+        new_state = action == 'enable'
+        toggled = 0
+
+        projects_dict = dict(PROJECTS)
+        for ds in projects_dict[target_pk].get('dev_services', []):
+            if target_name and target_name.lower() not in ds['name'].lower():
+                continue
+            if ds.get('enabled') != new_state:
+                ds['enabled'] = new_state
+                toggled += 1
+
+        if toggled == 0:
+            state_word = 'enabled' if new_state else 'disabled'
+            print(f"\n  {GRAY}Already {state_word} (or no match){RESET}\n")
+            return
+
+        save_projects(projects_dict, PROJECT_ORDER, IGNORED)
+        reload_projects()
+
+        state_word = 'enabled' if new_state else 'disabled'
+        icon = GREEN if new_state else YELLOW
+        print(f"\n  {icon}✓{RESET} {state_word.title()} {toggled} dev service(s) for {WHITE}{target_pk}{RESET}")
+        if new_state:
+            print(f"  {DIM}Will auto-start on next {WHITE}prepare{RESET}{DIM} / {WHITE}work{RESET}")
+        print()
+        return
+
+    # Default: interactive toggle menu
+    # Build flat item list with group headers
+    menu_items = []
+    current_pk = None
+    for pk, proj, ds in all_devs:
+        if pk != current_pk:
+            current_pk = pk
+            menu_items.append(('header', pk, proj, None))
+        menu_items.append(('service', pk, proj, ds))
+
+    # Snapshot original states for discard
+    orig_states = {}
+    for _, pk, _, ds in menu_items:
+        if ds is not None:
+            orig_states[id(ds)] = ds.get('enabled', False)
+
+    def _dev_render(item, idx, highlighted):
+        kind, pk, proj, ds = item
+        if kind == 'header':
+            host = proj['host']
+            return f"  {WHITE}{pk}{RESET}  {GRAY}({host}:{proj['path']}){RESET}"
+        # Service row
+        enabled = ds.get('enabled', False)
+        toggle_text = '[ON]' if enabled else '[  ]'
+        toggle_color = GREEN if enabled else GRAY
+        name = ds['name']
+        port = f":{ds['port']}"
+        if highlighted:
+            toggle = f"{toggle_color}{toggle_text}{RESET}"
+            return f"    {toggle} {HIGHLIGHT_BG}{name:<25} {port:<6}{HIGHLIGHT_OFF}"
+        toggle = f"{toggle_color}{toggle_text}{RESET}"
+        return f"    {toggle} {name:<25} {port:<6}"
+
+    def _dev_get_state(item):
+        kind, _, _, ds = item
+        if kind == 'header':
+            return None  # Non-toggleable
+        return ds.get('enabled', False)
+
+    def _dev_set_state(item, val):
+        _, _, _, ds = item
+        if ds is not None:
+            ds['enabled'] = val
+
+    def _dev_save():
+        projects_dict = dict(PROJECTS)
+        # Apply toggled states to projects dict
+        for _, pk, _, ds in menu_items:
+            if ds is not None:
+                for d in projects_dict[pk].get('dev_services', []):
+                    if d['name'] == ds['name'] and d['port'] == ds['port']:
+                        d['enabled'] = ds.get('enabled', False)
+        save_projects(projects_dict, PROJECT_ORDER, IGNORED)
+        reload_projects()
+
+    print()
+    title = f"  {WHITE}DEV SERVICES{RESET}  {GRAY}— space=toggle  enter=save  q=discard{RESET}"
+    saved = interactive_toggle(
+        menu_items, _dev_render, _dev_get_state, _dev_set_state,
+        title=title, on_save=_dev_save,
+    )
+
+    if saved:
+        # Count changes
+        changed = sum(1 for _, pk, _, ds in menu_items
+                      if ds is not None and ds.get('enabled', False) != orig_states.get(id(ds), False))
+        if changed:
+            print(f"  {GREEN}✓{RESET} Saved {changed} change(s)")
+        else:
+            print(f"  {GREEN}✓{RESET} Saved (no changes)")
+    else:
+        # Restore original states
+        for _, pk, _, ds in menu_items:
+            if ds is not None:
+                ds['enabled'] = orig_states.get(id(ds), False)
+        print(f"  {GRAY}Discarded{RESET}")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_usage():
+    print(f"""
+{WHITE}hub{RESET} — Central entry point for the Orin Nano hub ecosystem
+
+{WHITE}Usage:{RESET}
+  hub                  Full reference with live system status
+  hub --explain        Same as above (default)
+  hub --status         Compact dashboard (fast)
+  hub --next           Prioritized action list — what needs attention
+  hub --services       Service status across all projects
+  hub --dev            Show/toggle npm dev services (enable/disable per project)
+  hub --manage         Edit, delete, or reorder project entries
+  hub --scan <host>    Discover new projects on a host (agx, ws)
+  hub --scan --ignore <host>   Manage ignored dirs on a host
+  hub --help           This help
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args:
+        print_usage()
+        sys.exit(0)
+
+    if '--scan' in args:
+        idx = args.index('--scan')
+        if '--ignore' in args or '--ignored' in args:
+            # hub --scan --ignore <host>
+            ignore_idx = args.index('--ignore') if '--ignore' in args else args.index('--ignored')
+            # Host can be after --scan or after --ignore
+            host_arg = None
+            for i in (idx + 1, ignore_idx + 1):
+                if i < len(args) and not args[i].startswith('--'):
+                    host_arg = args[i]
+                    break
+            if not host_arg:
+                host_list = ', '.join(k for k in HOSTS if k != LOCAL_HOST)
+                print(f"{RED}--scan --ignore requires a host argument ({host_list}){RESET}")
+                sys.exit(1)
+            scan_ignore(host_arg)
+        else:
+            if idx + 1 >= len(args):
+                host_list = ', '.join(k for k in HOSTS if k != LOCAL_HOST)
+                print(f"{RED}--scan requires a host argument ({host_list}){RESET}")
+                sys.exit(1)
+            scan_projects(args[idx + 1])
+    elif '--dev' in args:
+        dev_idx = args.index('--dev')
+        dev_args = args[dev_idx + 1:]
+        render_dev(dev_args)
+    elif '--manage' in args:
+        manage_projects()
+    elif '--services' in args:
+        render_services()
+    elif '--status' in args:
+        render_status()
+    elif '--next' in args:
+        render_next()
+    else:
+        render_explain()
+
+
+if __name__ == '__main__':
+    main()

@@ -32,7 +32,7 @@ This fork adds two layers on top of stock OI:
 | Feature | What it does |
 |---------|--------------|
 | **Mini-RAG** | Semantic search over a local knowledge base (your projects, tools, commands) — injects the most relevant entries into each prompt automatically |
-| **Magic commands** | 12 `%commands` to operate your hub without leaving OI — check status, switch projects, commit code, run backups |
+| **Magic commands** | 13 `%commands` to operate your hub without leaving OI — check status, switch projects, commit code, run backups |
 | **Project switching** | `%switch` changes the LLM's project context (system message, env vars) so it knows which codebase you're working on |
 | **Status bar** | Shows context window usage and optional remote host memory usage after each response |
 
@@ -249,6 +249,235 @@ Without these tools installed, the magic commands will print a "tool not found" 
 
 ---
 
+## Hub Tools
+
+The `tools/hub/` directory contains a suite of CLI tools that manage a multi-machine development environment. Each tool is a standalone Python script that can be run directly from the terminal or through OI's magic commands.
+
+### Installation
+
+```bash
+cd open-interpreter
+python3 tools/hub/install.py
+```
+
+The install wizard will:
+1. Detect your hostname and username
+2. Ask about remote hosts (GPU servers, workstations, etc.)
+3. Configure Ollama location and GitHub username
+4. Write `~/.config/hub/config.json`
+5. Create symlinks from `~/` to `tools/hub/` for each tool
+6. Set up bash aliases (`hub`, `repo`, `status`)
+
+### Configuration
+
+All hub tools read from two files:
+
+| File | Purpose | Modified by |
+|------|---------|-------------|
+| `~/.config/hub/config.json` | Infrastructure config (hosts, Ollama, GitHub, backup) | `install.py` only |
+| `~/.config/hub/projects.json` | Project registry (names, paths, services, git remotes) | `hub --scan`, `hub --manage` |
+
+#### config.json schema
+
+```json
+{
+  "hub": {
+    "name": "My Dev Hub",
+    "local_host": "nano"
+  },
+  "hosts": {
+    "nano": {
+      "name": "Hub", "ip": "127.0.0.1", "user": "myuser",
+      "roles": ["local"]
+    },
+    "gpu": {
+      "name": "GPU Server", "ip": "192.168.1.100", "user": "mluser",
+      "roles": ["ollama", "code_assistant", "backup_target"]
+    },
+    "ws": {
+      "name": "Workstation", "ip": "192.168.1.50", "user": "dev",
+      "roles": ["wakeable"], "wol_mac": "AA:BB:CC:DD:EE:FF"
+    }
+  },
+  "ollama": { "host": "gpu", "port": 11434, "default_model": "llama3:8b" },
+  "code_assistant": { "host": "gpu", "port": 5002 },
+  "backup": { "destination": "gpu:~/hub-backup" },
+  "git": { "github_username": "myuser", "email": "me@example.com" }
+}
+```
+
+Host roles determine behavior:
+- `local` — the machine running the hub tools
+- `ollama` — runs the Ollama LLM server
+- `code_assistant` — runs the Code Assistant (semantic search/RAG)
+- `backup_target` — receives rsync backups
+- `wakeable` — supports Wake-on-LAN (requires `wol_mac`)
+
+### Tool Overview
+
+| Tool | Alias | Purpose |
+|------|-------|---------|
+| `hub` | `hub`, `status` | Meta-tool: dashboard, priorities, services, config, architecture |
+| `git` | `repo` | Git management: dashboard, commit, push, checkpoint, deploy |
+| `overview` | — | LLM-powered project briefings |
+| `prepare` | — | Session setup: wake hosts, warm Ollama, start services |
+| `begin` | — | Session bootstrap: build preamble, launch Claude Code or OI |
+| `work` | — | One-command workflow: prepare → overview → begin |
+| `backup` | — | Rsync hub ecosystem to backup target |
+| `research` | — | Monitor arxiv + GitHub releases, score by relevance |
+| `health-probe` | — | Probe hosts and services, track transitions |
+| `code` | — | Code Assistant client: semantic search, RAG, dependency graphs |
+| `notify` | — | Notification history viewer |
+| `hubgrep` | — | Search across all hub files (tools, config, cache, memory) |
+| `edit` | — | Structured remote file editing via SSH |
+| `search` | — | DuckDuckGo web search helper |
+| `autosummary` | — | Post-session daemon: journaling, cache refresh |
+
+---
+
+### `repo` — Git Management Tool
+
+The `repo` tool (aliased from `~/git`) provides unified git management across all registered projects. It works over SSH, so your projects can live on any configured host.
+
+#### Quick Reference
+
+```
+repo                           Dashboard — all projects at a glance
+repo status <project>          Detailed status for one project
+repo init <project>            git init + .gitignore + first commit
+repo commit <project> ["msg"]  Stage all + commit (LLM-generated message if omitted)
+repo push <project>            Push to remote
+repo pull <project>            Pull from remote
+repo log <project>             Recent commit log (last 10)
+repo create <project>          Create private GitHub repo + configure SSH remote
+repo checkpoint ["msg"]        Batch commit+push ALL dirty projects
+repo deploy <project>          Commit + push + restart services + health check
+repo fix <project>             Audit and fix git issues (PAT tokens, user config, .gitignore)
+```
+
+#### Dashboard
+
+Running `repo` with no arguments shows a compact table of every registered project:
+
+```
+$ repo
+
+  ══════════════════════════════════════════════════════
+    GIT STATUS                              Sun 02 Mar
+  ══════════════════════════════════════════════════════
+
+  Project       Branch    Dirty  Untrk  Ahead  Remote
+  ─────────────────────────────────────────────────────
+  prometheus    main        2      0      1    ✓ SSH
+  speech        main        0      0      0    ✓ SSH
+  pipeline      main        5      3      0    ✓ SSH
+  aiquest       main        0      0      2    ✓ SSH
+  presentatie   main        0      1      0    ✓ SSH
+  learnlocal    main        0      0      0    ✓ SSH
+```
+
+The dashboard probes each host via SSH in parallel (one SSH call per host for all projects on that host), so it returns in ~2 seconds regardless of how many projects you have.
+
+Column meanings:
+- **Dirty** — modified tracked files
+- **Untrk** — untracked files
+- **Ahead** — commits not yet pushed to remote
+- **Remote** — `✓ SSH` (secure), `⚠ PAT` (token in URL — run `repo fix`), or `✗ none`
+
+#### Committing
+
+```bash
+# Commit with a message you write:
+repo commit prometheus "Add activation field decay logic"
+
+# Let the LLM write the commit message (uses Ollama):
+repo commit prometheus
+```
+
+When you omit the message, `repo` sends the `git diff --staged` output to Ollama and gets back a conventional commit message. The diff is sent via SCP + curl (not shell escaping) to handle large diffs cleanly.
+
+The tool stages all changes (`git add -A`), shows you the diff summary, generates the message, and asks for confirmation before committing.
+
+#### Creating GitHub Repos
+
+```bash
+repo create prometheus
+```
+
+This will:
+1. Check the project is already a git repo (run `repo init` first if not)
+2. Prompt for a repo name (defaults to the project key)
+3. Prompt for a description (optional)
+4. Create a **private** GitHub repo via the `gh` CLI (runs on the host that has `gh` authenticated)
+5. Set the remote to use **SSH** (`git@github.com:user/repo.git`) — not HTTPS
+6. Push the current branch
+7. Save the remote to `projects.json`
+
+> **Note:** `gh` CLI must be authenticated on one of your configured hosts. The tool auto-detects which host has it.
+
+#### Batch Checkpoint
+
+```bash
+# Interactive — shows what will be committed, asks for confirmation:
+repo checkpoint
+
+# With a shared commit message:
+repo checkpoint "Weekly sync"
+
+# Skip confirmation (for scripts/cron):
+repo checkpoint --yes
+```
+
+`checkpoint` finds every project with uncommitted changes or unpushed commits and processes them all in sequence. For each dirty project it stages, generates/uses a commit message, commits, and pushes. Projects that are clean but have unpushed commits just get pushed.
+
+#### Deploy
+
+```bash
+repo deploy prometheus
+```
+
+Deploy is a full release pipeline for a single project:
+1. `git add -A` + commit (with LLM-generated message if needed)
+2. `git push`
+3. Restart the project's registered services (via tmux on the remote host)
+4. Wait for services to become healthy (HTTP probe)
+5. Update deploy state cache
+
+If any step fails, the pipeline stops and reports the issue.
+
+#### Fix — Audit and Repair
+
+```bash
+repo fix prometheus
+```
+
+Checks for and fixes common git issues:
+- **PAT token in remote URL** — rewrites HTTPS remote from `https://token@github.com/...` to `git@github.com:...` (SSH)
+- **Wrong user.name / user.email** — sets them to the values from `config.json`
+- **Missing .gitignore** — creates one with sensible defaults for the project's tech stack
+
+#### Init
+
+```bash
+repo init pipeline
+```
+
+For projects that aren't git repos yet:
+1. `git init`
+2. Creates a `.gitignore` (detects Python, Node, Rust, etc.)
+3. Sets `user.name` and `user.email` from config
+4. `git add -A && git commit -m "Initial commit"`
+
+#### Pre-flight Safety
+
+Every git operation runs pre-flight checks:
+- **Index lock** — detects and clears stale `.git/index.lock` files (with confirmation)
+- **Large files** — warns about files >10MB before staging
+- **Remote auth** — validates SSH remote is accessible before pushing
+- **Stderr capture** — git warnings and errors are shown to the user, not swallowed
+
+---
+
 ## Other Built-in Commands
 
 These are OI's original commands plus a few additions:
@@ -294,6 +523,11 @@ These are OI's original commands plus a few additions:
 | `interpreter/terminal_interface/rich_output.py` | Rich diff panels + structured output renderer |
 | `interpreter/vendor/tokentrim/` | Vendored tokentrim with [double-subtraction fix](https://github.com/KillianLucas/tokentrim/issues/11) |
 | `rag-entries.example.json` | Sample RAG entries to get started |
+| `tools/hub/` | Hub tools ecosystem — 15 scripts + shared module, config templates, install wizard |
+| `tools/hub/hub_common.py` | Shared module — config loading, SSH helpers, project registry, terminal UI primitives |
+| `tools/hub/install.py` | Interactive setup wizard — generates config.json and creates symlinks |
+| `tools/hub/config.example.json` | Minimal single-host config template |
+| `tools/hub/profiles/hub-profile.example.py` | OI profile template that reads from config.json |
 
 ### Environment variables
 

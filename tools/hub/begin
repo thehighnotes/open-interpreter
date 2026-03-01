@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+"""begin — Session bootstrap tool for the Orin Nano hub.
+
+Builds a context preamble from overview cache, notes, and git log,
+then launches Claude Code (or Open Interpreter with --oi) on the remote host.
+
+Usage:
+    begin <project>              New session with context injection
+    begin <project> --continue   Continue last session with context
+    begin <project> --dry-run    Print preamble only, don't launch
+    begin <project> --oi         Launch Open Interpreter instead of Claude Code
+    begin --help
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import *
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data gathering
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_overview_cache(project_key):
+    """Load cached overview JSON. Returns dict or None."""
+    cache_file = OVERVIEW_CACHE_DIR / f"{project_key}.json"
+    if not cache_file.exists():
+        return None
+    try:
+        return json.loads(cache_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def fetch_notes(project_key):
+    """Load recent notes from local storage. Returns string or empty."""
+    notes_file = NOTES_CACHE_DIR / f"{project_key}.txt"
+    if not notes_file.exists():
+        return ''
+    try:
+        lines = notes_file.read_text().strip().split('\n')
+        return '\n'.join(lines[-10:])
+    except OSError:
+        return ''
+
+
+def fetch_git_log(host_alias, project_path, count=3):
+    """Fetch recent git commits. Returns string or empty."""
+    cmd = f'cd {project_path} 2>/dev/null && git log --oneline -{count} 2>/dev/null'
+    ok, output = ssh_cmd(host_alias, cmd, timeout=10)
+    if ok and output:
+        return output.strip()
+    return ''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Preamble builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_preamble(project_key, cache_data, notes_str, git_str, env_status=None):
+    """Build the session context preamble text."""
+    proj = PROJECTS[project_key]
+    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    lines = []
+    lines.append(f"=== SESSION CONTEXT (auto-generated {now}) ===")
+    lines.append(f"Project: {proj['name']} | {HOSTS[proj['host']]['name']} | {proj['path']}")
+
+    if env_status:
+        lines.append(f"Environment: {env_status}")
+
+    if cache_data:
+        phase = cache_data.get('phase', '')
+        status = cache_data.get('status_summary', '')
+        if phase:
+            lines.append(f"Phase: {phase}")
+        if status:
+            lines.append(f"Status: {status}")
+
+        lines.append('')
+
+        focus = cache_data.get('current_focus', [])
+        lines.append('Current focus:')
+        if focus:
+            for item in focus:
+                lines.append(f"  - {item}")
+        else:
+            lines.append('  (none)')
+
+        lines.append('')
+
+        blockers = cache_data.get('blockers', [])
+        lines.append('Blockers:')
+        if blockers:
+            for item in blockers:
+                lines.append(f"  - {item}")
+        else:
+            lines.append('  (none)')
+
+        lines.append('')
+
+        breakthroughs = cache_data.get('recent_breakthroughs', [])
+        lines.append('Recent breakthroughs:')
+        if breakthroughs:
+            for item in breakthroughs:
+                lines.append(f"  - {item}")
+        else:
+            lines.append('  (none)')
+    else:
+        lines.append('')
+        lines.append('(no cached overview data — run prepare first for richer context)')
+
+    # Trajectory context (from timeline journal)
+    journal = read_journal(project_key)
+    if journal:
+        lines.append('')
+        lines.append('Session trajectory:')
+
+        # Count recent sessions
+        session_ends = [e for e in journal if e.get('type') == 'session_end']
+        if session_ends:
+            lines.append(f"  - {len(session_ends)} session(s) tracked")
+
+        # Last session summary with git stats
+        if session_ends:
+            last_end = session_ends[-1]
+            duration = last_end.get('duration_minutes')
+            git_stats = last_end.get('git_stats', {})
+            parts = []
+            if duration is not None:
+                parts.append(f"{duration}m")
+            commits = git_stats.get('commits', 0)
+            if commits:
+                parts.append(f"{commits} commit{'s' if commits != 1 else ''}")
+            ins = git_stats.get('insertions', 0)
+            dels = git_stats.get('deletions', 0)
+            if ins or dels:
+                parts.append(f"+{ins}/-{dels} lines")
+            changed = git_stats.get('changed_files', [])
+            if changed:
+                parts.append(f"{len(changed)} file{'s' if len(changed) != 1 else ''}")
+            if parts:
+                lines.append(f"  Last session: {', '.join(parts)}")
+
+        # Persistent blockers
+        blocker_ages = get_blocker_ages(project_key)
+        persistent = {b: info for b, info in blocker_ages.items() if info['sessions'] > 1}
+        if persistent:
+            for b, info in sorted(persistent.items(), key=lambda x: -x[1]['sessions']):
+                days = int((time.time() - info['first_seen_ts']) / 86400)
+                age_label = f"{days}d" if days > 0 else "today"
+                lines.append(f"  - PERSISTENT BLOCKER ({info['sessions']} sessions, {age_label}): {b}")
+
+        # Recent notes from journal (last 3)
+        note_events = [e for e in journal if e.get('type') == 'note']
+        if note_events:
+            recent_notes = note_events[-3:]
+            lines.append('  Recent notes:')
+            for ne in recent_notes:
+                lines.append(f"    - {ne.get('message', '')}")
+
+        # Recent state changes (last session only)
+        last_session_events = []
+        for e in reversed(journal):
+            if e.get('type') in ('session_end', 'session_start'):
+                break
+            last_session_events.append(e)
+        last_session_events.reverse()
+
+        if last_session_events:
+            lines.append('  Last session changes:')
+            for e in last_session_events:
+                etype = e.get('type', '')
+                if etype == 'state_change':
+                    field = e.get('field', '')
+                    if field == 'phase':
+                        lines.append(f"    - Phase changed: {e.get('before', '?')} -> {e.get('after', '?')}")
+                    elif field == 'blockers':
+                        for b in e.get('removed', []):
+                            lines.append(f"    - Resolved: {b}")
+                        for b in e.get('added', []):
+                            lines.append(f"    - New blocker: {b}")
+                    elif field == 'focus':
+                        old = set(e.get('before', []))
+                        new = set(e.get('after', []))
+                        gained = new - old
+                        if gained:
+                            lines.append(f"    - Focus added: {', '.join(gained)}")
+                elif etype == 'metric_change':
+                    lines.append(f"    - {e.get('key', '?')}: {e.get('before', '?')} -> {e.get('after', '?')}")
+
+    # Research context (from research cache)
+    lines.append('')
+    lines.append('Research context:')
+    research_cache = RESEARCH_CACHE_DIR / f'{project_key}.json'
+    if research_cache.exists():
+        try:
+            rdata = json.loads(research_cache.read_text())
+            r_papers = rdata.get('high_relevance', [])[:3]
+            r_releases = rdata.get('releases', [])[:2]
+            has_research = False
+            for item in r_papers:
+                lines.append(f"  - [{item.get('score',0)}] {item.get('title','')} — {item.get('reason','')}")
+                has_research = True
+            for item in r_releases:
+                lines.append(f"  - [{item.get('score',0)}] Release: {item.get('title','')} — {item.get('reason','')}")
+                has_research = True
+            if not has_research:
+                lines.append('  (none)')
+        except (json.JSONDecodeError, OSError):
+            lines.append('  (none)')
+    else:
+        lines.append('  (none)')
+
+    # Code pulse (from Code Assistant cache)
+    ca_key = resolve_code_project(project_key)
+    if ca_key:
+        pulse_file = CODE_CACHE_DIR / f'{project_key}_pulse.json'
+        last_file = CODE_CACHE_DIR / f'{project_key}_last.json'
+        has_code_context = False
+
+        if pulse_file.exists():
+            try:
+                pulse = json.loads(pulse_file.read_text())
+                if time.time() - pulse.get('ts', 0) < 86400:  # < 24h old
+                    lines.append('')
+                    lines.append('Code pulse:')
+                    has_code_context = True
+                    graph = pulse.get('graph', {})
+                    if graph:
+                        lines.append(f"  Codebase: {graph.get('total_files', '?')} files, "
+                                     f"{graph.get('total_edges', '?')} dependency edges")
+                    for term, hits in list(pulse.get('focus_hits', {}).items())[:2]:
+                        fnames = [h['file_path'].split('/')[-1] for h in hits[:3]]
+                        lines.append(f"  '{term}': {', '.join(fnames)}")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if last_file.exists():
+            try:
+                last = json.loads(last_file.read_text())
+                if time.time() - last.get('ts', 0) < 14400:  # < 4h old
+                    if not has_code_context:
+                        lines.append('')
+                        lines.append('Code pulse:')
+                    answer = last.get('data', {}).get('answer', '')
+                    if answer:
+                        lines.append(f"  Last code query ({last.get('type','?')}): "
+                                     f"{answer[:200]}{'...' if len(answer) > 200 else ''}")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    # Code Assistant API reference (only if project is indexed)
+    if ca_key:
+        lines.append('')
+        ca_host_name = HOSTS.get(HUB_CONFIG['code_assistant']['host'], {}).get('name', 'CA')
+        ca_port = HUB_CONFIG['code_assistant']['port']
+        lines.append(f'Code Assistant API ({ca_host_name}:{ca_port}):')
+        lines.append(f'  Base: {CODE_ASSISTANT_URL}')
+        lines.append(f'  Project key: "{ca_key}"')
+        lines.append('  Endpoints:')
+        lines.append('    POST /ask          {question, project, model}         — RAG question (model: hub-coder-30b)')
+        lines.append('    POST /ask/stream   {question, project, use_tools}     — streaming search with tool use (SSE)')
+        lines.append('    POST /impact       {file_path, project}               — dependency impact analysis')
+        lines.append('    GET  /graph/stats  ?project=<name>                    — dependency graph overview')
+        lines.append('    GET  /projects                                        — list indexed projects')
+        lines.append('    POST /index        {project, code_paths[], doc_paths[]} — index new project')
+        lines.append('    POST /projects/<name>/reindex {}                      — reindex existing project')
+
+    lines.append('')
+
+    lines.append('Recent commits:')
+    if git_str:
+        for commit in git_str.strip().split('\n'):
+            lines.append(f"  - {commit}")
+    else:
+        lines.append('  (none)')
+
+    lines.append('')
+
+    lines.append('Notes:')
+    if notes_str:
+        for note_line in notes_str.strip().split('\n')[-5:]:
+            lines.append(f"  - {note_line}")
+    else:
+        lines.append('  (none)')
+
+    # Key decisions
+    decisions = read_decisions(project_key, limit=5)
+    if decisions:
+        lines.append('')
+        lines.append('Key decisions:')
+        for d in decisions:
+            lines.append(f"  - [{d.get('category', 'design')}] {d.get('description', '')}")
+
+    # Cross-project context
+    cross = summarize_cross_project_sessions(project_key)
+    if cross:
+        lines.append('')
+        lines.append("Today's work on other projects:")
+        for s in cross:
+            lines.append(s)
+
+    lines.append('=== END SESSION CONTEXT ===')
+
+    return '\n'.join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compressed preamble (for OI — ~1500-2000 chars)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_compressed_preamble(project_key, cache_data, notes_str, git_str, env_status=None):
+    """Build a compact preamble for OI (small context window)."""
+    proj = PROJECTS[project_key]
+    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    lines = []
+    lines.append(f"SESSION: {proj['name']} | {now}")
+
+    if env_status:
+        lines.append(f"Env: {env_status}")
+
+    if cache_data:
+        phase = cache_data.get('phase', '')
+        status = cache_data.get('status_summary', '')
+        if phase:
+            lines.append(f"Phase: {phase}")
+        if status:
+            lines.append(f"Status: {status[:120]}")
+
+        focus = cache_data.get('current_focus', [])
+        if focus:
+            lines.append('Focus: ' + '; '.join(f[:80] for f in focus[:3]))
+
+        blockers = cache_data.get('blockers', [])
+        if blockers:
+            lines.append('Blockers: ' + '; '.join(b[:80] for b in blockers[:3]))
+
+        breakthroughs = cache_data.get('recent_breakthroughs', [])
+        if breakthroughs:
+            lines.append('Recent: ' + '; '.join(b[:60] for b in breakthroughs[:2]))
+
+    # Commits (compact)
+    if git_str:
+        commits = git_str.strip().split('\n')[:3]
+        lines.append('Commits: ' + ' | '.join(commits))
+
+    # Research (titles only)
+    research_cache = RESEARCH_CACHE_DIR / f'{project_key}.json'
+    if research_cache.exists():
+        try:
+            rdata = json.loads(research_cache.read_text())
+            r_papers = rdata.get('high_relevance', [])[:2]
+            titles = [p.get('title', '')[:60] for p in r_papers if p.get('title')]
+            if titles:
+                lines.append('Research: ' + '; '.join(titles))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Key decisions (top 3)
+    decisions = read_decisions(project_key, limit=3)
+    if decisions:
+        dec_strs = [f"[{d.get('category', 'design')}] {d.get('description', '')[:60]}" for d in decisions]
+        lines.append('Decisions: ' + ' | '.join(dec_strs))
+
+    # Code pulse (single line)
+    ca_key = resolve_code_project(project_key)
+    if ca_key:
+        pulse_file = CODE_CACHE_DIR / f'{project_key}_pulse.json'
+        if pulse_file.exists():
+            try:
+                pulse = json.loads(pulse_file.read_text())
+                if time.time() - pulse.get('ts', 0) < 86400:
+                    graph = pulse.get('graph', {})
+                    if graph:
+                        lines.append(f"Codebase: {graph.get('total_files', '?')} files, {graph.get('total_edges', '?')} deps")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    # Cross-project (1-liner per project, no LLM call — just check journal)
+    for pk in PROJECT_ORDER:
+        if pk == project_key:
+            continue
+        today_midnight = datetime(datetime.now().year, datetime.now().month, datetime.now().day).timestamp()
+        journal = read_journal(pk, since_ts=today_midnight)
+        session_ends = [e for e in journal if e.get('type') == 'session_end']
+        if session_ends:
+            p = PROJECTS[pk]
+            commits = sum(e.get('git_stats', {}).get('commits', 0) for e in session_ends)
+            lines.append(f"Also today: {p['name']} ({commits} commits)")
+
+    # Notes (last 2)
+    if notes_str:
+        note_lines = notes_str.strip().split('\n')[-2:]
+        lines.append('Notes: ' + ' | '.join(note_lines))
+
+    return '\n'.join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Launch helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def launch_claude(project_key, proj, host, host_alias, continue_session):
+    """Launch Claude Code on the remote host via SSH."""
+    claude_flags = '--append-system-prompt "$(cat /tmp/_begin_ctx.txt)"'
+    if continue_session:
+        claude_flags = f'-c {claude_flags}'
+
+    ssh_command = f'cd {proj["path"]} && claude {claude_flags}'
+
+    print()
+    print(f"  {CYAN}Launching Claude Code on {host['name']}...{RESET}")
+    print()
+
+    os.execvp('ssh', [
+        'ssh', '-t',
+        '-o', 'ConnectTimeout=3',
+        '-o', 'StrictHostKeyChecking=no',
+        host_alias,
+        ssh_command
+    ])
+
+
+def launch_oi(project_key, preamble, continue_session):
+    """Launch Open Interpreter locally with project context."""
+    proj = PROJECTS[project_key]
+    host_key = proj['host']
+    host_alias = HOSTS[host_key]['alias']
+
+    if continue_session:
+        print(f"  {YELLOW}Note: --continue ignored with --oi (OI has no session persistence){RESET}")
+
+    # Write compressed preamble to temp file
+    preamble_path = '/tmp/_oi_preamble.txt'
+    with open(preamble_path, 'w') as f:
+        f.write(preamble)
+
+    # Set env vars for OI profile to pick up
+    os.environ['OI_PROJECT'] = project_key
+    os.environ['OI_PROJECT_HOST'] = host_alias
+    os.environ['OI_PROJECT_PATH'] = proj['path']
+
+    print()
+    print(f"  {CYAN}Launching Open Interpreter (project mode)...{RESET}")
+    print()
+
+    os.execvp('interpreter', ['interpreter', '--profile', 'linux-admin'])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main flow
+# ─────────────────────────────────────────────────────────────────────────────
+
+def begin(project_key, continue_session=False, dry_run=False, use_oi=False):
+    """Bootstrap a Claude Code (or OI) session with context."""
+    proj = PROJECTS[project_key]
+    host_key = proj['host']
+    host = HOSTS[host_key]
+    host_alias = host['alias']
+
+    print()
+    header_bar()
+    mode = "OI" if use_oi else "CONTINUE" if continue_session else "NEW SESSION"
+    print(f"{BRIGHT_GREEN}  BEGIN — {proj['name']} ({mode}){RESET}")
+    header_bar()
+    print()
+
+    # Step 1: Check host
+    print(f"  {WHITE}[1/5]{RESET} Checking {host['name']}...")
+    if not check_host_reachable(host_alias):
+        print(f"  {host_offline_msg(host_key, project_key)}")
+        sys.exit(1)
+    print(f"  {GREEN}● {host['name']} is online{RESET}")
+
+    # Step 2: Gather context
+    print(f"  {WHITE}[2/5]{RESET} Gathering context...")
+
+    notes_str = fetch_notes(project_key)
+    git_str = fetch_git_log(host_alias, proj['path'])
+
+    # Step 3: Load overview cache (local file)
+    print(f"  {WHITE}[3/5]{RESET} Loading overview cache...")
+    cache_data = load_overview_cache(project_key)
+    if cache_data:
+        print(f"  {GREEN}● Cache loaded{RESET}")
+    else:
+        print(f"  {YELLOW}● No cache — run {WHITE}prepare {project_key}{YELLOW} for richer context{RESET}")
+
+    # Step 4: Quick environment probe
+    print(f"  {WHITE}[4/5]{RESET} Checking environment...")
+    env_status = None
+    services = load_services(project_key)
+    if services:
+        running = sum(1 for svc in services if probe_service(host_alias, svc['port'], timeout=3))
+        env_status = f"{running}/{len(services)} services running"
+        color = GREEN if running == len(services) else YELLOW
+        print(f"  {color}● {env_status}{RESET}")
+    else:
+        print(f"  {GRAY}● No services configured{RESET}")
+
+    # Probe dev services
+    dev_svcs = load_dev_services(project_key, enabled_only=True)
+    if dev_svcs:
+        dev_running = sum(1 for ds in dev_svcs if probe_service(host_alias, ds['port'], timeout=3))
+        dev_color = GREEN if dev_running == len(dev_svcs) else YELLOW
+        print(f"  {dev_color}● {dev_running}/{len(dev_svcs)} dev services running{RESET}")
+
+    # Step 5: Build and deliver preamble
+    print(f"  {WHITE}[5/5]{RESET} Building preamble...")
+    if use_oi:
+        preamble = build_compressed_preamble(project_key, cache_data, notes_str, git_str, env_status=env_status)
+    else:
+        preamble = build_preamble(project_key, cache_data, notes_str, git_str, env_status=env_status)
+
+    if dry_run:
+        print()
+        label = "COMPRESSED PREAMBLE" if use_oi else "PREAMBLE PREVIEW"
+        print(f"  {WHITE}--- {label} ({len(preamble)} chars) ---{RESET}")
+        print()
+        for line in preamble.split('\n'):
+            print(f"  {GRAY}{line}{RESET}")
+        print()
+        header_bar()
+        print(f"{GRAY}  Dry run — no session launched{RESET}")
+        header_bar()
+        return
+
+    # Close previous session (safety net if prepare was skipped)
+    closed = close_previous_session(project_key)
+    if closed:
+        print(f"  {GREEN}● Previous session closed{RESET}")
+
+    # Write session_start event to journal
+    git_head = fetch_git_head(host_alias, proj['path'])
+    session_start_event = {
+        'ts': time.time(),
+        'type': 'session_start',
+        'project': project_key,
+        'git_head': git_head,
+        'mode': 'oi' if use_oi else 'claude',
+    }
+    if cache_data:
+        session_start_event['cache_snapshot'] = {
+            'phase': cache_data.get('phase', ''),
+            'blockers': cache_data.get('blockers', []),
+            'focus': cache_data.get('current_focus', []),
+        }
+    append_journal(project_key, [session_start_event])
+    print(f"  {GREEN}● Session start recorded{RESET}")
+
+    if use_oi:
+        launch_oi(project_key, preamble, continue_session)
+    else:
+        # Sanitize preamble for shell (replace double quotes with single quotes)
+        safe_preamble = preamble.replace('"', "'")
+
+        # Write preamble to local temp file, SCP to remote
+        tmp_local = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(safe_preamble)
+                tmp_local = f.name
+
+            tmp_remote = '/tmp/_begin_ctx.txt'
+            scp_result = subprocess.run(
+                ['scp', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                 tmp_local, f'{host_alias}:{tmp_remote}'],
+                capture_output=True, text=True, timeout=10
+            )
+
+            if scp_result.returncode != 0:
+                print(f"  {RED}● Failed to copy context to {host['name']}{RESET}")
+                sys.exit(1)
+
+            print(f"  {GREEN}● Context delivered to {host['name']}{RESET}")
+
+        finally:
+            if tmp_local and os.path.exists(tmp_local):
+                os.unlink(tmp_local)
+
+        launch_claude(project_key, proj, host, host_alias, continue_session)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_usage():
+    print(f"""
+{WHITE}begin{RESET} — Session bootstrap tool
+
+{WHITE}Usage:{RESET}
+  begin <project>              New session with context injection
+  begin <project> --continue   Continue last session with context
+  begin <project> --dry-run    Print preamble only, don't launch
+  begin <project> --oi         Launch Open Interpreter instead of Claude Code
+
+{WHITE}What it does:{RESET}
+  1. Checks host reachability
+  2. Gathers notes + git log
+  3. Loads overview cache (from prepare)
+  4. Checks environment (service status from registry)
+  5. Builds context preamble and launches Claude Code (or OI with --oi)
+
+{WHITE}OI mode:{RESET}
+  Uses a compressed preamble (~1500-2000 chars) optimized for OI's smaller context.
+  Sets OI_PROJECT, OI_PROJECT_HOST, OI_PROJECT_PATH env vars.
+  Use ~/edit for structured file operations on remote files.
+
+{WHITE}Projects:{RESET}
+  {', '.join(PROJECT_ORDER) if PROJECT_ORDER else '(none — run hub --scan first)'}
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args or not args:
+        print_usage()
+        sys.exit(0)
+
+    continue_session = '--continue' in args or '-c' in args
+    dry_run = '--dry-run' in args
+    use_oi = '--oi' in args
+
+    clean_args = [a for a in args if a not in ('--continue', '-c', '--dry-run', '--oi')]
+
+    if not clean_args:
+        print_usage()
+        sys.exit(1)
+
+    project_key = resolve_project(clean_args[0])
+    if not project_key:
+        sys.exit(1)
+
+    begin(project_key, continue_session=continue_session, dry_run=dry_run, use_oi=use_oi)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,1343 @@
+#!/usr/bin/env python3
+"""overview — Context-aware project overview tool for the Orin Nano hub.
+
+Generates deep, per-project context views by combining live SSH probes,
+LLM-powered CLAUDE.md extraction via Ollama on AGX, and rich ANSI rendering.
+
+Usage:
+    overview                        All projects summary (compact view)
+    overview prometheus             Deep view of Prometheus-Mind
+    overview prometheus --refresh   Force re-analysis (bypass cache)
+    overview prometheus --raw       Show raw LLM JSON (debug)
+    overview --refresh              Force re-analysis for all projects
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import *
+
+import os
+
+CACHE_DIR = OVERVIEW_CACHE_DIR
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Architecture Diagrams — loaded from ~/.config/hub/diagrams.json
+# ─────────────────────────────────────────────────────────────────────────────
+DIAGRAMS_JSON = Path.home() / '.config' / 'hub' / 'diagrams.json'
+
+
+def _load_diagrams():
+    """Load project architecture diagrams from JSON. Returns dict or empty.
+
+    Diagram strings can contain ANSI placeholders like {WHITE}, {DIM}, etc.
+    which are interpolated at load time.
+    """
+    if not DIAGRAMS_JSON.exists():
+        return {}
+    try:
+        with open(DIAGRAMS_JSON) as f:
+            raw = json.load(f)
+        colors = {
+            'WHITE': WHITE, 'DIM': DIM, 'RESET': RESET, 'GREEN': GREEN,
+            'GRAY': GRAY, 'CYAN': CYAN, 'YELLOW': YELLOW, 'RED': RED,
+            'BRIGHT_GREEN': BRIGHT_GREEN, 'BOLD': BOLD,
+        }
+        return {k: v.format(**colors) for k, v in raw.items()}
+    except (json.JSONDecodeError, OSError, KeyError):
+        return {}
+
+
+DIAGRAMS = _load_diagrams()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSH + Probing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def probe_claude_md(host_alias, project_path, claude_md_name):
+    """Read CLAUDE.md content and its mtime. Returns (content, mtime_str) or (None, None)."""
+    filepath = f"{project_path}/{claude_md_name}"
+    cmd = f'cat {filepath} 2>/dev/null && echo "===MTIME===" && stat -c %Y {filepath} 2>/dev/null'
+    ok, output = ssh_cmd(host_alias, cmd, timeout=10)
+    if ok and '===MTIME===' in output:
+        parts = output.rsplit('===MTIME===', 1)
+        content = parts[0].strip()
+        mtime = parts[1].strip()
+        return content, mtime
+    return None, None
+
+
+def probe_recent_files(host_alias, project_path, gap_hours=8):
+    """Find files from the most recent work session.
+
+    Gets file timestamps sorted newest-first, then collects files until
+    a gap exceeding gap_hours is found. This captures the last concentrated
+    work session regardless of how long ago it was.
+    """
+    # Get timestamps + paths, filtered for source files only
+    cmd = (f'cd {project_path} 2>/dev/null && '
+           f'find . -type f '
+           f'-not -path "./.git/*" -not -path "./node_modules/*" '
+           f'-not -path "./__pycache__/*" -not -path "./venv/*" '
+           f'-not -path "./.venv/*" -not -path "./target/*" '
+           f'-not -path "*/build/*" -not -path "./audio/*" '
+           f'-not -path "*/samples/*" -not -path "*/results/*" '
+           f'-not -path "*/outputs/*" '
+           f'-not -name "*.pyc" -not -name "*.log" '
+           f'-not -name "*.wav" -not -name "*.mp3" -not -name "*.flac" '
+           f'-not -name "*.png" -not -name "*.jpg" -not -name "*.jpeg" '
+           f'-not -name "*.npy" -not -name "*.npz" '
+           f'-not -name "*.pt" -not -name "*.bin" -not -name "*.onnx" '
+           f'-not -name "*.so" -not -name "*.o" '
+           f'-printf "%T@ %p\\n" | sort -rn | head -60')
+    ok, output = ssh_cmd(host_alias, cmd, timeout=10)
+    if not ok or not output:
+        return []
+
+    lines = output.strip().split('\n')
+    if not lines:
+        return []
+
+    # Parse timestamps and paths
+    files = []
+    gap_sec = gap_hours * 3600
+    prev_ts = None
+    for line in lines:
+        parts = line.split(' ', 1)
+        if len(parts) != 2:
+            continue
+        try:
+            ts = float(parts[0])
+        except ValueError:
+            continue
+        path = parts[1].lstrip('./')
+
+        if prev_ts is not None and (prev_ts - ts) > gap_sec:
+            break  # Session boundary found
+        files.append(path)
+        prev_ts = ts
+
+    return files
+
+
+def probe_git_log(host_alias, project_path, count=5):
+    """Get recent git commits. Returns list of one-line strings."""
+    cmd = (f'cd {project_path} 2>/dev/null && '
+           f'git log --oneline -{count} 2>/dev/null')
+    ok, output = ssh_cmd(host_alias, cmd, timeout=10)
+    if ok and output:
+        return output.strip().split('\n')
+    return []
+
+
+def probe_last_commit_ts(host_alias, project_path):
+    """Get unix timestamp of the most recent git commit. Returns float or None."""
+    cmd = (f'cd {project_path} 2>/dev/null && '
+           f'git log -1 --format="%at" 2>/dev/null')
+    ok, output = ssh_cmd(host_alias, cmd, timeout=5)
+    if ok and output.strip():
+        try:
+            return float(output.strip())
+        except ValueError:
+            pass
+    return None
+
+
+def format_activity_age(ts):
+    """Format a unix timestamp as a human-readable activity age string."""
+    age = time.time() - ts
+    if age < 3600:
+        return f"{GREEN}active {int(age / 60)}m ago{RESET}"
+    elif age < 86400:
+        hours = int(age / 3600)
+        return f"{GREEN}active {hours}h ago{RESET}"
+    elif age < 172800:
+        return f"{GRAY}active yesterday{RESET}"
+    elif age < 604800:
+        return f"{GRAY}active {int(age / 86400)}d ago{RESET}"
+    else:
+        return f"{YELLOW}inactive {int(age / 86400)}d{RESET}"
+
+
+def probe_transcript(host_alias, claude_dir):
+    """Extract condensed conversation transcript from the most recent Claude Code session.
+
+    Finds the newest .jsonl in the project's Claude dir, extracts user messages
+    and substantive assistant responses, filters out tool chatter.
+    Returns condensed transcript string or empty string.
+    """
+    # Find the most recent top-level .jsonl (not subagent files)
+    cmd = (f'find ~/.claude/projects/{claude_dir}/ -maxdepth 1 -name "*.jsonl" '
+           f'-printf "%T@ %p\\n" 2>/dev/null | sort -rn | head -1')
+    ok, output = ssh_cmd(host_alias, cmd, timeout=5)
+    if not ok or not output.strip():
+        return ''
+
+    parts = output.strip().split(' ', 1)
+    if len(parts) != 2:
+        return ''
+    jsonl_path = parts[1]
+
+    # Read the file
+    ok, raw = ssh_cmd(host_alias, f'cat {jsonl_path}', timeout=15)
+    if not ok or not raw:
+        return ''
+
+    # Parse and condense
+    lines = []
+    for jline in raw.split('\n'):
+        jline = jline.strip()
+        if not jline:
+            continue
+        try:
+            obj = json.loads(jline)
+        except json.JSONDecodeError:
+            continue
+
+        typ = obj.get('type', '')
+        if typ not in ('user', 'assistant'):
+            continue
+
+        msg = obj.get('message', {})
+        role = msg.get('role', typ)
+        content = msg.get('content', '')
+
+        texts = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if block.get('type') == 'text' and block.get('text', '').strip():
+                    texts.append(block['text'])
+
+        for t in texts:
+            t = t.strip()
+            if not t:
+                continue
+            # Skip system/command noise
+            if '<command-name>' in t or '<local-command' in t:
+                continue
+            if '<task-notification>' in t:
+                continue
+            if t.startswith('[Request interrupted'):
+                continue
+            # Skip tool-calling chatter from assistant
+            if role == 'assistant':
+                low = t.lower()
+                if any(low.startswith(p) for p in [
+                    'let me read', 'let me check', 'let me find',
+                    'now let me', 'now add', 'now update', 'now i',
+                    'i need to update',
+                ]):
+                    continue
+                if len(t) < 60:
+                    continue
+            # Truncate long blocks
+            if len(t) > 300:
+                t = t[:300] + '...'
+            prefix = 'U:' if role == 'user' else 'A:'
+            lines.append(f'{prefix} {t}')
+
+    return '\n'.join(lines)
+
+
+def probe_machine_health(host_alias):
+    """Get machine health info. Returns dict with uptime, ram, disk, temp, etc."""
+    cmd = (
+        'echo "===UPTIME===" && uptime -p 2>/dev/null && '
+        'echo "===MEM===" && free -m 2>/dev/null | grep Mem && '
+        'echo "===DISK===" && df -h / 2>/dev/null | tail -1 && '
+        'echo "===TEMP===" && cat /sys/devices/virtual/thermal/thermal_zone*/temp 2>/dev/null | head -1'
+    )
+    ok, output = ssh_cmd(host_alias, cmd, timeout=10)
+    info = {}
+    if ok:
+        sections = output.split('===')
+        for i in range(1, len(sections), 2):
+            key = sections[i].strip()
+            val = sections[i + 1].strip() if i + 1 < len(sections) else ''
+            if key == 'UPTIME':
+                info['uptime'] = val
+            elif key == 'MEM':
+                parts = val.split()
+                if len(parts) >= 3:
+                    info['ram_used'] = parts[2]
+                    info['ram_total'] = parts[1]
+            elif key == 'DISK':
+                parts = val.split()
+                if len(parts) >= 4:
+                    info['disk_used'] = parts[2]
+                    info['disk_total'] = parts[1]
+            elif key == 'TEMP':
+                try:
+                    temp_c = int(val) // 1000
+                    info['temp'] = f"{temp_c}C"
+                except (ValueError, TypeError):
+                    pass
+    return info
+
+
+def probe_ollama_status(host_alias):
+    """Check if Ollama is running and what model is loaded."""
+    cmd = f'curl -s http://localhost:{OLLAMA_PORT}/api/ps 2>/dev/null'
+    ok, output = ssh_cmd(host_alias, cmd, timeout=5)
+    if ok and output:
+        try:
+            data = json.loads(output)
+            models = data.get('models', [])
+            if models:
+                names = [m.get('name', '?') for m in models]
+                return True, names
+            return True, []
+        except json.JSONDecodeError:
+            return True, []
+    return False, []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ollama LLM Integration
+# ─────────────────────────────────────────────────────────────────────────────
+
+OLLAMA_SYSTEM = """/no_think
+You are a JSON extraction tool. Output ONLY a JSON object. No other text."""
+
+OLLAMA_USER = """Return a JSON object from this project context. Use ALL sources — CLAUDE.md for background, recent files for activity, and the conversation transcript for what is ACTIVELY happening.
+
+Keys:
+- "phase": string — current project phase (short label)
+- "status_summary": string — 1-2 sentence status reflecting where things stand right now
+- "current_focus": list of strings — what is actively being worked on RIGHT NOW, with enough context to understand WHY (from transcript + recent files, max 5)
+- "blockers": list of strings — known issues, failed attempts, constraints — include what was tried and what went wrong (max 5)
+- "key_metrics": object — key numbers mentioned, use descriptive keys
+- "recent_breakthroughs": list of strings — discoveries or achievements, explain the significance not just the name (max 3)
+- "architecture_summary": string — 3-4 sentences on current architecture state and what is active
+- "tech_stack": list of strings (max 8)
+- "connections": list of strings — how this project relates to other projects in the ecosystem AND relevant recent research, be specific (max 4)
+- "entry_points": object — key files with a brief note on what each does
+
+Rules:
+- The transcript shows what JUST happened — prioritize it for current_focus, breakthroughs, blockers
+- Recent files confirm what areas are active
+- CLAUDE.md provides background context and architecture
+- Write entries that give enough context to pick up work — not just labels, but not paragraphs either. Aim for 1 clear sentence per entry.
+- Extract only stated facts
+- If research context is provided, mention highly relevant papers/releases in connections where appropriate
+
+"""
+
+
+def query_ollama(claude_md_content=None, recent_files=None, git_log=None,
+                 transcript=None, research_context=None, doc_context=None,
+                 model=DEFAULT_MODEL):
+    """Build overview prompt from all sources and query Ollama. Returns parsed JSON or None."""
+    # Build enriched content from all sources
+    parts = []
+
+    if claude_md_content:
+        claude_truncated = claude_md_content[:8000]
+        parts.append(f'=== CLAUDE.md (project reference) ===\n{claude_truncated}')
+    else:
+        parts.append('=== NOTE: No CLAUDE.md found. Analysis based on code files, git history, and transcript only. ===')
+
+    if recent_files:
+        files_str = '\n'.join(recent_files[:25])
+        parts.append(f'=== RECENTLY MODIFIED FILES (last work session) ===\n{files_str}')
+
+    if git_log:
+        log_str = '\n'.join(git_log[:5]) if isinstance(git_log, list) else git_log
+        parts.append(f'=== RECENT GIT COMMITS ===\n{log_str}')
+
+    if transcript:
+        parts.append(f'=== LAST DEVELOPMENT SESSION (conversation transcript) ===\n{transcript}')
+
+    if research_context:
+        parts.append(f'=== RECENT RESEARCH (auto-discovered) ===\n{research_context}')
+
+    if doc_context:
+        parts.append(f'=== PROJECT DOCUMENTATION (from indexed docs) ===\n{doc_context}')
+
+    enriched_content = '\n\n'.join(parts)
+
+    return ollama_query(
+        model=model,
+        system_msg=OLLAMA_SYSTEM,
+        user_msg=OLLAMA_USER + enriched_content,
+        timeout=120,
+        temperature=0.3,
+        num_predict=2048,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Caching
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensure_cache_dir():
+    ensure_dir(CACHE_DIR)
+
+
+def get_cached_analysis(project_key, current_mtime, transcript_mtime=None):
+    """Return cached LLM analysis if source mtimes haven't changed. Returns (data, age_str) or (None, None)."""
+    cache_file = CACHE_DIR / f"{project_key}.json"
+    mtime_file = CACHE_DIR / f"{project_key}.mtime"
+
+    if not cache_file.exists() or not mtime_file.exists():
+        return None, None
+
+    try:
+        stored_mtime = mtime_file.read_text().strip()
+        # Cache key is "claude_mtime:transcript_mtime"
+        current_key = f"{current_mtime}:{transcript_mtime or ''}"
+        if stored_mtime != current_key:
+            return None, None
+
+        data = json.loads(cache_file.read_text())
+        # Calculate cache age
+        cache_age = time.time() - cache_file.stat().st_mtime
+        if cache_age < 60:
+            age_str = f"{int(cache_age)}s ago"
+        elif cache_age < 3600:
+            age_str = f"{int(cache_age / 60)}m ago"
+        elif cache_age < 86400:
+            age_str = f"{int(cache_age / 3600)}h ago"
+        else:
+            age_str = f"{int(cache_age / 86400)}d ago"
+        return data, age_str
+    except (json.JSONDecodeError, OSError):
+        return None, None
+
+
+def save_cache(project_key, data, mtime, transcript_mtime=None):
+    """Save LLM analysis and combined mtime key to cache."""
+    ensure_cache_dir()
+    cache_file = CACHE_DIR / f"{project_key}.json"
+    mtime_file = CACHE_DIR / f"{project_key}.mtime"
+    try:
+        cache_file.write_text(json.dumps(data, indent=2))
+        mtime_file.write_text(f"{mtime}:{transcript_mtime or ''}")
+        append_overview_history(project_key, data)
+    except OSError:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data collection (orchestrates probes + LLM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def collect_project_data(project_key, force_refresh=False, model=DEFAULT_MODEL):
+    """Collect all data for a project. Returns a data dict."""
+    proj = PROJECTS[project_key]
+    host = proj['host']
+    host_alias = HOSTS[host]['alias']
+    data = {
+        'key': project_key,
+        'project': proj,
+        'host_online': False,
+        'claude_md': None,
+        'claude_md_mtime': None,
+        'recent_files': [],
+        'git_log': [],
+        'services': {},
+        'llm_analysis': None,
+        'llm_cache_age': None,
+        'llm_error': None,
+    }
+
+    # Check host reachability
+    if not check_host_reachable(host_alias):
+        data['host_online'] = False
+        return data
+
+    data['host_online'] = True
+
+    # Parallel probes (including transcript)
+    tasks = {
+        'claude_md': lambda: probe_claude_md(host_alias, proj['path'], proj['claude_md']),
+        'recent_files': lambda: probe_recent_files(host_alias, proj['path']),
+        'git_log': lambda: probe_git_log(host_alias, proj['path']),
+    }
+
+    # Add transcript probe if claude_dir is configured
+    claude_dir = proj.get('claude_dir')
+    if claude_dir:
+        tasks['transcript'] = lambda: probe_transcript(host_alias, claude_dir)
+
+    # Load services from registry (projects.json)
+    service_list = load_services(project_key)
+
+    # Add service probes
+    for svc in service_list:
+        port = svc['port']
+        svc_key = f"svc_{port}"
+        tasks[svc_key] = lambda p=port: probe_service(host_alias, p)
+
+    results = run_parallel(tasks)
+
+    # Unpack results
+    if results.get('claude_md'):
+        data['claude_md'], data['claude_md_mtime'] = results['claude_md']
+
+    data['recent_files'] = results.get('recent_files', [])
+    data['git_log'] = results.get('git_log', [])
+    transcript = results.get('transcript', '')
+
+    # Get transcript file mtime for cache key
+    transcript_mtime = None
+    if transcript and claude_dir:
+        cmd = (f'find ~/.claude/projects/{claude_dir}/ -maxdepth 1 -name "*.jsonl" '
+               f'-printf "%T@\\n" 2>/dev/null | sort -rn | head -1')
+        ok, ts = ssh_cmd(host_alias, cmd, timeout=5)
+        if ok and ts.strip():
+            transcript_mtime = ts.strip().split('.')[0]  # integer seconds
+
+    # Store service list for rendering
+    data['service_list'] = service_list
+
+    for svc in service_list:
+        port = svc['port']
+        svc_key = f"svc_{port}"
+        data['services'][port] = results.get(svc_key, False)
+
+    # LLM analysis — run if ANY source material is available
+    has_sources = data['claude_md'] or data['recent_files'] or data['git_log'] or transcript
+    if has_sources:
+        # Fallback cache key when CLAUDE.md is absent: use git HEAD hash or timestamp
+        cache_mtime = data['claude_md_mtime']
+        if cache_mtime is None:
+            host_alias_for_cache = HOSTS[host]['alias']
+            ok, head = ssh_cmd(host_alias_for_cache,
+                               f'cd {proj["path"]} 2>/dev/null && git rev-parse HEAD 2>/dev/null',
+                               timeout=5)
+            cache_mtime = f"nogit-{int(time.time())}" if not ok or not head.strip() else f"git-{head.strip()}"
+
+        if not force_refresh:
+            cached, age = get_cached_analysis(project_key, cache_mtime,
+                                              transcript_mtime)
+            if cached:
+                data['llm_analysis'] = cached
+                data['llm_cache_age'] = age
+                return data
+
+        # Load research context if available
+        research_context = None
+        research_cache = RESEARCH_CACHE_DIR / f'{project_key}.json'
+        if research_cache.exists():
+            try:
+                rdata = json.loads(research_cache.read_text())
+                rlines = []
+                for item in rdata.get('high_relevance', [])[:3]:
+                    rlines.append(f"Paper [{item.get('score',0)}]: {item.get('title','')} — {item.get('reason','')}")
+                for item in rdata.get('releases', [])[:2]:
+                    rlines.append(f"Release [{item.get('score',0)}]: {item.get('title','')} — {item.get('reason','')}")
+                if rlines:
+                    research_context = '\n'.join(rlines)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Need fresh analysis — pass all sources (claude_md may be None)
+        with Spinner(f"Analyzing {proj['name']} with {model}..."):
+            analysis = query_ollama(
+                data['claude_md'],
+                recent_files=data['recent_files'],
+                git_log=data['git_log'],
+                transcript=transcript,
+                research_context=research_context,
+                model=model,
+            )
+
+        if analysis and validate_overview_analysis(analysis):
+            # RAG enrichment pass: use first-pass results to query doc RAG
+            # for richer context from indexed project documentation
+            ca_key = resolve_code_project(project_key)
+            ca_host = HUB_CONFIG['code_assistant']['host']
+            if ca_key and (ca_host == LOCAL_HOST or check_host_reachable(ca_host)):
+                first_pass = analysis  # save in case second pass fails
+                focus = analysis.get('current_focus', [])
+                phase = analysis.get('phase', '')
+                query_parts = [phase] + focus[:3]
+                rag_query = ' '.join(query_parts).strip()
+                if rag_query:
+                    rag_results = code_assistant_get('search', {
+                        'query': rag_query,
+                        'project': ca_key,
+                        'source_type': 'doc',
+                        'limit': 3,
+                    }, timeout=10)
+                    if rag_results and rag_results.get('results'):
+                        snippets = []
+                        for r in rag_results['results']:
+                            if r.get('score', 0) > 0.3:
+                                snippets.append(r.get('snippet', ''))
+                        if snippets:
+                            doc_context = '\n---\n'.join(snippets)
+                            with Spinner(f"Enriching {proj['name']} with indexed docs..."):
+                                enriched = query_ollama(
+                                    data['claude_md'],
+                                    recent_files=data['recent_files'],
+                                    git_log=data['git_log'],
+                                    transcript=transcript,
+                                    research_context=research_context,
+                                    doc_context=doc_context,
+                                    model=model,
+                                )
+                            if enriched and validate_overview_analysis(enriched):
+                                analysis = enriched
+                            # else: keep first_pass (already in analysis)
+
+            data['llm_analysis'] = analysis
+            data['llm_cache_age'] = 'just now'
+            save_cache(project_key, analysis, cache_mtime,
+                       transcript_mtime)
+        elif analysis:
+            data['llm_error'] = 'LLM returned malformed data (missing required keys)'
+        else:
+            data['llm_error'] = 'LLM analysis failed (timeout or parse error)'
+
+    return data
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Renderers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_summary_view(force_refresh=False, model=DEFAULT_MODEL):
+    """Render compact all-projects summary view."""
+    from datetime import datetime
+
+    # Check host reachability first (parallel)
+    host_status = {}
+    host_health = {}
+
+    def check_host(alias):
+        reachable = check_host_reachable(alias)
+        health = probe_machine_health(alias) if reachable else {}
+        return reachable, health
+
+    with Spinner("Probing infrastructure..."):
+        host_tasks = {}
+        for hkey, hinfo in HOSTS.items():
+            host_tasks[hkey] = lambda a=hinfo['alias']: check_host(a)
+        host_results = run_parallel(host_tasks)
+
+    for hkey, (reachable, health) in host_results.items():
+        host_status[hkey] = reachable
+        host_health[hkey] = health
+
+    # Probe last commit timestamps for all projects on online hosts (parallel)
+    activity_ts = {}
+    activity_tasks = {}
+    for pk in PROJECT_ORDER:
+        proj = PROJECTS[pk]
+        host = proj['host']
+        if host_status.get(host):
+            alias = HOSTS[host]['alias']
+            activity_tasks[pk] = lambda a=alias, p=proj['path']: probe_last_commit_ts(a, p)
+    if activity_tasks:
+        activity_ts = run_parallel(activity_tasks)
+
+    # Check Ollama on its configured host
+    ollama_up, ollama_models = False, []
+    if OLLAMA_HOST == LOCAL_HOST or host_status.get(OLLAMA_HOST):
+        ollama_up, ollama_models = probe_ollama_status(OLLAMA_HOST)
+
+    print()
+    header_bar()
+    now = datetime.now().strftime('%a %d %b %H:%M')
+    print_right(f"{BRIGHT_GREEN}  OPERATIONS OVERVIEW{RESET}", f"{BRIGHT_GREEN}{now}{RESET}")
+    header_bar()
+    print()
+
+    # Infrastructure
+    print(f"  {WHITE}INFRASTRUCTURE{RESET}")
+    divider()
+
+    # Local host
+    local_health = {}
+    try:
+        result = subprocess.run(['free', '-m'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'Mem:' in line:
+                    parts = line.split()
+                    local_health['ram_total'] = parts[1]
+                    local_health['ram_used'] = parts[2]
+        result = subprocess.run(['df', '-h', '/'], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            parts = result.stdout.strip().split('\n')[-1].split()
+            local_health['disk_used'] = parts[2]
+            local_health['disk_total'] = parts[1]
+    except Exception:
+        pass
+
+    local_info_parts = []
+    if local_health.get('ram_used'):
+        local_info_parts.append(f"{local_health['ram_used']}M/{local_health['ram_total']}M RAM")
+    if local_health.get('disk_used'):
+        local_info_parts.append(f"{local_health['disk_used']}/{local_health['disk_total']} disk")
+    local_name = HOSTS.get(LOCAL_HOST, {}).get('name', LOCAL_HOST)
+    local_info = ' | '.join(local_info_parts)
+    print(f"  {GREEN}●{RESET} {WHITE}{local_name}{RESET}  hub     | {local_info}")
+
+    # Remote hosts
+    for hkey in HOSTS:
+        if hkey == LOCAL_HOST:
+            continue
+        hname = HOSTS[hkey]['name']
+        is_wakeable = 'wakeable' in HOSTS[hkey].get('roles', [])
+        if host_status.get(hkey):
+            h = host_health.get(hkey, {})
+            parts = []
+            if h.get('ram_used'):
+                parts.append(f"{h['ram_used']}M/{h['ram_total']}M RAM")
+            if h.get('disk_used'):
+                parts.append(f"{h['disk_used']}/{h['disk_total']} disk")
+            if h.get('uptime'):
+                parts.append(h['uptime'])
+            # Show Ollama info on its host
+            if hkey == OLLAMA_HOST and ollama_up:
+                if ollama_models:
+                    parts.append(f"Ollama: {', '.join(ollama_models)}")
+                else:
+                    parts.append("Ollama: idle")
+            info = ' | '.join(parts)
+            print(f"  {GREEN}●{RESET} {WHITE}{hname}{RESET}  | {info}")
+        elif is_wakeable:
+            print(f"  {YELLOW}●{RESET} {WHITE}{hname}{RESET}  | {YELLOW}SUSPENDED{RESET}")
+        else:
+            print(f"  {RED}●{RESET} {WHITE}{hname}{RESET}  | {RED}OFFLINE{RESET}")
+
+    print()
+
+    # Services
+    print(f"  {WHITE}SERVICES{RESET}")
+    divider()
+
+    # Collect all services by host (dynamic)
+    for hkey in HOSTS:
+        if hkey == LOCAL_HOST or not host_status.get(hkey):
+            continue
+        host_services = []
+        for pk in PROJECT_ORDER:
+            p = PROJECTS[pk]
+            if p['host'] == hkey:
+                for svc in p['services']:
+                    host_services.append(svc)
+
+        if not host_services:
+            continue
+
+        svc_results = {}
+
+        def check_svc(alias, port):
+            return probe_service(alias, port)
+
+        svc_tasks = {}
+        alias = HOSTS[hkey]['alias']
+        for svc in host_services:
+            svc_tasks[svc['port']] = lambda a=alias, p=svc['port']: check_svc(a, p)
+        svc_results = run_parallel(svc_tasks)
+
+        line_parts = [f"  {HOSTS[hkey]['name'].upper()[:4]:4s}"]
+        for svc in host_services:
+            up = svc_results.get(svc['port'], False)
+            dot = f"{GREEN}●{RESET}" if up else f"{RED}●{RESET}"
+            line_parts.append(f" {dot} {svc['name']} :{svc['port']}")
+        print('  '.join(line_parts))
+
+    # Ollama
+    ollama_host_name = HOSTS.get(OLLAMA_HOST, {}).get('name', OLLAMA_HOST)
+    if (OLLAMA_HOST == LOCAL_HOST or host_status.get(OLLAMA_HOST)) and ollama_up:
+        print(f"  {ollama_host_name}   {GREEN}●{RESET} Ollama :{OLLAMA_PORT}")
+
+    print()
+
+    # Projects
+    print(f"{WHITE}  PROJECTS{RESET}")
+    print(f"{'═' * cols()}")
+    print()
+
+    any_missing_claude_md = False
+    for pk in PROJECT_ORDER:
+        proj = PROJECTS[pk]
+        host = proj['host']
+
+        if not host_status.get(host):
+            # Try local cache even when host is offline
+            cache_file = CACHE_DIR / f"{pk}.json"
+            cached_llm = None
+            cache_age_str = None
+            if cache_file.exists():
+                try:
+                    cached_llm = json.loads(cache_file.read_text())
+                    cache_age = time.time() - cache_file.stat().st_mtime
+                    if cache_age < 3600:
+                        cache_age_str = f"{int(cache_age / 60)}m ago"
+                    elif cache_age < 86400:
+                        cache_age_str = f"{int(cache_age / 3600)}h ago"
+                    else:
+                        cache_age_str = f"{int(cache_age / 86400)}d ago"
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            print(f"  {CYAN}{proj['name']}{RESET} {GRAY}| {HOSTS[host]['name']} | {proj['path']}{RESET}")
+            divider()
+            if host == 'ws':
+                print(f"  {YELLOW}● SUSPENDED{RESET} — run {WHITE}wake-ws{RESET} to access")
+            else:
+                print(f"  {RED}● OFFLINE{RESET}")
+
+            if cached_llm:
+                print(f"  {GRAY}(cached {cache_age_str}){RESET}")
+                phase = cached_llm.get('phase', '')
+                status = cached_llm.get('status_summary', '')
+                if phase:
+                    print(f"  {WHITE}Phase:{RESET}  {phase}")
+                if status:
+                    print(f"  {WHITE}Status:{RESET} {status}")
+                focus = cached_llm.get('current_focus', [])
+                if focus:
+                    print()
+                    print(f"  {WHITE}Current focus:{RESET}")
+                    for item in focus[:3]:
+                        print(f"    {GREEN}▸{RESET} {item}")
+
+            print()
+            thin_divider()
+            print()
+            continue
+
+        # Get CLAUDE.md and check cache for LLM data
+        host_alias = HOSTS[host]['alias']
+        content, mtime = probe_claude_md(host_alias, proj['path'], proj['claude_md'])
+
+        # Fallback cache key when no CLAUDE.md
+        cache_mtime = mtime
+        if cache_mtime is None:
+            ok, head = ssh_cmd(host_alias,
+                               f'cd {proj["path"]} 2>/dev/null && git rev-parse HEAD 2>/dev/null',
+                               timeout=5)
+            cache_mtime = f"git-{head.strip()}" if ok and head.strip() else None
+
+        llm_data = None
+        if content is None:
+            any_missing_claude_md = True
+
+        # Try cache first (works with or without CLAUDE.md)
+        if cache_mtime:
+            cached, _ = get_cached_analysis(pk, cache_mtime)
+            if cached:
+                llm_data = cached
+
+        # Force refresh: run full collection pipeline
+        if not llm_data and force_refresh:
+            data = collect_project_data(pk, force_refresh=True, model=model)
+            llm_data = data.get('llm_analysis')
+
+        # Project header with activity indicator
+        act_ts = activity_ts.get(pk)
+        act_str = f" | {format_activity_age(act_ts)}{GRAY}" if act_ts else ""
+        print(f"  {CYAN}{proj['name']}{RESET} {GRAY}| {HOSTS[host]['name']} | {proj['path']}{act_str}{RESET}")
+        divider()
+
+        if llm_data:
+            phase = llm_data.get('phase', '')
+            status = llm_data.get('status_summary', '')
+            if phase:
+                print(f"  {WHITE}Phase:{RESET}  {phase}")
+            if status:
+                print(f"  {WHITE}Status:{RESET} {status}")
+
+            focus = llm_data.get('current_focus', [])
+            if focus:
+                print()
+                print(f"  {WHITE}Current focus:{RESET}")
+                for item in focus[:3]:
+                    print(f"    {GREEN}▸{RESET} {item}")
+
+            metrics = llm_data.get('key_metrics', {})
+            if metrics:
+                parts = [f"{k}: {v}" for k, v in list(metrics.items())[:4]]
+                print(f"\n  {WHITE}Key metrics:{RESET}  {'  |  '.join(parts)}")
+        else:
+            print(f"  {proj['tagline']}")
+            # Show git log as fallback
+            commits = probe_git_log(host_alias, proj['path'], 2)
+            if commits:
+                print(f"  {WHITE}Recent:{RESET} {commits[0]}")
+
+        print()
+        thin_divider()
+        print()
+
+    # Footer
+    header_bar()
+    if any_missing_claude_md:
+        source_parts = ["Source: live probes (some projects lack CLAUDE.md)"]
+    else:
+        source_parts = ["Source: CLAUDE.md + live probes"]
+    if ollama_up:
+        source_parts.append("Ollama AGX: active")
+    print(f"{GRAY}  {'  |  '.join(source_parts)}{RESET}")
+    header_bar()
+
+
+def render_deep_view(project_key, force_refresh=False, show_raw=False, model=DEFAULT_MODEL):
+    """Render deep single-project view."""
+    from datetime import datetime
+
+    proj = PROJECTS[project_key]
+    host_alias = HOSTS[proj['host']]['alias']
+
+    with Spinner(f"Collecting data for {proj['name']}..."):
+        data = collect_project_data(project_key, force_refresh=force_refresh, model=model)
+
+    if show_raw and data.get('llm_analysis'):
+        print(json.dumps(data['llm_analysis'], indent=2))
+        return
+    elif show_raw:
+        print(f"{RED}No LLM analysis available.{RESET}")
+        if data.get('llm_error'):
+            print(f"{GRAY}{data['llm_error']}{RESET}")
+        return
+
+    # If host is offline, try loading cached analysis before giving up
+    if not data['host_online'] and not data.get('llm_analysis'):
+        cache_file = CACHE_DIR / f"{project_key}.json"
+        if cache_file.exists():
+            try:
+                data['llm_analysis'] = json.loads(cache_file.read_text())
+                cache_age = time.time() - cache_file.stat().st_mtime
+                if cache_age < 3600:
+                    data['llm_cache_age'] = f"{int(cache_age / 60)}m ago"
+                elif cache_age < 86400:
+                    data['llm_cache_age'] = f"{int(cache_age / 3600)}h ago"
+                else:
+                    data['llm_cache_age'] = f"{int(cache_age / 86400)}d ago"
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    print()
+    header_bar()
+    now = datetime.now().strftime('%a %d %b %H:%M')
+    print_right(f"{BRIGHT_GREEN}  {proj['name']}{RESET}", f"{BRIGHT_GREEN}{now}{RESET}")
+    print(f"  {DIM}{proj['tagline']} | {HOSTS[proj['host']]['name']} | {proj['path']}{RESET}")
+    header_bar()
+    print()
+
+    if not data['host_online'] and not data.get('llm_analysis'):
+        print(f"  {host_offline_msg(proj['host'], project_key)}")
+        print()
+        header_bar()
+        return
+
+    if not data['host_online']:
+        print(f"  {YELLOW}● {HOSTS[proj['host']]['name']} offline — showing cached data ({data.get('llm_cache_age', '?')}){RESET}")
+        print()
+
+    if data['host_online'] and data['claude_md'] is None:
+        print(f"  {DIM}ℹ No CLAUDE.md — analysis from git + files only. Create one for richer context.{RESET}")
+        print()
+
+    llm = data.get('llm_analysis') or {}
+
+    # Phase & Status
+    phase = llm.get('phase', '')
+    status = llm.get('status_summary', '')
+    if phase or status:
+        print(f"  {WHITE}PHASE & STATUS{RESET}")
+        divider()
+        if phase:
+            print(f"  {WHITE}Phase:{RESET}   {phase}")
+        if status:
+            print(f"  {WHITE}Status:{RESET}  {status}")
+        print()
+
+    # Current Focus
+    focus = llm.get('current_focus', [])
+    if focus:
+        print(f"  {WHITE}CURRENT FOCUS{RESET}")
+        divider()
+        for item in focus:
+            print(f"    {GREEN}▸{RESET} {item}")
+        print()
+
+    # Blockers (with persistence annotations from timeline journal)
+    blockers = llm.get('blockers', [])
+    if blockers:
+        print(f"  {WHITE}BLOCKERS & CONSTRAINTS{RESET}")
+        divider()
+        blocker_ages = get_blocker_ages(project_key)
+        for item in blockers:
+            age_info = blocker_ages.get(item)
+            if age_info and age_info['sessions'] > 1:
+                days = int((time.time() - age_info['first_seen_ts']) / 86400)
+                age_label = f"{days}d" if days > 0 else "today"
+                tag = f" {GRAY}(persistent \u2014 {age_info['sessions']} sessions, {age_label}){RESET}"
+            elif age_info:
+                tag = f" {GRAY}(new this session){RESET}"
+            else:
+                tag = ''
+            print(f"    {YELLOW}\u25b8{RESET} {item}{tag}")
+        print()
+
+    # Key Metrics
+    metrics = llm.get('key_metrics', {})
+    if metrics:
+        print(f"  {WHITE}KEY METRICS{RESET}")
+        divider()
+        for k, v in metrics.items():
+            print(f"  {WHITE}{k}:{RESET}  {v}")
+        print()
+
+    # Recent Breakthroughs
+    breakthroughs = llm.get('recent_breakthroughs', [])
+    if breakthroughs:
+        print(f"  {WHITE}RECENT BREAKTHROUGHS{RESET}")
+        divider()
+        for item in breakthroughs:
+            print(f"    {CYAN}▸{RESET} {item}")
+        print()
+
+    # Architecture Diagram
+    if project_key in DIAGRAMS:
+        print(f"  {WHITE}ARCHITECTURE{RESET}")
+        divider()
+        print()
+        print(DIAGRAMS[project_key])
+        print()
+
+    # Architecture Summary (from LLM)
+    arch_summary = llm.get('architecture_summary', '')
+    if arch_summary:
+        print(f"  {WHITE}Architecture summary:{RESET}")
+        # Word-wrap the summary
+        words = arch_summary.split()
+        line = '  '
+        for word in words:
+            if len(line) + len(word) + 1 > cols() - 4:
+                print(line)
+                line = '  ' + word
+            else:
+                line += ' ' + word if line.strip() else '  ' + word
+        if line.strip():
+            print(line)
+        print()
+
+    # Services (from projects.json registry)
+    svc_list = data.get('service_list', proj['services'])
+    if svc_list:
+        print(f"  {WHITE}SERVICES{RESET}")
+        divider()
+        running = 0
+        for svc in svc_list:
+            up = data['services'].get(svc['port'], False)
+            if up:
+                running += 1
+            dot = f"{GREEN}●{RESET}" if up else f"{RED}●{RESET}"
+            print(f"  {dot} {svc['name']}  :{svc['port']}")
+        print(f"  {GRAY}Environment: {running}/{len(svc_list)} services running{RESET}")
+        print()
+
+    # Tech Stack
+    tech = llm.get('tech_stack', [])
+    if tech:
+        print(f"  {WHITE}TECH STACK{RESET}")
+        divider()
+        print(f"  {', '.join(tech)}")
+        print()
+
+    # Recent Activity
+    if data['recent_files']:
+        print(f"  {WHITE}RECENT ACTIVITY{RESET} {GRAY}(last session){RESET}")
+        divider()
+        # Group by directory
+        dirs = {}
+        for f in data['recent_files']:
+            parts = f.split('/')
+            if len(parts) > 1:
+                d = parts[0]
+            else:
+                d = '.'
+            dirs.setdefault(d, []).append(f)
+
+        for d in sorted(dirs.keys())[:8]:
+            files = dirs[d]
+            if d == '.':
+                for f in files[:3]:
+                    print(f"    {GREEN}▸{RESET} {f}")
+            else:
+                file_names = [f.split('/', 1)[-1] if '/' in f else f for f in files[:4]]
+                extra = f" +{len(files) - 4} more" if len(files) > 4 else ""
+                print(f"    {GREEN}▸{RESET} {d}/  {', '.join(file_names)}{extra}")
+        print()
+
+    # Recent Commits
+    if data['git_log']:
+        print(f"  {WHITE}RECENT COMMITS{RESET}")
+        divider()
+        for commit in data['git_log'][:5]:
+            print(f"    {DIM}{commit}{RESET}")
+        print()
+
+    # Connections
+    connections = llm.get('connections', [])
+    if connections:
+        print(f"  {WHITE}CONNECTIONS TO OTHER PROJECTS{RESET}")
+        divider()
+        for conn in connections:
+            print(f"    {CYAN}▸{RESET} {conn}")
+        print()
+
+    # Recent Decisions
+    decisions = read_decisions(project_key, limit=5)
+    if decisions:
+        from datetime import datetime as _dt
+        cat_colors = {
+            'architecture': CYAN, 'tooling': GREEN, 'design': WHITE,
+            'performance': YELLOW, 'abandoned': RED,
+        }
+        print(f"  {WHITE}RECENT DECISIONS{RESET}")
+        divider()
+        for d in decisions:
+            cat = d.get('category', 'design')
+            color = cat_colors.get(cat, GRAY)
+            ts = d.get('ts', 0)
+            date_str = _dt.fromtimestamp(ts).strftime('%b %d') if ts else ''
+            print(f"    {color}[{cat}]{RESET} {d.get('description', '')}  {GRAY}{date_str}{RESET}")
+        print()
+
+    # Research Context (from research cache — fails silently if missing)
+    research_cache = RESEARCH_CACHE_DIR / f'{project_key}.json'
+    if research_cache.exists():
+        try:
+            rdata = json.loads(research_cache.read_text())
+            r_papers = rdata.get('high_relevance', [])[:3]
+            r_releases = rdata.get('releases', [])[:3]
+            if r_papers or r_releases:
+                print(f"  {WHITE}RESEARCH CONTEXT{RESET}")
+                divider()
+                for item in r_papers:
+                    score = item.get('score', 0)
+                    age = item.get('age_days', 0)
+                    score_color = f"{GREEN}" if score >= 8 else f"{YELLOW}"
+                    age_color = f"{WHITE}" if age <= 7 else f"{GRAY}"
+                    age_label = f"{age}d" if age > 0 else "today"
+                    print(f"    {score_color}[{score:2d}]{RESET} {age_color}{item.get('title', '')[:65]}{RESET} {GRAY}({age_label}){RESET}")
+                    reason = item.get('reason', '')
+                    if reason:
+                        print(f"         {DIM}{reason}{RESET}")
+                for item in r_releases:
+                    score = item.get('score', 0)
+                    score_color = f"{GREEN}" if score >= 8 else f"{YELLOW}"
+                    print(f"    {score_color}[{score:2d}]{RESET} {CYAN}↑{RESET} {item.get('title', '')[:65]}")
+                    reason = item.get('reason', '')
+                    if reason:
+                        print(f"         {DIM}{reason}{RESET}")
+                print()
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Key Entry Points
+    entry_points = llm.get('entry_points', {})
+    if entry_points:
+        print(f"  {WHITE}KEY ENTRY POINTS{RESET}")
+        divider()
+        for label, path in entry_points.items():
+            print(f"  {GRAY}{label:12s}{RESET} {path}")
+        print()
+
+    # Footer
+    header_bar()
+    footer_parts = []
+    if data.get('llm_cache_age'):
+        footer_parts.append(f"LLM cache: {data['llm_cache_age']}")
+    if data.get('llm_error'):
+        footer_parts.append(f"LLM: {data['llm_error']}")
+    footer_parts.append(f"Model: {model}")
+    if data['claude_md'] is None:
+        footer_parts.append("Source: git + files (no CLAUDE.md)")
+    else:
+        footer_parts.append("Source: CLAUDE.md + live probes")
+    print(f"{GRAY}  {'  |  '.join(footer_parts)}{RESET}")
+    header_bar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Watch Mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_change_fingerprint(host_reachable):
+    """Lightweight SSH probes to detect changes. Returns a fingerprint string.
+
+    Checks git HEAD hash + newest transcript mtime per project, all in parallel.
+    """
+    parts = []
+
+    def probe_project(key):
+        proj = PROJECTS[key]
+        host = proj['host']
+        if not host_reachable.get(host):
+            return f"{key}:offline"
+        alias = HOSTS[host]['alias']
+        claude_dir = proj.get('claude_dir', '')
+        cmd = (
+            f'cd {proj["path"]} 2>/dev/null && git rev-parse --short HEAD 2>/dev/null; '
+            f'find ~/.claude/projects/{claude_dir}/ -maxdepth 1 -name "*.jsonl" '
+            f'-printf "%T@\\n" 2>/dev/null | sort -rn | head -1'
+        )
+        ok, output = ssh_cmd(alias, cmd, timeout=8)
+        return f"{key}:{output}" if ok else f"{key}:err"
+
+    tasks = {k: lambda pk=k: probe_project(pk) for k in PROJECT_ORDER}
+    results = run_parallel(tasks)
+
+    for k in PROJECT_ORDER:
+        parts.append(results.get(k, f'{k}:none'))
+
+    return '|'.join(parts)
+
+
+def watch_loop(interval_minutes, force_refresh, model):
+    """Continuous refresh loop. Clears screen and re-renders on changes."""
+    import signal
+
+    interval_secs = max(60, interval_minutes * 60)
+    last_fingerprint = None
+
+    # Restore cursor on exit
+    def cleanup(*_):
+        sys.stderr.write('\033[?25h')  # Show cursor
+        sys.stderr.flush()
+        print(f"\n{GRAY}Watch stopped.{RESET}")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    try:
+        while True:
+            # Check host reachability
+            host_reachable = run_parallel({
+                h: lambda a=HOSTS[h]['alias']: check_host_reachable(a)
+                for h in HOSTS
+            })
+
+            # Get fingerprint
+            fingerprint = get_change_fingerprint(host_reachable)
+
+            if fingerprint != last_fingerprint or force_refresh:
+                # Clear screen and render
+                sys.stdout.write('\033[2J\033[H')
+                sys.stdout.flush()
+                render_summary_view(force_refresh=force_refresh, model=model)
+                print(f"\n{GRAY}  Watch mode — refreshing every {interval_minutes}m | Ctrl+C to stop{RESET}")
+                last_fingerprint = fingerprint
+                # Only force refresh on first run
+                force_refresh = False
+
+            # Countdown timer
+            sys.stderr.write('\033[?25l')  # Hide cursor
+            remaining = interval_secs
+            while remaining > 0:
+                mins, secs = divmod(remaining, 60)
+                sys.stderr.write(f"\r{GRAY}  Next check in {mins:02d}:{secs:02d}{RESET} ")
+                sys.stderr.flush()
+                time.sleep(1)
+                remaining -= 1
+            sys.stderr.write(f"\r{' ' * 30}\r")
+            sys.stderr.flush()
+            sys.stderr.write('\033[?25h')  # Show cursor
+
+    except KeyboardInterrupt:
+        cleanup()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_usage():
+    print(f"""
+{WHITE}overview{RESET} — Context-aware project overview tool
+
+{WHITE}Usage:{RESET}
+  overview                        All projects summary (compact view)
+  overview <project>              Deep view of a specific project
+  overview <project> --refresh    Force re-analysis (bypass cache)
+  overview <project> --raw        Show raw LLM JSON (debug)
+  overview --refresh              Force re-analysis for all
+  overview --model <name>         Use specific Ollama model
+  overview --watch               Continuous refresh (every 5 minutes)
+  overview --watch --interval 2  Custom interval in minutes
+
+{WHITE}Projects:{RESET}
+  prometheus   PROMETHEUS-MIND      (AGX)
+  speech       SPEECH-AI            (AGX)
+  pipeline     ENRICHMENT PIPELINE  (AGX)
+  aiquest      AIQUEST              (WS)
+  presentatie  AI-PRESENTATIE       (WS)
+  learnlocal   LEARNLOCAL           (WS)
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args:
+        print_usage()
+        sys.exit(0)
+
+    # Parse flags
+    force_refresh = '--refresh' in args
+    show_raw = '--raw' in args
+    watch_mode = '--watch' in args
+    model = DEFAULT_MODEL
+    watch_interval = 5  # default minutes
+
+    # Remove flags from args
+    clean_args = []
+    skip_next = False
+    for i, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ('--refresh', '--raw', '--watch'):
+            continue
+        if arg == '--model':
+            if i + 1 < len(args):
+                model = args[i + 1]
+                skip_next = True
+            continue
+        if arg == '--interval':
+            if i + 1 < len(args):
+                try:
+                    watch_interval = int(args[i + 1])
+                except ValueError:
+                    pass
+                skip_next = True
+            continue
+        clean_args.append(arg)
+
+    ensure_cache_dir()
+
+    if watch_mode:
+        watch_loop(watch_interval, force_refresh, model)
+        return
+
+    if not clean_args:
+        # Summary view
+        render_summary_view(force_refresh=force_refresh, model=model)
+    else:
+        project_key = resolve_project(clean_args[0])
+        if not project_key:
+            sys.exit(1)
+        render_deep_view(project_key, force_refresh=force_refresh,
+                         show_raw=show_raw, model=model)
+
+
+if __name__ == '__main__':
+    main()

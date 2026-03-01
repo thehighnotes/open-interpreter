@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""prepare — Smart prepare tool for the Orin Nano hub.
+
+Ensures a project's host is reachable, warms Ollama (AGX projects),
+and refreshes the overview cache so begin/work have fresh context.
+
+Usage:
+    prepare <project>              Full prepare flow
+    prepare <project> --no-wake    Skip WoL, just report if suspended
+    prepare --help
+"""
+
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import *
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def send_wol(mac_address):
+    """Send Wake-on-LAN magic packet to the given MAC address."""
+    try:
+        subprocess.run(['wakeonlan', mac_address], capture_output=True, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+def poll_until_ssh(host_alias, max_wait=120, interval=5):
+    """Poll SSH until host responds. Returns True if reachable within max_wait."""
+    elapsed = 0
+    while elapsed < max_wait:
+        sys.stderr.write(f"\r{CYAN}⠼{RESET} Waiting for {host_alias}... {elapsed}s/{max_wait}s")
+        sys.stderr.flush()
+        if check_host_reachable(host_alias):
+            sys.stderr.write(f"\r{' ' * 60}\r")
+            sys.stderr.flush()
+            return True
+        time.sleep(interval)
+        elapsed += interval
+    sys.stderr.write(f"\r{' ' * 60}\r")
+    sys.stderr.flush()
+    return False
+
+
+def warmup_ollama_bg():
+    """Fire-and-forget Ollama warmup request to load model into memory."""
+    cmd = (
+        f"curl -s --max-time 30 http://localhost:{OLLAMA_PORT}/api/chat "
+        f"-d '{{\"model\":\"{DEFAULT_MODEL}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"stream\":false}}' "
+        "> /dev/null 2>&1"
+    )
+    if OLLAMA_HOST == LOCAL_HOST:
+        try:
+            subprocess.Popen(
+                ['bash', '-c', cmd],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            subprocess.Popen(
+                ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                 '-o', 'StrictHostKeyChecking=no', OLLAMA_HOST, cmd],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
+
+
+def refresh_cache(project_key):
+    """Run overview --refresh for a project. Returns True on success."""
+    return refresh_overview_cache(project_key)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main flow
+# ─────────────────────────────────────────────────────────────────────────────
+
+def prepare(project_key, no_wake=False):
+    """Full prepare flow for a project."""
+    proj = PROJECTS[project_key]
+    host_key = proj['host']
+    host = HOSTS[host_key]
+    host_alias = host['alias']
+
+    print()
+    header_bar()
+    print(f"{BRIGHT_GREEN}  PREPARE — {proj['name']}{RESET}")
+    header_bar()
+    print()
+
+    # Step 1: Check host reachability
+    print(f"  {WHITE}[1/4]{RESET} Checking {host['name']}...")
+
+    if not check_host_reachable(host_alias):
+        # Check if this host is wakeable (has WoL MAC)
+        wol_mac = find_wakeable_host(host_key)
+        if wol_mac:
+            if no_wake:
+                print(f"  {YELLOW}● {host['name']} is suspended{RESET}")
+                print(f"  {GRAY}Use {WHITE}prepare {project_key}{GRAY} (without --no-wake) to send WoL{RESET}")
+                sys.exit(1)
+
+            print(f"  {YELLOW}● {host['name']} is suspended — sending WoL...{RESET}")
+            if not send_wol(wol_mac):
+                print(f"  {RED}● Failed to send WoL packet{RESET}")
+                sys.exit(1)
+
+            print(f"  {CYAN}● WoL sent to {wol_mac}{RESET}")
+            if not poll_until_ssh(host_alias, max_wait=120, interval=5):
+                print(f"  {RED}● {host['name']} did not come online within 120s{RESET}")
+                sys.exit(1)
+
+            print(f"  {GREEN}● {host['name']} is online{RESET}")
+        else:
+            print(f"  {host_offline_msg(host_key)}")
+            sys.exit(1)
+    else:
+        print(f"  {GREEN}● {host['name']} is online{RESET}")
+
+    # Step 2: Warm Ollama
+    print(f"  {WHITE}[2/4]{RESET} Warming up...")
+
+    ollama_host_name = HOSTS.get(OLLAMA_HOST, {}).get('name', OLLAMA_HOST)
+    if host_key == OLLAMA_HOST:
+        warmup_ollama_bg()
+        print(f"  {GREEN}● Ollama warmup sent (background){RESET}")
+    elif OLLAMA_HOST == LOCAL_HOST:
+        warmup_ollama_bg()
+        print(f"  {GREEN}● Ollama warmup sent locally (background){RESET}")
+    else:
+        if check_host_reachable(OLLAMA_HOST):
+            warmup_ollama_bg()
+            print(f"  {GREEN}● Ollama warmup sent to {ollama_host_name} (background){RESET}")
+        else:
+            print(f"  {GRAY}● Skipped Ollama warmup ({ollama_host_name} offline){RESET}")
+
+    # Step 3: Ensure environment (services from registry)
+    print(f"  {WHITE}[3/4]{RESET} Ensuring environment...")
+
+    services = load_services(project_key)
+
+    if services:
+        started = 0
+        already_up = 0
+        for svc in services:
+            port = svc['port']
+            if probe_service(host_alias, port, timeout=3):
+                print(f"  {GREEN}●{RESET} {svc['name']} :{port} already running")
+                already_up += 1
+            elif svc.get('start_cmd'):
+                print(f"  {CYAN}●{RESET} Starting {svc['name']}...")
+                start_service(host_alias, proj['path'], svc)
+                if wait_for_ready(host_alias, port, timeout=30):
+                    print(f"  {GREEN}●{RESET} {svc['name']} :{port} ready")
+                    started += 1
+                else:
+                    print(f"  {YELLOW}●{RESET} {svc['name']} :{port} not responding after 30s")
+            else:
+                print(f"  {GRAY}●{RESET} {svc['name']} :{port} no start command")
+        total = already_up + started
+        print(f"  {GREEN}●{RESET} Environment: {total}/{len(services)} services running")
+    else:
+        print(f"  {GRAY}● No services configured{RESET}")
+
+    # Start enabled dev services
+    dev_services = load_dev_services(project_key, enabled_only=True)
+    if dev_services:
+        dev_started = 0
+        dev_already = 0
+        for ds in dev_services:
+            port = ds['port']
+            if probe_service(host_alias, port, timeout=3):
+                print(f"  {GREEN}●{RESET} {ds['name']} :{port} already running {GRAY}(dev){RESET}")
+                dev_already += 1
+            elif ds.get('dev_cmd'):
+                print(f"  {CYAN}●{RESET} Starting {ds['name']}... {GRAY}(dev){RESET}")
+                start_dev_service(host_alias, proj['path'], ds)
+                if wait_for_ready(host_alias, port, timeout=30):
+                    print(f"  {GREEN}●{RESET} {ds['name']} :{port} ready {GRAY}(dev){RESET}")
+                    dev_started += 1
+                else:
+                    print(f"  {YELLOW}●{RESET} {ds['name']} :{port} not responding after 30s")
+        dev_total = dev_already + dev_started
+        print(f"  {GREEN}●{RESET} Dev services: {dev_total}/{len(dev_services)} running")
+
+    # Step 4: Close previous session + refresh cache + diff state
+    print(f"  {WHITE}[4/4]{RESET} Refreshing overview cache...")
+
+    # 4a: Close previous session if one is open
+    closed = close_previous_session(project_key,
+        log_fn=lambda msg: print(f"  {GREEN}●{RESET} {msg}"))
+    if closed:
+        print(f"  {GREEN}● Previous session closed{RESET}")
+
+    # 4b: Read cache before refresh
+    cache_before = None
+    cache_file = OVERVIEW_CACHE_DIR / f'{project_key}.json'
+    if cache_file.exists():
+        try:
+            cache_before = json.loads(cache_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 4c: Refresh
+    with Spinner(f"Analyzing {proj['name']}..."):
+        ok = refresh_cache(project_key)
+
+    if ok:
+        print(f"  {GREEN}● Overview cache refreshed{RESET}")
+    else:
+        print(f"  {YELLOW}● Cache refresh failed (overview may use stale data){RESET}")
+
+    # 4d: Read cache after refresh and diff
+    if ok and cache_before:
+        cache_after = None
+        try:
+            cache_after = json.loads(cache_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+        if cache_after:
+            events = diff_overview_states(cache_before, cache_after)
+            if events:
+                append_journal(project_key, events)
+                print(f"  {GREEN}●{RESET} Journal: {len(events)} state transition(s) recorded")
+
+    # 4e: Extract decisions from transcript
+    if ok:
+        with Spinner("Extracting decisions from transcript..."):
+            new_decisions = extract_decisions_from_transcript(project_key)
+        if new_decisions:
+            for d in new_decisions:
+                cat_label = d.get('category', 'design')
+                print(f"  {GREEN}●{RESET} Decision: [{cat_label}] {d.get('description', '')}")
+        else:
+            print(f"  {GRAY}● No new decisions found{RESET}")
+
+    # 4f: Refresh code pulse (for indexed projects)
+    ca_key = resolve_code_project(project_key)
+    if ca_key:
+        if check_code_assistant():
+            # Get graph stats + focus-area search
+            focus_terms = None
+            if ok:
+                try:
+                    focus_terms = json.loads(cache_file.read_text()).get('current_focus', [])
+                except (json.JSONDecodeError, OSError):
+                    pass
+            with Spinner("Fetching code pulse..."):
+                pulse = {'project': ca_key, 'ts': time.time()}
+                stats = code_assistant_get('graph/stats', {'project': ca_key}, timeout=5)
+                if stats:
+                    pulse['graph'] = stats
+                if focus_terms:
+                    pulse['focus_hits'] = {}
+                    for term in focus_terms[:2]:
+                        results = code_assistant_get('search',
+                            {'query': term, 'project': ca_key, 'limit': 3}, timeout=10)
+                        if results and results.get('results'):
+                            pulse['focus_hits'][term] = results['results']
+                ensure_dir(CODE_CACHE_DIR)
+                (CODE_CACHE_DIR / f'{project_key}_pulse.json').write_text(
+                    json.dumps(pulse, indent=2))
+            print(f"  {GREEN}● Code pulse refreshed{RESET}")
+        else:
+            print(f"  {GRAY}● Code pulse skipped (Code Assistant offline){RESET}")
+
+    print()
+    header_bar()
+    print(f"{GRAY}  Ready — run {WHITE}begin {project_key}{GRAY} or {WHITE}work {project_key}{GRAY} to start{RESET}")
+    header_bar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_usage():
+    print(f"""
+{WHITE}prepare{RESET} — Smart prepare tool
+
+{WHITE}Usage:{RESET}
+  prepare <project>              Full prepare flow
+  prepare <project> --no-wake    Skip WoL, just report if suspended
+
+{WHITE}What it does:{RESET}
+  1. Checks host reachability (sends WoL for WS if suspended)
+  2. Warms Ollama on AGX (loads model into memory)
+  3. Ensures environment (services from registry started and ready)
+  4. Refreshes overview cache (fresh context for begin)
+
+{WHITE}Projects:{RESET}
+  {', '.join(PROJECT_ORDER) if PROJECT_ORDER else '(none — run hub --scan first)'}
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args or not args:
+        print_usage()
+        sys.exit(0)
+
+    no_wake = '--no-wake' in args
+    clean_args = [a for a in args if a != '--no-wake']
+
+    if not clean_args:
+        print_usage()
+        sys.exit(1)
+
+    project_key = resolve_project(clean_args[0])
+    if not project_key:
+        sys.exit(1)
+
+    prepare(project_key, no_wake=no_wake)
+
+
+if __name__ == '__main__':
+    main()

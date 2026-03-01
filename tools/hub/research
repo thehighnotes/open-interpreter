@@ -1,0 +1,962 @@
+#!/usr/bin/env python3
+"""research — Continuous researcher for the Orin Nano hub.
+
+Monitors arxiv papers and GitHub releases, scores relevance against each
+project using Ollama on AGX informed by cached overview data, and surfaces
+findings inside the existing overview ecosystem.
+
+Usage:
+    research                     All projects' research digests
+    research <project>           Detailed view for one project
+    research --fetch             Fetch + score (cron mode)
+    research --calibrate         Score test items, show threshold matrix
+    research --status            Fetch state, item counts, source health
+    research --help
+"""
+
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path.home()))
+from hub_common import *
+
+CACHE_DIR = RESEARCH_CACHE_DIR
+# DEFAULT_MODEL is imported from hub_common (config-derived)
+
+# Scoring threshold — items below this are not shown in digests
+RELEVANCE_THRESHOLD = 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# arxiv configuration
+# ─────────────────────────────────────────────────────────────────────────────
+ARXIV_CATEGORIES = ['eess.AS', 'cs.SD', 'cs.CL', 'cs.LG', 'cs.AI']
+ARXIV_KEYWORDS = [
+    'TTS', 'speech', 'synthesis', 'voice', 'vocoder',
+    'transformer', 'memory', 'attention', 'inference', 'embedding',
+    'knowledge graph', 'continual learning', 'curriculum',
+    'interactive', 'tutorial',
+]
+ARXIV_MAX_RESULTS = 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GitHub repos to track
+# ─────────────────────────────────────────────────────────────────────────────
+GITHUB_REPOS = [
+    'NVIDIA/TensorRT',
+    'ollama/ollama',
+    'pytorch/pytorch',
+    'ggml-org/llama.cpp',
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache management
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensure_cache_dir():
+    ensure_dir(CACHE_DIR)
+
+
+def load_items():
+    """Load all scored items from cache. Returns dict with 'items' list."""
+    items_file = CACHE_DIR / 'items.json'
+    if not items_file.exists():
+        return {'version': 1, 'last_fetch': None, 'items': []}
+    try:
+        return json.loads(items_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {'version': 1, 'last_fetch': None, 'items': []}
+
+
+def save_items(data):
+    """Save all scored items to cache."""
+    ensure_cache_dir()
+    items_file = CACHE_DIR / 'items.json'
+    items_file.write_text(json.dumps(data, indent=2))
+
+
+def load_state():
+    """Load fetch state (deduplication + timestamps). Returns dict."""
+    state_file = CACHE_DIR / 'state.json'
+    if not state_file.exists():
+        return {'arxiv_last_fetch': None, 'github_last_fetch': {}, 'known_ids': []}
+    try:
+        return json.loads(state_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {'arxiv_last_fetch': None, 'github_last_fetch': {}, 'known_ids': []}
+
+
+def save_state(state):
+    """Save fetch state."""
+    ensure_cache_dir()
+    state_file = CACHE_DIR / 'state.json'
+    state_file.write_text(json.dumps(state, indent=2))
+
+
+def generate_digests(items_data):
+    """Generate per-project digest JSON files from scored items."""
+    ensure_cache_dir()
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+
+    for pk in PROJECT_ORDER:
+        high_relevance = []
+        releases = []
+
+        for item in items_data.get('items', []):
+            scores = item.get('scores', {})
+            proj_score = scores.get(pk, {})
+            score_val = proj_score.get('score', 0)
+
+            if score_val < RELEVANCE_THRESHOLD:
+                continue
+
+            # Calculate age
+            try:
+                pub_date = datetime.strptime(item['published'], '%Y-%m-%d')
+                age_days = (datetime.now() - pub_date).days
+            except (ValueError, KeyError):
+                age_days = 0
+
+            entry = {
+                'title': item.get('title', ''),
+                'url': item.get('url', ''),
+                'source': item.get('source', ''),
+                'published': item.get('published', ''),
+                'score': score_val,
+                'reason': proj_score.get('reason', ''),
+                'age_days': age_days,
+            }
+
+            if item.get('source') == 'github':
+                releases.append(entry)
+            else:
+                high_relevance.append(entry)
+
+        # Sort by score descending
+        high_relevance.sort(key=lambda x: x['score'], reverse=True)
+        releases.sort(key=lambda x: x['score'], reverse=True)
+
+        # Build summary
+        paper_count = len(high_relevance)
+        release_count = len(releases)
+        summary_parts = []
+        if paper_count:
+            summary_parts.append(f"{paper_count} relevant paper{'s' if paper_count != 1 else ''}")
+        if release_count:
+            summary_parts.append(f"{release_count} tracked release{'s' if release_count != 1 else ''}")
+        summary = ', '.join(summary_parts) if summary_parts else 'no relevant items'
+
+        digest = {
+            'generated': now,
+            'project': pk,
+            'high_relevance': high_relevance[:10],
+            'releases': releases[:10],
+            'summary': summary,
+        }
+
+        digest_file = CACHE_DIR / f'{pk}.json'
+        digest_file.write_text(json.dumps(digest, indent=2))
+
+
+def prune_old_items(items_data, max_age_days=30):
+    """Remove items older than max_age_days. Returns pruned data."""
+    now = datetime.now()
+    kept = []
+    pruned_count = 0
+
+    for item in items_data.get('items', []):
+        try:
+            pub_date = datetime.strptime(item['published'], '%Y-%m-%d')
+            age = (now - pub_date).days
+            if age <= max_age_days:
+                kept.append(item)
+            else:
+                pruned_count += 1
+        except (ValueError, KeyError):
+            kept.append(item)  # Keep items with unparseable dates
+
+    items_data['items'] = kept
+
+    # Also prune known_ids from state
+    if pruned_count > 0:
+        state = load_state()
+        kept_ids = {item['id'] for item in kept}
+        state['known_ids'] = [id_ for id_ in state.get('known_ids', []) if id_ in kept_ids]
+        save_state(state)
+
+    return items_data, pruned_count
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Source fetchers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_arxiv(known_ids):
+    """Fetch recent arxiv papers matching categories and keywords.
+
+    Returns list of new item dicts (not yet scored).
+    """
+    try:
+        import urllib.request
+        import xml.etree.ElementTree as ET
+    except ImportError as e:
+        print(f"  {RED}● Missing module: {e}{RESET}")
+        return []
+
+    # Build query: categories OR'd, filtered by title keywords
+    cat_query = '+OR+'.join(f'cat:{cat}' for cat in ARXIV_CATEGORIES)
+    url = (f'http://export.arxiv.org/api/query?search_query={cat_query}'
+           f'&sortBy=submittedDate&sortOrder=descending'
+           f'&max_results={ARXIV_MAX_RESULTS}')
+
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'research-monitor/1.0'})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            xml_data = resp.read()
+    except Exception as e:
+        print(f"  {RED}● arxiv fetch failed: {e}{RESET}")
+        return []
+
+    # Parse Atom feed
+    ns = {'atom': 'http://www.w3.org/2005/Atom'}
+    try:
+        root = ET.fromstring(xml_data)
+    except ET.ParseError as e:
+        print(f"  {RED}● arxiv parse failed: {e}{RESET}")
+        return []
+
+    items = []
+    keywords_lower = [kw.lower() for kw in ARXIV_KEYWORDS]
+
+    for entry in root.findall('atom:entry', ns):
+        title_el = entry.find('atom:title', ns)
+        summary_el = entry.find('atom:summary', ns)
+        published_el = entry.find('atom:published', ns)
+        id_el = entry.find('atom:id', ns)
+
+        if title_el is None or id_el is None:
+            continue
+
+        title = ' '.join(title_el.text.strip().split())
+        abstract = summary_el.text.strip() if summary_el is not None else ''
+        arxiv_url = id_el.text.strip()
+
+        # Extract arxiv ID from URL
+        arxiv_id = arxiv_url.split('/abs/')[-1] if '/abs/' in arxiv_url else arxiv_url
+        item_id = f'arxiv:{arxiv_id}'
+
+        if item_id in known_ids:
+            continue
+
+        # Keyword filter on title
+        title_lower = title.lower()
+        if not any(kw in title_lower for kw in keywords_lower):
+            continue
+
+        # Parse published date
+        published = ''
+        if published_el is not None:
+            try:
+                pub_dt = datetime.strptime(published_el.text[:10], '%Y-%m-%d')
+                published = pub_dt.strftime('%Y-%m-%d')
+            except ValueError:
+                published = published_el.text[:10]
+
+        items.append({
+            'id': item_id,
+            'source': 'arxiv',
+            'title': title,
+            'url': f'https://arxiv.org/abs/{arxiv_id}',
+            'published': published,
+            'fetched': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+            'abstract': abstract[:1500],
+            'scores': {},
+        })
+
+    return items
+
+
+def fetch_github_releases(known_ids):
+    """Fetch latest releases from tracked GitHub repos.
+
+    Returns list of new item dicts (not yet scored).
+    """
+    try:
+        import urllib.request
+    except ImportError:
+        return []
+
+    items = []
+
+    for repo in GITHUB_REPOS:
+        url = f'https://api.github.com/repos/{repo}/releases?per_page=3'
+        try:
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'research-monitor/1.0',
+                'Accept': 'application/vnd.github.v3+json',
+            })
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                releases = json.loads(resp.read())
+        except Exception as e:
+            print(f"  {YELLOW}● GitHub {repo}: {e}{RESET}")
+            continue
+
+        if not isinstance(releases, list):
+            continue
+
+        for release in releases:
+            tag = release.get('tag_name', '')
+            item_id = f'github:{repo}:{tag}'
+
+            if item_id in known_ids:
+                continue
+
+            name = release.get('name', '') or tag
+            body = release.get('body', '') or ''
+            published_at = release.get('published_at', '')
+            html_url = release.get('html_url', '')
+
+            # Parse published date
+            published = ''
+            if published_at:
+                try:
+                    pub_dt = datetime.strptime(published_at[:10], '%Y-%m-%d')
+                    published = pub_dt.strftime('%Y-%m-%d')
+                except ValueError:
+                    published = published_at[:10]
+
+            items.append({
+                'id': item_id,
+                'source': 'github',
+                'title': f'{repo} {name}',
+                'url': html_url,
+                'published': published,
+                'fetched': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+                'abstract': body[:1500],
+                'scores': {},
+            })
+
+    return items
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scoring via Ollama on AGX
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_project_contexts():
+    """Build scoring context from overview cache. Returns dict of {key: context_str}."""
+    contexts = {}
+    for pk in PROJECT_ORDER:
+        cache_file = OVERVIEW_CACHE_DIR / f'{pk}.json'
+        if not cache_file.exists():
+            contexts[pk] = f'{pk}: (no overview cache)'
+            continue
+        try:
+            data = json.loads(cache_file.read_text())
+            phase = data.get('phase', '?')
+            focus = ', '.join(data.get('current_focus', [])[:3])
+            tech = ', '.join(data.get('tech_stack', [])[:5])
+            blockers = ', '.join(data.get('blockers', [])[:2])
+            contexts[pk] = (
+                f"Phase={phase}. "
+                f"Focus: {focus or 'unknown'}. "
+                f"Tech: {tech or 'unknown'}. "
+                f"Blockers: {blockers or 'none'}"
+            )
+        except (json.JSONDecodeError, OSError):
+            contexts[pk] = f'{pk}: (cache read error)'
+    return contexts
+
+
+def score_item(item, project_contexts):
+    """Score a single item against all projects via Ollama on AGX.
+
+    Returns scores dict: {project_key: {score: N, reason: "..."}}
+    """
+    source = item.get('source', 'unknown')
+    title = item.get('title', '')
+    abstract = item.get('abstract', '')
+
+    projects_block = '\n'.join(
+        f'  {pk}: {ctx}' for pk, ctx in project_contexts.items()
+    )
+
+    system_msg = '/no_think\nYou are a relevance scoring tool. Output ONLY a JSON object. No other text.'
+
+    user_msg = f"""Score this item's relevance to each project (0-10).
+
+0 = completely unrelated
+3 = tangentially related (same broad field)
+6 = moderately relevant (related technique or dependency)
+8 = highly relevant (directly applicable to current work)
+10 = critical (solves an active blocker or is a direct dependency update)
+
+Item:
+  Source: {source}
+  Title: {title}
+  Content: {abstract[:1000]}
+
+Projects:
+{projects_block}
+
+Return: {{{', '.join(f'"{pk}": {{"score": N, "reason": "..."}}' for pk in PROJECT_ORDER)}}}"""
+
+    data = ollama_query(
+        model=DEFAULT_MODEL,
+        system_msg=system_msg,
+        user_msg=user_msg,
+        timeout=90,
+        temperature=0.2,
+        num_predict=512,
+    )
+
+    if data is None:
+        return {}
+    return parse_scores_from_dict(data)
+
+
+def parse_scores_from_dict(data):
+    """Validate and extract scores from already-parsed LLM JSON dict."""
+    if not isinstance(data, dict):
+        return {}
+
+    scores = {}
+    for pk in PROJECT_ORDER:
+        if pk in data and isinstance(data[pk], dict):
+            score = data[pk].get('score', 0)
+            reason = data[pk].get('reason', '')
+            try:
+                score = int(float(score))
+            except (ValueError, TypeError):
+                score = 0
+            scores[pk] = {'score': max(0, min(10, score)), 'reason': str(reason)[:200]}
+    return scores
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fetch orchestration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def do_fetch():
+    """Main fetch + score pipeline. Called by --fetch."""
+    ensure_cache_dir()
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+
+    # Check AGX is reachable (needed for Ollama scoring)
+    ollama_host_name = HOSTS.get(OLLAMA_HOST, {}).get('name', OLLAMA_HOST)
+    if OLLAMA_HOST != LOCAL_HOST and not check_host_reachable(OLLAMA_HOST):
+        print(f"{RED}● {ollama_host_name} is offline — cannot score items{RESET}")
+        sys.exit(1)
+
+    state = load_state()
+    items_data = load_items()
+    known_ids = set(state.get('known_ids', []))
+
+    # Fetch from sources
+    print(f"  {WHITE}[1/4]{RESET} Fetching from sources...")
+
+    new_items = []
+
+    with Spinner("Fetching arxiv..."):
+        arxiv_items = fetch_arxiv(known_ids)
+    print(f"  {GREEN}●{RESET} arxiv: {len(arxiv_items)} new papers")
+    new_items.extend(arxiv_items)
+
+    with Spinner("Fetching GitHub releases..."):
+        github_items = fetch_github_releases(known_ids)
+    print(f"  {GREEN}●{RESET} GitHub: {len(github_items)} new releases")
+    new_items.extend(github_items)
+
+    if not new_items:
+        print(f"\n  {GRAY}No new items to score.{RESET}")
+        state['arxiv_last_fetch'] = now
+        save_state(state)
+        # Still regenerate digests in case threshold changed
+        generate_digests(items_data)
+        return
+
+    # Build project contexts for scoring
+    print(f"\n  {WHITE}[2/4]{RESET} Loading project contexts...")
+    project_contexts = build_project_contexts()
+
+    contexts_loaded = sum(1 for v in project_contexts.values() if 'no overview cache' not in v)
+    print(f"  {GREEN}●{RESET} {contexts_loaded}/{len(PROJECT_ORDER)} project contexts loaded")
+
+    # Score each new item
+    print(f"\n  {WHITE}[3/4]{RESET} Scoring {len(new_items)} items via Ollama...")
+
+    scored_count = 0
+    failed_count = 0
+
+    for i, item in enumerate(new_items):
+        label = item['title'][:60]
+        with Spinner(f"[{i+1}/{len(new_items)}] {label}..."):
+            scores = score_item(item, project_contexts)
+
+        if scores:
+            item['scores'] = scores
+            scored_count += 1
+            # Show top score
+            top_proj = max(scores.keys(), key=lambda k: scores[k]['score'])
+            top_score = scores[top_proj]['score']
+            color = GREEN if top_score >= 6 else YELLOW if top_score >= 3 else GRAY
+            print(f"  {color}●{RESET} [{top_score:2d}] {item['title'][:70]}")
+        else:
+            failed_count += 1
+            print(f"  {RED}●{RESET} Failed: {item['title'][:70]}")
+
+    # Merge new items into cache
+    items_data['items'].extend([item for item in new_items if item.get('scores')])
+    items_data['last_fetch'] = now
+
+    # Update known_ids
+    for item in new_items:
+        known_ids.add(item['id'])
+    state['known_ids'] = list(known_ids)
+    state['arxiv_last_fetch'] = now
+
+    # Prune old items
+    print(f"\n  {WHITE}[4/4]{RESET} Pruning and generating digests...")
+
+    items_data, pruned = prune_old_items(items_data)
+    if pruned:
+        print(f"  {GRAY}Pruned {pruned} items older than 30 days{RESET}")
+
+    save_items(items_data)
+    save_state(state)
+    generate_digests(items_data)
+
+    print(f"\n  {GREEN}●{RESET} Done: {scored_count} scored, {failed_count} failed, {len(items_data['items'])} total in cache")
+    if scored_count > 0:
+        hub_notify("Research", f"{scored_count} new items scored", source='research')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Calibration
+# ─────────────────────────────────────────────────────────────────────────────
+
+CALIBRATION_ITEMS = [
+    {
+        'source': 'arxiv',
+        'title': 'High-Fidelity Dutch TTS with Efficient Vocoder Architecture',
+        'abstract': 'We present a novel text-to-speech system for Dutch language with a lightweight vocoder suitable for edge deployment on NVIDIA Jetson devices. Our approach achieves near-human naturalness.',
+    },
+    {
+        'source': 'arxiv',
+        'title': 'Continual Knowledge Graph Construction from Streaming Text',
+        'abstract': 'We propose a method for incrementally building knowledge graphs from document streams, using relation detection and entity linking with memory-efficient storage.',
+    },
+    {
+        'source': 'arxiv',
+        'title': 'Quantum Error Correction in Topological Superconductors',
+        'abstract': 'We study the effects of noise on topological quantum computing architectures and propose new error correction codes for Majorana-based qubits.',
+    },
+    {
+        'source': 'github',
+        'title': 'NVIDIA/TensorRT v10.15',
+        'abstract': 'New release with improved ARM support, better FP16 performance on Jetson Orin series, and updated Python bindings.',
+    },
+    {
+        'source': 'github',
+        'title': 'ollama/ollama v0.16.0',
+        'abstract': 'Added structured JSON output mode, improved memory management for large context windows, ARM64 optimizations.',
+    },
+]
+
+
+def do_calibrate():
+    """Score test items and display threshold matrix."""
+    ollama_host_name = HOSTS.get(OLLAMA_HOST, {}).get('name', OLLAMA_HOST)
+    if OLLAMA_HOST != LOCAL_HOST and not check_host_reachable(OLLAMA_HOST):
+        print(f"{RED}● {ollama_host_name} is offline — cannot calibrate{RESET}")
+        sys.exit(1)
+
+    print()
+    header_bar()
+    print(f"{BRIGHT_GREEN}  RESEARCH CALIBRATION{RESET}")
+    header_bar()
+    print()
+
+    print(f"  {WHITE}Loading project contexts...{RESET}")
+    project_contexts = build_project_contexts()
+
+    print(f"  {WHITE}Scoring {len(CALIBRATION_ITEMS)} test items...{RESET}")
+    print()
+
+    results = []
+    for item in CALIBRATION_ITEMS:
+        with Spinner(f"Scoring: {item['title'][:50]}..."):
+            scores = score_item(item, project_contexts)
+        results.append((item, scores))
+
+    # Display matrix
+    # Header row
+    proj_labels = [pk[:6] for pk in PROJECT_ORDER]
+    header = f"  {'Item':<45s} " + ' '.join(f'{l:>6s}' for l in proj_labels)
+    print(f"  {WHITE}Score Matrix{RESET} (threshold: {RELEVANCE_THRESHOLD})")
+    divider()
+    print(f"{WHITE}{header}{RESET}")
+    divider()
+
+    for item, scores in results:
+        label = item['title'][:44]
+        cols_str = ''
+        for pk in PROJECT_ORDER:
+            s = scores.get(pk, {}).get('score', 0)
+            if s >= 8:
+                color = GREEN
+            elif s >= RELEVANCE_THRESHOLD:
+                color = YELLOW
+            elif s >= 3:
+                color = GRAY
+            else:
+                color = DIM
+            cols_str += f' {color}{s:>6d}{RESET}'
+        print(f"  {label:<45s}{cols_str}")
+
+    print()
+
+    # Show reasons for high scores
+    print(f"  {WHITE}High-scoring reasons:{RESET}")
+    divider()
+    for item, scores in results:
+        for pk in PROJECT_ORDER:
+            s = scores.get(pk, {}).get('score', 0)
+            if s >= RELEVANCE_THRESHOLD:
+                reason = scores[pk].get('reason', '?')
+                print(f"  {GREEN}{pk}{RESET} [{s}] {item['title'][:40]}: {reason}")
+
+    print()
+    header_bar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Renderers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def age_color(age_days):
+    """Return ANSI color based on item age."""
+    if age_days <= 7:
+        return WHITE
+    elif age_days <= 30:
+        return GRAY
+    return DIM
+
+
+def render_all_projects():
+    """Render compact research digest for all projects."""
+    print()
+    header_bar()
+    now = datetime.now().strftime('%a %d %b %H:%M')
+    print_right(f"{BRIGHT_GREEN}  RESEARCH DIGEST{RESET}", f"{BRIGHT_GREEN}{now}{RESET}")
+    header_bar()
+    print()
+
+    any_findings = False
+
+    for pk in PROJECT_ORDER:
+        digest_file = CACHE_DIR / f'{pk}.json'
+        if not digest_file.exists():
+            continue
+
+        try:
+            digest = json.loads(digest_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        papers = digest.get('high_relevance', [])
+        releases = digest.get('releases', [])
+
+        if not papers and not releases:
+            continue
+
+        any_findings = True
+        proj = PROJECTS[pk]
+        print(f"  {CYAN}{proj['name']}{RESET}")
+        divider()
+
+        # Top 3 papers
+        for item in papers[:3]:
+            score = item.get('score', 0)
+            age = item.get('age_days', 0)
+            color = age_color(age)
+            score_color = GREEN if score >= 8 else YELLOW
+            age_label = f"{age}d" if age > 0 else "today"
+            print(f"    {score_color}[{score:2d}]{RESET} {color}{item['title'][:65]}{RESET} {GRAY}({age_label}){RESET}")
+
+        # Top 2 releases
+        for item in releases[:2]:
+            score = item.get('score', 0)
+            score_color = GREEN if score >= 8 else YELLOW
+            print(f"    {score_color}[{score:2d}]{RESET} {CYAN}↑{RESET} {item['title'][:65]}")
+
+        remaining_papers = max(0, len(papers) - 3)
+        remaining_releases = max(0, len(releases) - 2)
+        if remaining_papers or remaining_releases:
+            parts = []
+            if remaining_papers:
+                parts.append(f"+{remaining_papers} more papers")
+            if remaining_releases:
+                parts.append(f"+{remaining_releases} more releases")
+            print(f"    {GRAY}{', '.join(parts)}{RESET}")
+
+        print()
+
+    if not any_findings:
+        print(f"  {GRAY}No research data yet. Run {WHITE}research --fetch{GRAY} first.{RESET}")
+        print()
+
+    # Status line
+    state = load_state()
+    last_fetch = state.get('arxiv_last_fetch', 'never')
+    items_data = load_items()
+    total = len(items_data.get('items', []))
+    header_bar()
+    print(f"{GRAY}  Last fetch: {last_fetch} | {total} items in cache | threshold: {RELEVANCE_THRESHOLD}{RESET}")
+    header_bar()
+
+
+def render_project_detail(project_key):
+    """Render detailed research view for a single project."""
+    proj = PROJECTS[project_key]
+    digest_file = CACHE_DIR / f'{project_key}.json'
+
+    print()
+    header_bar()
+    now = datetime.now().strftime('%a %d %b %H:%M')
+    print_right(f"{BRIGHT_GREEN}  RESEARCH — {proj['name']}{RESET}", f"{BRIGHT_GREEN}{now}{RESET}")
+    header_bar()
+    print()
+
+    if not digest_file.exists():
+        print(f"  {GRAY}No research data for {proj['name']}.{RESET}")
+        print(f"  {GRAY}Run {WHITE}research --fetch{GRAY} first.{RESET}")
+        print()
+        header_bar()
+        return
+
+    try:
+        digest = json.loads(digest_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        print(f"  {RED}● Cache read error{RESET}")
+        return
+
+    papers = digest.get('high_relevance', [])
+    releases = digest.get('releases', [])
+
+    # Papers section
+    if papers:
+        print(f"  {WHITE}RELEVANT PAPERS{RESET} ({len(papers)} found)")
+        divider()
+        for item in papers:
+            score = item.get('score', 0)
+            age = item.get('age_days', 0)
+            color = age_color(age)
+            score_color = GREEN if score >= 8 else YELLOW
+            age_label = f"{age}d ago" if age > 0 else "today"
+
+            print(f"    {score_color}[{score:2d}]{RESET} {color}{item['title']}{RESET}")
+            print(f"         {GRAY}{item.get('url', '')}  ({age_label}){RESET}")
+            reason = item.get('reason', '')
+            if reason:
+                print(f"         {DIM}{reason}{RESET}")
+            print()
+    else:
+        print(f"  {WHITE}RELEVANT PAPERS{RESET}")
+        divider()
+        print(f"  {GRAY}None above threshold ({RELEVANCE_THRESHOLD}){RESET}")
+        print()
+
+    # Releases section
+    if releases:
+        print(f"  {WHITE}TRACKED RELEASES{RESET} ({len(releases)} found)")
+        divider()
+        for item in releases:
+            score = item.get('score', 0)
+            score_color = GREEN if score >= 8 else YELLOW
+            age = item.get('age_days', 0)
+            age_label = f"{age}d ago" if age > 0 else "today"
+
+            print(f"    {score_color}[{score:2d}]{RESET} {CYAN}↑{RESET} {item['title']}")
+            print(f"         {GRAY}{item.get('url', '')}  ({age_label}){RESET}")
+            reason = item.get('reason', '')
+            if reason:
+                print(f"         {DIM}{reason}{RESET}")
+            print()
+    else:
+        print(f"  {WHITE}TRACKED RELEASES{RESET}")
+        divider()
+        print(f"  {GRAY}None above threshold ({RELEVANCE_THRESHOLD}){RESET}")
+        print()
+
+    # Footer
+    header_bar()
+    generated = digest.get('generated', '?')
+    print(f"{GRAY}  Generated: {generated} | Summary: {digest.get('summary', '?')}{RESET}")
+    header_bar()
+
+
+def render_status():
+    """Render fetch status and source health."""
+    print()
+    header_bar()
+    print(f"{BRIGHT_GREEN}  RESEARCH STATUS{RESET}")
+    header_bar()
+    print()
+
+    state = load_state()
+    items_data = load_items()
+
+    # Last fetch times
+    print(f"  {WHITE}FETCH STATE{RESET}")
+    divider()
+    print(f"  arxiv last fetch:  {state.get('arxiv_last_fetch', 'never')}")
+
+    gh_fetches = state.get('github_last_fetch', {})
+    for repo in GITHUB_REPOS:
+        last = gh_fetches.get(repo, 'never')
+        print(f"  GitHub {repo}:  {last}")
+    print()
+
+    # Item counts
+    items = items_data.get('items', [])
+    print(f"  {WHITE}CACHE{RESET}")
+    divider()
+    print(f"  Total items:  {len(items)}")
+    print(f"  Known IDs:    {len(state.get('known_ids', []))}")
+
+    # Count by source
+    arxiv_count = sum(1 for i in items if i.get('source') == 'arxiv')
+    github_count = sum(1 for i in items if i.get('source') == 'github')
+    print(f"  arxiv:        {arxiv_count}")
+    print(f"  GitHub:       {github_count}")
+
+    # Age distribution
+    now = datetime.now()
+    fresh = 0
+    aging = 0
+    for item in items:
+        try:
+            pub_date = datetime.strptime(item['published'], '%Y-%m-%d')
+            age = (now - pub_date).days
+            if age <= 7:
+                fresh += 1
+            else:
+                aging += 1
+        except (ValueError, KeyError):
+            pass
+    print(f"  Fresh (≤7d):  {fresh}")
+    print(f"  Aging (>7d):  {aging}")
+    print()
+
+    # Per-project digest stats
+    print(f"  {WHITE}DIGESTS{RESET}")
+    divider()
+    for pk in PROJECT_ORDER:
+        digest_file = CACHE_DIR / f'{pk}.json'
+        if digest_file.exists():
+            try:
+                digest = json.loads(digest_file.read_text())
+                summary = digest.get('summary', '?')
+                print(f"  {pk:12s}  {summary}")
+            except (json.JSONDecodeError, OSError):
+                print(f"  {pk:12s}  {RED}read error{RESET}")
+        else:
+            print(f"  {pk:12s}  {GRAY}no digest{RESET}")
+    print()
+
+    # Ollama host health
+    ollama_host_name = HOSTS.get(OLLAMA_HOST, {}).get('name', OLLAMA_HOST)
+    print(f"  {WHITE}{ollama_host_name} / OLLAMA{RESET}")
+    divider()
+    ollama_reachable = check_host_reachable(OLLAMA_HOST) if OLLAMA_HOST != LOCAL_HOST else True
+    if ollama_reachable:
+        if OLLAMA_HOST != LOCAL_HOST:
+            print(f"  {GREEN}●{RESET} {ollama_host_name} is online")
+        ok, output = ssh_cmd(OLLAMA_HOST, f'curl -s http://localhost:{OLLAMA_PORT}/api/ps 2>/dev/null', timeout=5)
+        if ok and output:
+            try:
+                data = json.loads(output)
+                models = data.get('models', [])
+                if models:
+                    names = [m.get('name', '?') for m in models]
+                    print(f"  {GREEN}●{RESET} Ollama loaded: {', '.join(names)}")
+                else:
+                    print(f"  {GREEN}●{RESET} Ollama running (idle)")
+            except json.JSONDecodeError:
+                print(f"  {GREEN}●{RESET} Ollama running")
+        else:
+            print(f"  {RED}●{RESET} Ollama not responding")
+    else:
+        print(f"  {RED}●{RESET} {ollama_host_name} is offline")
+    print()
+
+    header_bar()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_usage():
+    print(f"""
+{WHITE}research{RESET} — Continuous researcher for the Orin Nano hub
+
+{WHITE}Usage:{RESET}
+  research                     All projects' research digests
+  research <project>           Detailed view for one project
+  research --fetch             Fetch + score (cron mode)
+  research --calibrate         Score test items, show threshold matrix
+  research --status            Fetch state, item counts, source health
+  research --help
+
+{WHITE}Projects:{RESET}
+  {', '.join(PROJECT_ORDER) if PROJECT_ORDER else '(none — run hub --scan first)'}
+
+{WHITE}Sources:{RESET}
+  arxiv:  {', '.join(ARXIV_CATEGORIES)}
+  GitHub: {', '.join(GITHUB_REPOS)}
+
+{WHITE}Cron:{RESET}
+  0 */6 * * * ~/research --fetch >> ~/.cache/research/research.log 2>&1
+""")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if '-h' in args or '--help' in args:
+        print_usage()
+        sys.exit(0)
+
+    ensure_cache_dir()
+
+    if '--fetch' in args:
+        do_fetch()
+        return
+
+    if '--calibrate' in args:
+        do_calibrate()
+        return
+
+    if '--status' in args:
+        render_status()
+        return
+
+    # Remove flags
+    clean_args = [a for a in args if not a.startswith('--')]
+
+    if not clean_args:
+        render_all_projects()
+    else:
+        project_key = resolve_project(clean_args[0])
+        if not project_key:
+            sys.exit(1)
+        render_project_detail(project_key)
+
+
+if __name__ == '__main__':
+    main()

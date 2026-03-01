@@ -514,9 +514,24 @@ def handle_view(self, arguments):
         subprocess.call(["less", spillover])
 
 
-_PROFILE_PATH = os.path.expanduser(
-    "~/.config/open-interpreter/profiles/linux-admin.py"
-)
+# Auto-detect profile path from --profile CLI arg, or fall back to default
+_PROFILE_PATH = None
+for _i, _arg in enumerate(sys.argv):
+    if _arg == '--profile' and _i + 1 < len(sys.argv):
+        _pname = sys.argv[_i + 1]
+        _candidate = os.path.expanduser(f"~/.config/open-interpreter/profiles/{_pname}")
+        if os.path.exists(_candidate):
+            _PROFILE_PATH = _candidate
+        elif os.path.exists(_pname):
+            _PROFILE_PATH = _pname
+        break
+if _PROFILE_PATH is None:
+    # Fall back to any .py file in profiles dir
+    _profiles_dir = os.path.expanduser("~/.config/open-interpreter/profiles")
+    if os.path.isdir(_profiles_dir):
+        _pfiles = [f for f in os.listdir(_profiles_dir) if f.endswith('.py')]
+        if len(_pfiles) == 1:
+            _PROFILE_PATH = os.path.join(_profiles_dir, _pfiles[0])
 
 # Maps %context setting names to (target, attr, label, profile regex pattern)
 # target: "self" = interpreter, "llm" = interpreter.llm
@@ -545,37 +560,25 @@ def _persist_to_profile(pattern, value):
 
 
 def handle_model(self, arguments):
-    """Switch between available OI models. Changes take effect immediately."""
-    _models = {
-        '14b': {'name': 'hub-assist-14b', 'ctx': 12000, 'max_tokens': 800},
-        'coder': {'name': 'hub-coder-30b', 'ctx': 8000, 'max_tokens': 1200},
-    }
+    """Show or switch the active LLM model. Usage: %model [ollama/model-name]"""
     current = self.llm.model.split("/")[-1] if "/" in self.llm.model else self.llm.model
 
     if not arguments:
-        print(f"\n  Current model: {current}")
-        print("  Available:")
-        for key, cfg in _models.items():
-            marker = " ←" if cfg['name'] == current else ""
-            print(f"    {key:8s} {cfg['name']:20s} ctx={cfg['ctx']} max_tok={cfg['max_tokens']}{marker}")
-        print(f"\n  Usage: %model <{'|'.join(_models.keys())}>\n")
+        print(f"\n  Current model: \033[1m{current}\033[0m")
+        print(f"  Context window: {self.llm.context_window}")
+        print(f"  Max tokens: {self.llm.max_tokens}")
+        print(f"  API base: {getattr(self.llm, 'api_base', 'default')}")
+        print(f"\n  Usage: %model <model-name>  (e.g. %model llama3:8b)\n")
         return
 
-    key = arguments.strip().lower()
-    if key not in _models:
-        print(f"\n  Unknown model: {key}")
-        print(f"  Available: {', '.join(_models.keys())}\n")
+    model_name = arguments.strip()
+    if model_name == current:
+        print(f"\n  Already using {model_name}\n")
         return
 
-    cfg = _models[key]
-    if cfg['name'] == current:
-        print(f"\n  Already using {cfg['name']}\n")
-        return
-
-    self.llm.model = f"ollama/{cfg['name']}"
-    self.llm.context_window = cfg['ctx']
-    self.llm.max_tokens = cfg['max_tokens']
-    print(f"\n  Switched to \033[1m{cfg['name']}\033[0m (ctx={cfg['ctx']}, max_tok={cfg['max_tokens']})")
+    prefix = "ollama/" if not model_name.startswith("ollama/") else ""
+    self.llm.model = f"{prefix}{model_name}"
+    print(f"\n  Switched to \033[1m{model_name}\033[0m (ctx={self.llm.context_window}, max_tok={self.llm.max_tokens})")
     print(f"  Conversation history preserved ({len(self.messages)} messages)\n")
 
 
@@ -639,6 +642,14 @@ def handle_context(self, arguments):
 
 def _run_hub_tool(args, timeout=30):
     """Run a hub tool and print its output. Returns exit code."""
+    # Check if the tool exists before running
+    tool_path = args[1] if len(args) > 1 and args[0] == sys.executable else args[0]
+    tool_path = os.path.expanduser(tool_path)
+    if not os.path.exists(tool_path):
+        tool_name = os.path.basename(tool_path)
+        print(f"\n  ⚠ Hub tool '{tool_name}' not found at {tool_path}")
+        print(f"  Run: python3 tools/hub/install.py (from OI repo) to set up hub tools")
+        return 1
     try:
         result = subprocess.run(
             args, capture_output=True, text=True, timeout=timeout,
