@@ -73,8 +73,11 @@ def load_config():
             with open(CONFIG_JSON) as f:
                 user_config = json.load(f)
             # Deep merge: user overrides defaults
+            # 'hosts' is replaced entirely (not merged) to avoid phantom default entries
             for section, values in user_config.items():
-                if isinstance(values, dict) and isinstance(config.get(section), dict):
+                if section == 'hosts':
+                    config[section] = values
+                elif isinstance(values, dict) and isinstance(config.get(section), dict):
                     config[section].update(values)
                 else:
                     config[section] = values

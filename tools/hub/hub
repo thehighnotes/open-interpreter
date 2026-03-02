@@ -1085,8 +1085,8 @@ def render_explain():
     # ── Terminal ──
     print()
     print(f"  {CYAN}Terminal{RESET}")
-    print(f"    {WHITE}assist{RESET}               Open Interpreter — local AI assistant via AGX Ollama")
-    print(f"      {GRAY}Model: qwen3:14b-instruct (~14 tok/s). Read-auto/write-confirm.{RESET}")
+    print(f"    {WHITE}assist{RESET}               Open Interpreter — local AI assistant via Ollama")
+    print(f"      {GRAY}Model: {DEFAULT_MODEL}. Read-auto/write-confirm.{RESET}")
     print(f"      {GRAY}Good at: file inspection, system admin, running commands. Not a strategist.{RESET}")
     print(f"      {GRAY}%reset  clear history  |  %undo  remove last exchange{RESET}")
     print()
