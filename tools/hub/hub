@@ -1449,21 +1449,15 @@ def _discover_npm_dev_services(host_alias, project_path):
     """
     # SCP a small Python script to remote, run it there (avoids shell quoting hell)
     import tempfile as _tf
-    scanner_script = f'''import json, os, sys
+    scanner_script = f'''import json, os, re, sys
 base = os.path.realpath(os.path.expanduser("{project_path}"))
-parent = os.path.dirname(base)
 seen = set()
-# Collect package.json from: project root, children, siblings
+# Collect package.json from: project root + immediate children
 dirs_to_scan = [base]
 for d in os.listdir(base):
     p = os.path.join(base, d)
     if os.path.isdir(p):
         dirs_to_scan.append(p)
-if os.path.isdir(parent):
-    for d in os.listdir(parent):
-        p = os.path.join(parent, d)
-        if os.path.isdir(p):
-            dirs_to_scan.append(p)
 for d in dirs_to_scan:
     pj = os.path.join(d, "package.json")
     rp = os.path.realpath(d)
@@ -1477,7 +1471,23 @@ for d in dirs_to_scan:
     scripts = data.get("scripts", {{}})
     reldir = os.path.relpath(rp, base)
     for name, cmd in scripts.items():
-        print(f"PKG|{{reldir}}|{{name}}|{{cmd}}")
+        # For node scripts, try to find a PORT or .listen() in the JS file
+        file_port = ""
+        if cmd.startswith("node "):
+            js_file = cmd.split()[1]
+            js_path = os.path.join(rp, js_file)
+            if os.path.isfile(js_path):
+                try:
+                    src = open(js_path).read(8192)
+                    # Match: const PORT = 3456, .listen(3001, PORT=3000
+                    m = re.search(r"\.listen\(\s*(\d{{4,5}})", src)
+                    if not m:
+                        m = re.search(r"(?:PORT|port)\s*[=:]\s*(?:process\.env\.PORT\s*\|\|\s*)?(\d{{4,5}})", src)
+                    if m:
+                        file_port = m.group(1)
+                except Exception:
+                    pass
+        print(f"PKG|{{reldir}}|{{name}}|{{cmd}}|{{file_port}}")
 '''
     # Write to temp, SCP, run, clean up
     with _tf.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
@@ -1493,20 +1503,31 @@ for d in dirs_to_scan:
 
     import re as _re
 
-    # Auto-detect port from command string (and optionally dir context)
+    # Auto-detect port from command string, URL patterns, and dir context
     def _guess_port(cmd, reldir=''):
+        # Explicit port flags or env vars
         m = _re.search(r'(?:-p|--port)\s+(\d{4,5})', cmd)
         if m: return int(m.group(1))
         m = _re.search(r'PORT=(\d{4,5})', cmd)
         if m: return int(m.group(1))
+        # URL in command (e.g. xdg-open http://localhost:3001)
+        m = _re.search(r'localhost:(\d{4,5})', cmd)
+        if m: return int(m.group(1))
+        # Framework-specific defaults
         if 'react-scripts' in cmd: return 3000
         if 'next' in cmd: return 3000
+        if 'nuxt' in cmd: return 3000
+        if 'remix' in cmd: return 3000
+        if 'gatsby' in cmd: return 8000
         if 'vite' in cmd: return 5173
+        if 'svelte' in cmd or 'sveltekit' in cmd: return 5173
+        if 'astro' in cmd: return 4321
+        if _re.search(r'\bng\s+serve', cmd) or 'angular' in cmd: return 4200
+        if 'webpack-dev-server' in cmd or 'webpack serve' in cmd: return 8080
         if 'func start' in cmd or 'func ' in cmd: return 7071
         # Directory-based heuristic: API/functions dirs likely serve on 7071
         dir_lower = reldir.lower().rstrip('/')
         if dir_lower in ('api', 'functions', 'azure-functions') and 'func' not in cmd:
-            # Node wrapper in API dir — likely Azure Functions on 7071
             if cmd.startswith('node ') and ('start' in cmd or 'server' in cmd or 'logging' in cmd):
                 return 7071
         return None
@@ -1515,13 +1536,17 @@ for d in dirs_to_scan:
     for line in output.strip().split('\n'):
         if not line.startswith('PKG|'):
             continue
-        parts = line.split('|', 3)
+        parts = line.split('|', 4)
         if len(parts) < 4:
             continue
-        _, reldir, script_name, script_cmd = parts
+        _, reldir, script_name, script_cmd = parts[0], parts[1], parts[2], parts[3]
+        file_port = int(parts[4]) if len(parts) > 4 and parts[4].strip().isdigit() else None
 
         dev_cmd = 'npm start' if script_name == 'start' else f'npm run {script_name}'
         port = _guess_port(script_cmd, reldir)
+        # Fall back to port found in the JS source file
+        if port is None and file_port:
+            port = file_port
 
         candidates.append({
             'script_name': script_name,
