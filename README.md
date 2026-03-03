@@ -140,6 +140,10 @@ Browser-based OI with hub integration — 8 tabs (Chat, Status, Projects, Repo, 
 
 ![WebUI — Chat tab with sidebar and suggestion chips](docs/hub/images/webui-chat.png)
 
+![WebUI — Status dashboard showing live host and service data](docs/hub/images/webui-status.png)
+
+![WebUI — Help tab with searchable command reference](docs/hub/images/webui-help.png)
+
 ```bash
 oi-web                          # start on port 8585
 open http://localhost:8585      # or http://<hub-ip>:8585

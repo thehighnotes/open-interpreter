@@ -24,6 +24,23 @@ const App = {
       el.addEventListener('click', () => this.switchTab(el.dataset.tab));
     });
 
+    // URL-based tab routing — check path for /status, /settings, etc.
+    const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
+    const validTabs = ['chat','status','projects','repo','research','notify','help','settings'];
+    if (path && validTabs.includes(path)) {
+      this.switchTab(path, true);
+    }
+
+    // Handle browser back/forward
+    window.addEventListener('popstate', () => {
+      const p = window.location.pathname.replace(/^\/+|\/+$/g, '');
+      if (p && validTabs.includes(p)) {
+        this.switchTab(p, true);
+      } else {
+        this.switchTab('chat', true);
+      }
+    });
+
     // Initialize chat
     Chat.init();
 
@@ -31,8 +48,8 @@ const App = {
     this.loadSessionInfo();
   },
 
-  switchTab(tab) {
-    if (tab === this.activeTab) return;
+  switchTab(tab, skipPush) {
+    if (tab === this.activeTab && !skipPush) return;
     this.activeTab = tab;
 
     // Update sidebar
@@ -47,6 +64,12 @@ const App = {
     document.querySelectorAll('.tab-content').forEach(el => {
       el.classList.toggle('active', el.id === `tab-${tab}`);
     });
+
+    // Update URL without reload
+    if (!skipPush) {
+      const url = tab === 'chat' ? '/' : `/${tab}`;
+      history.pushState({ tab }, '', url);
+    }
 
     // Load data for tab on first visit
     Tabs.onTabActivated(tab);

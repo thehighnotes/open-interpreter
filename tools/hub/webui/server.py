@@ -745,8 +745,11 @@ async def upload_image(request):
 
 # ── App assembly ─────────────────────────────────────────────────────────────
 
+_TAB_ROUTES = ["chat", "status", "projects", "repo", "research", "notify", "help", "settings"]
+
 routes = [
     Route("/", index),
+    *[Route(f"/{tab}", index) for tab in _TAB_ROUTES],
     Route("/api/chat", chat, methods=["POST"]),
     Route("/api/chat/approve", chat_approve, methods=["POST"]),
     Route("/api/chat/stop", chat_stop, methods=["POST"]),
