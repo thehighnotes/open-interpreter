@@ -169,7 +169,7 @@ Full reference: **[OI Integration documentation](docs/hub/oi-integration.md)**
 
 Development happens across three machines — a workstation for coding, an AGX Orin running Ollama for inference, and an Orin Nano as the always-on hub. The tools started as shell scripts to avoid repetitive SSH sessions and kept evolving as new problems came up. Born on ARM + NVIDIA but designed to be architecture-generic — pure Python, SSH, and config files. If you can run Python 3.10+ and reach your machines over SSH, it works.
 
-> **[Read the full story on AIquest →](https://aiquest.info/research/oi-hub)**
+> **[Read the full story on AIquest →](https://www.aiquest.info/research/oi-hub)**
 > Architecture deep-dive, development timeline, and the thinking behind each layer.
 
 ## Platform support
