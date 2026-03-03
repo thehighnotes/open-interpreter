@@ -46,6 +46,58 @@ A single Starlette server hosts the API and serves static files. The interpreter
 - **Session restore** — on page load, previous messages are fetched from the interpreter's in-memory history
 - **Welcome screen** — suggestion chips for common actions (Hub Status, My Projects, Research Digest, Git Activity)
 
+### Code approval flow
+
+When the LLM generates a command to run, the WebUI evaluates it against `_SAFE_PREFIXES` — a list of read-only and hub tool commands (`ls`, `cat`, `git status`, `hub`, `repo`, `overview`, etc.). Safe commands auto-execute and show their output inline. Unsafe commands pause and display a code block with **Run** and **Skip** buttons:
+
+```
+┌─────────────────────────────────────┐
+│ ⚠ OI wants to run:                 │
+│                                     │
+│   rm -rf node_modules && npm install│
+│                                     │
+│            [ Run ]    [ Skip ]      │
+└─────────────────────────────────────┘
+```
+
+Clicking **Run** sends a POST to `/api/chat/approve` with `{"approved": true}`, and the command executes. **Skip** sends `{"approved": false}` and the LLM continues without running it. This is the same approval model as the terminal OI — the WebUI just renders it as buttons instead of a y/n prompt.
+
+### Chat interaction example
+
+A typical exchange looks like this:
+
+```
+You:  What's the git status of the backend project?
+
+OI:   I'll check that for you.
+      ┌──────────────────────────┐
+      │ repo status backend      │  ← auto-runs (safe command)
+      └──────────────────────────┘
+
+      The backend project is on branch `main` with 2 modified files
+      (src/api.py, src/auth.py) and 1 unpushed commit. No untracked files.
+
+You:  Commit those changes
+
+OI:   I'll stage and commit with an LLM-generated message.
+      ┌──────────────────────────┐
+      │ repo commit backend      │  ← auto-runs (safe command)
+      └──────────────────────────┘
+
+      Committed: "Fix session expiry and add token refresh to auth flow"
+      1 commit ready to push.
+```
+
+Magic commands (lines starting with `%`) are detected client-side and routed through `/api/magic` — they bypass the LLM entirely and return tool output directly.
+
+### Screenshots
+
+![Chat tab — streaming conversation with code approval and suggestion chips](images/webui-chat.png)
+
+![Status tab — live host and service dashboard](images/webui-status.png)
+
+![Help tab — searchable command reference with 70+ entries](images/webui-help.png)
+
 ## API Endpoints
 
 | Method | Endpoint | Purpose |

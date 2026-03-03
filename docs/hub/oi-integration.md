@@ -2,6 +2,20 @@
 
 The hub tools connect to Open Interpreter through **magic commands** — type them directly in an OI session to operate your hub without leaving the conversation. Without the hub tools installed, the magic commands print a "tool not found" error and return gracefully — the core OI improvements still work fine.
 
+## Typical session
+
+```
+%switch myapp          → switch context to your project
+%status                → check which hosts are up
+%repo                  → see if anything needs committing
+  ... do some coding ...
+%repo commit           → commit current project (LLM writes the message)
+%checkpoint            → batch commit+push everything dirty
+%research              → check if any relevant papers dropped overnight
+```
+
+Commands chain naturally — `%switch` loads project context into the system message, so the LLM knows your codebase when you ask questions. `%repo commit` uses the same LLM to generate commit messages from your diff.
+
 ## Project Management
 
 | Command | What it does |

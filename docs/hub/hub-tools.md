@@ -351,7 +351,9 @@ System files (EDID, xorg.conf, lightdm.conf, WireGuard) require sudo — `backup
 
 ## `code` — Code Assistant Client
 
-Interactive code exploration and index management for the Code Assistant service (semantic search, RAG, dependency graphs).
+The `code` tool talks to the Code Assistant service, which runs on the host with the `code_assistant` role (typically your GPU server). The service provides semantic indexing and dependency analysis across your projects. It's started automatically by `prepare` or can be checked with `hub --status` (BACKGROUND section). The endpoint is configured in `config.json` under `code_assistant` — default is `http://<host>:5002/api/...`.
+
+Interactive code exploration and index management:
 
 ```
 code                            List indexed projects

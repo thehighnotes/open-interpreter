@@ -8,7 +8,11 @@
 
 ### Why this exists
 
-Multi-machine dev setups mean scattered repos, different SSH configs, services that need coordinating, and context that lives in your head instead of your tools. This hub eliminates that friction — one terminal gives you git dashboards, service management, LLM-powered research, automated backups, and session workflows across every machine you own.
+**Before:** SSH to GPU box, `cd` to project, `git status`. SSH to workstation, check another repo. Open a browser tab for Ollama. Try to remember which services are running. Forget what you were doing yesterday.
+
+**After:** Type `hub --status`. Every machine, every repo, every service — one view. `work myapp` wakes your GPU server, loads the model, starts your services, and drops you into an editor with full project context already in the system prompt.
+
+Multi-machine dev setups shouldn't mean scattered context. This hub eliminates the friction.
 
 ### Origin
 
@@ -209,7 +213,8 @@ Full reference: **[OI Improvements documentation](docs/hub/oi-improvements.md)**
 | [Web Interface](docs/hub/webui.md) | WebUI architecture, tabs, API endpoints, responsive layout |
 | [OI Integration](docs/hub/oi-integration.md) | Magic commands — project, git, infra, vision |
 | [OI Improvements](docs/hub/oi-improvements.md) | Callable auto_run, custom_instructions, Mini-RAG |
-| [Reference](docs/hub/reference.md) | Modified files, new files, environment variables |
+| [Reference](docs/hub/reference.md) | Modified files, new files, environment variables, contribution patterns |
+| [Troubleshooting](docs/hub/troubleshooting.md) | SSH, Ollama, git, WebUI — common problems and fixes |
 
 ---
 

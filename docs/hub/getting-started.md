@@ -115,3 +115,16 @@ All hub tools read from two files:
 | Debian / RPi | Community | Pure Python + SSH — should work. Not CI-tested. |
 | macOS | Untested | TUI menus fall back to numbered input. Core tools likely work. |
 | Windows | Not supported | Requires WSL2. Uses `termios`, `tty`, Unix signals. |
+
+## First steps after install
+
+After running `install.py`, try these commands in order:
+
+1. **`hub --status`** — verify your hosts are reachable and services are detected
+2. **`hub --scan <host>`** — discover projects on remote machines and add them to the registry
+3. **`repo`** — see git status across all registered projects
+4. **`work <project>`** — launch a full session (wake hosts, warm LLM, start services, open editor)
+
+From inside an OI session, type `%help` to see all magic commands.
+
+If something isn't working, see [Troubleshooting](troubleshooting.md).
