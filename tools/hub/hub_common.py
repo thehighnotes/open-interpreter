@@ -2206,9 +2206,18 @@ def start_dev_service(host_alias, project_path, dev_service):
     if not dev_cmd:
         return False
 
-    full_cmd = f'cd {project_path}/{work_dir} && {dev_cmd}'
-    ssh_cmd(host_alias, f'tmux new-window -t dev -n {win_name}', timeout=5)
-    ssh_cmd(host_alias, f'tmux send-keys -t dev:{win_name} {repr(full_cmd)} Enter', timeout=5)
+    # Normalize path: resolve . and avoid double slashes
+    if work_dir in ('.', ''):
+        full_path = project_path
+    else:
+        full_path = f'{project_path}/{work_dir}'
+    full_cmd = f'cd {full_path} && {dev_cmd}'
+    ok, err = ssh_cmd(host_alias, f'tmux new-window -t dev -a -n {win_name}', timeout=5)
+    if not ok:
+        return False
+    # Use double quotes so ~ expands; escape any inner double quotes
+    escaped_cmd = full_cmd.replace('"', '\\"')
+    ssh_cmd(host_alias, f'tmux send-keys -t dev:{win_name} "{escaped_cmd}" Enter', timeout=5)
     return True
 
 
