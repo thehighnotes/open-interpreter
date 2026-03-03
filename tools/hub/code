@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path.home()))
 from hub_common import (
     BOLD, BRIGHT_GREEN, CYAN, CODE_ASSISTANT_PROJECTS, CODE_ASSISTANT_URL,
-    CODE_CACHE_DIR, DEFAULT_MODEL, HUB_CONFIG, HOSTS, IGNORED, LOCAL_HOST, PROJECTS, PROJECT_ORDER,
+    CODE_CACHE_DIR, DEFAULT_MODEL, HUB_CONFIG, HOSTS, IGNORED, LOCAL_HOST, OVERVIEW_CACHE_DIR, PROJECTS, PROJECT_ORDER,
     DIM, GRAY, GREEN, HIGHLIGHT_BG, HIGHLIGHT_OFF, KEY_ENTER, RED, RESET, WHITE, YELLOW,
     check_agx_ws_ssh, check_code_assistant, check_host_reachable,
     code_assistant_get, code_assistant_post,
@@ -1056,8 +1056,10 @@ def _render_manage_dashboard():
         else:
             host_label = ca_host
 
+        # Build compact status tags
+        tags = []
+
         # Sync status for remote-hosted projects (synced to CA host)
-        sync_note = ''
         if needs_sync:
             sync_file = CODE_CACHE_DIR / f'{p["name"]}_sync.json'
             if sync_file.exists():
@@ -1065,16 +1067,46 @@ def _render_manage_dashboard():
                     sync_data = json.loads(sync_file.read_text())
                     sync_age = time.time() - sync_data.get('ts', 0)
                     if sync_age < 3600:
-                        sync_note = f"  {GRAY}sync {int(sync_age/60)}m ago{RESET}"
+                        tags.append(f"{GRAY}sync:{int(sync_age/60)}m{RESET}")
                     elif sync_age < 86400:
-                        sync_note = f"  {GRAY}sync {int(sync_age/3600)}h ago{RESET}"
+                        tags.append(f"{GRAY}sync:{int(sync_age/3600)}h{RESET}")
                     else:
-                        sync_note = f"  {YELLOW}sync {int(sync_age/86400)}d ago{RESET}"
+                        tags.append(f"{YELLOW}sync:{int(sync_age/86400)}d{RESET}")
                 except (json.JSONDecodeError, OSError):
                     pass
 
+        # Last indexed timestamp from CA API
+        idx_ts = p.get('last_indexed_at')
+        if idx_ts:
+            idx_age = time.time() - idx_ts
+            if idx_age < 3600:
+                tags.append(f"{GRAY}idx:{int(idx_age/60)}m{RESET}")
+            elif idx_age < 86400:
+                tags.append(f"{GRAY}idx:{int(idx_age/3600)}h{RESET}")
+            else:
+                tags.append(f"{YELLOW}idx:{int(idx_age/86400)}d{RESET}")
+
+        # Last worked on — from overview cache mtime
+        if hub_key:
+            ov_cache = OVERVIEW_CACHE_DIR / f'{hub_key}.json'
+            if ov_cache.exists():
+                try:
+                    ov_age = time.time() - ov_cache.stat().st_mtime
+                    if ov_age < 3600:
+                        tags.append(f"{GREEN}act:{int(ov_age/60)}m{RESET}")
+                    elif ov_age < 86400:
+                        tags.append(f"{GREEN}act:{int(ov_age/3600)}h{RESET}")
+                    elif ov_age < 604800:
+                        tags.append(f"{GRAY}act:{int(ov_age/86400)}d{RESET}")
+                    else:
+                        tags.append(f"{YELLOW}act:{int(ov_age/86400)}d{RESET}")
+                except OSError:
+                    pass
+
+        status_str = '  '.join(tags)
+        tag_suffix = f"  {status_str}" if tags else ""
         print(f"  {WHITE}{i:<4}{RESET}{GREEN}{p['name']:<16}{RESET}{total:>8d}{p.get('code_count',0):>8d}"
-              f"{p.get('doc_count',0):>8d}  {hub_label:<18}{host_label}{sync_note}")
+              f"{p.get('doc_count',0):>8d}  {hub_label:<18}{host_label}{tag_suffix}")
 
     # Watcher status
     print()

@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path.home()))
 from hub_common import (
-    PROJECTS, PROJECT_ORDER, HOSTS, GITHUB_USERNAME, GIT_EMAIL, DEFAULT_MODEL,
+    PROJECTS, PROJECT_ORDER, HOSTS, LOCAL_HOST, GITHUB_USERNAME, GIT_EMAIL, DEFAULT_MODEL,
     GREEN, BRIGHT_GREEN, DIM, YELLOW, RED, CYAN, WHITE, GRAY, RESET, BOLD,
     HIGHLIGHT_BG, HIGHLIGHT_OFF,
     ssh_cmd, check_host_reachable, run_parallel, resolve_project,
@@ -189,15 +189,17 @@ def _generate_commit_msg(host_alias, path, model=None):
 
 
 def _ssh_commit(host_alias, path, message, timeout=30):
-    """Stage all + commit via SCP temp file (handles multi-line messages safely).
+    """Stage all + commit via temp file (handles multi-line messages safely).
 
     Returns (success, output). Captures both stdout and stderr for error reporting.
+    For local hosts, skips SCP/SSH and runs git directly.
     """
     import os as _os
     import tempfile as _tf
     import subprocess as _sp
     import uuid as _uuid
 
+    is_local = (host_alias == LOCAL_HOST)
     uid = _uuid.uuid4().hex[:8]
     with _tf.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
         f.write(message)
@@ -205,28 +207,44 @@ def _ssh_commit(host_alias, path, message, timeout=30):
 
     tmp_remote = f'/tmp/_hub_commit_msg_{uid}.txt'
     try:
-        scp = _sp.run(
-            ['scp', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
-             tmp_local, f'{host_alias}:{tmp_remote}'],
-            capture_output=True, text=True, timeout=10
-        )
-        if scp.returncode != 0:
-            return False, f'SCP failed: {scp.stderr.strip()}'
+        if is_local:
+            # Local: use the temp file directly
+            import shutil as _sh
+            _sh.copy2(tmp_local, tmp_remote)
+        else:
+            scp = _sp.run(
+                ['scp', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                 tmp_local, f'{host_alias}:{tmp_remote}'],
+                capture_output=True, text=True, timeout=10
+            )
+            if scp.returncode != 0:
+                return False, f'SCP failed: {scp.stderr.strip()}'
 
         cmd = f"cd {path} && git add -A && git commit -F {tmp_remote}"
         try:
-            result = _sp.run(
-                ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
-                 '-o', 'StrictHostKeyChecking=no', host_alias, cmd],
-                capture_output=True, text=True, timeout=timeout
-            )
+            if is_local:
+                result = _sp.run(
+                    ['bash', '-c', cmd],
+                    capture_output=True, text=True, timeout=timeout
+                )
+            else:
+                result = _sp.run(
+                    ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                     '-o', 'StrictHostKeyChecking=no', host_alias, cmd],
+                    capture_output=True, text=True, timeout=timeout
+                )
             output = (result.stdout.strip() + '\n' + result.stderr.strip()).strip()
             return result.returncode == 0, output
         except _sp.TimeoutExpired:
-            return False, 'SSH timeout'
+            return False, 'timeout'
     finally:
         _os.unlink(tmp_local)
-        ssh_cmd(host_alias, f'rm -f {tmp_remote}', timeout=5)
+        try:
+            _os.unlink(tmp_remote)
+        except OSError:
+            pass
+        if not is_local:
+            ssh_cmd(host_alias, f'rm -f {tmp_remote}', timeout=5)
 
 
 def _ssh_cmd_with_stderr(host_alias, cmd, timeout=30):
@@ -234,17 +252,24 @@ def _ssh_cmd_with_stderr(host_alias, cmd, timeout=30):
 
     Returns (success, stdout, stderr). Unlike ssh_cmd() which drops stderr,
     this gives callers access to git's error output for better diagnostics.
+    For local hosts, runs via bash directly.
     """
     import subprocess as _sp
     try:
-        result = _sp.run(
-            ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
-             '-o', 'StrictHostKeyChecking=no', host_alias, cmd],
-            capture_output=True, text=True, timeout=timeout
-        )
+        if host_alias == LOCAL_HOST:
+            result = _sp.run(
+                ['bash', '-c', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+        else:
+            result = _sp.run(
+                ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                 '-o', 'StrictHostKeyChecking=no', host_alias, cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
         return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
     except _sp.TimeoutExpired:
-        return False, '', 'SSH timeout'
+        return False, '', 'timeout'
     except Exception as e:
         return False, '', str(e)
 

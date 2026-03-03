@@ -434,6 +434,11 @@ def fixed_litellm_completions(**params):
 
     params["model"] = params["model"].replace(":latest", "")
 
+    # Disable extended thinking for Ollama models (qwen3.5 burns all tokens
+    # on internal reasoning and returns empty content without this)
+    if params.get("model", "").startswith("ollama/"):
+        params["reasoning_effort"] = "none"
+
     # Run completion
     attempts = 4
     first_error = None

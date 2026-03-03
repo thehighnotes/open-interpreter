@@ -39,6 +39,7 @@ def _oi_completer(text, state):
         "%repo", "%checkpoint", "%backup",
         "%wake", "%research", "%health",
         "%services", "%switch", "%overview",
+        "%image",
         "%%",
     ]
     # Sub-options for commands that take known arguments
@@ -89,6 +90,123 @@ from .utils.check_for_package import check_for_package
 from .utils.cli_input import cli_input
 from .utils.display_output import display_output
 from .utils.find_image_path import find_image_path
+
+def _handle_image_command(interpreter, message):
+    """Handle %image command: grab clipboard image and/or file paths, inject into conversation.
+
+    Returns the text prompt string to send to interpreter.chat(), or None on error.
+    Images are appended to interpreter.messages before returning so the LLM sees them.
+    The returned prompt flows through interpreter.chat() which adds it as the final
+    user message — giving the model: [..., image1, image2, text_prompt].
+
+    Usage:
+        %image                          clipboard + default prompt
+        %image what is this?            clipboard + custom prompt
+        %image /path/to/img.png         file path(s) + default prompt
+        %image /a.png /b.jpg compare    file path(s) + custom prompt
+    """
+    _IMAGE_DIR = os.path.join(tempfile.gettempdir(), "oi-images")
+    _IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff'}
+    _CLIP_TARGETS = ['image/png', 'image/jpeg', 'image/bmp']
+
+    # Strip %image prefix
+    args = message[len("%image"):].strip()
+
+    # Parse: separate file paths from prompt text
+    tokens = args.split() if args else []
+    file_paths = []
+    prompt_words = []
+    for tok in tokens:
+        expanded = os.path.expanduser(tok)
+        if os.path.isfile(expanded) and os.path.splitext(expanded)[1].lower() in _IMAGE_EXTS:
+            file_paths.append(expanded)
+        else:
+            prompt_words.append(tok)
+
+    prompt = " ".join(prompt_words).strip() if prompt_words else ""
+    use_clipboard = len(file_paths) == 0  # grab clipboard only if no files given
+
+    if use_clipboard:
+        # Check clipboard for image content
+        clip_path = None
+        try:
+            targets_result = subprocess.run(
+                ['xclip', '-selection', 'clipboard', '-t', 'TARGETS', '-o'],
+                capture_output=True, text=True, timeout=3,
+            )
+            available = targets_result.stdout.strip().split('\n') if targets_result.returncode == 0 else []
+
+            # Find a supported image MIME type
+            clip_mime = None
+            for mime in _CLIP_TARGETS:
+                if mime in available:
+                    clip_mime = mime
+                    break
+
+            if clip_mime:
+                ext = clip_mime.split('/')[-1]
+                if ext == 'jpeg':
+                    ext = 'jpg'
+                os.makedirs(_IMAGE_DIR, exist_ok=True)
+                ts = int(time.time() * 1000)
+                clip_path = os.path.join(_IMAGE_DIR, f"clip_{ts}.{ext}")
+
+                grab = subprocess.run(
+                    ['xclip', '-selection', 'clipboard', '-t', clip_mime, '-o'],
+                    capture_output=True, timeout=5,
+                )
+                if grab.returncode == 0 and len(grab.stdout) > 100:
+                    with open(clip_path, 'wb') as f:
+                        f.write(grab.stdout)
+                    file_paths.append(clip_path)
+                else:
+                    clip_path = None
+        except FileNotFoundError:
+            print("\n  xclip not installed. Install with: sudo apt install xclip\n")
+            return None
+        except subprocess.TimeoutExpired:
+            pass
+
+        if not clip_path:
+            print("\n  No image in clipboard. Copy an image first, or provide file path(s):")
+            print("  %image /path/to/image.png [prompt]")
+            print("  %image /a.png /b.jpg compare these\n")
+            return None
+
+    # Validate all paths exist
+    for p in file_paths:
+        if not os.path.isfile(p):
+            print(f"\n  File not found: {p}\n")
+            return None
+
+    # Default prompt if none given
+    if not prompt:
+        if len(file_paths) == 1:
+            prompt = "Describe this image."
+        else:
+            prompt = f"Describe these {len(file_paths)} images."
+
+    # Inject images into interpreter.messages — they'll be seen by the LLM.
+    # The prompt text is returned and flows through interpreter.chat() which
+    # appends it as the final user message after these images.
+    for p in file_paths:
+        interpreter.messages.append({
+            "role": "user",
+            "type": "image",
+            "format": "path",
+            "content": p,
+        })
+
+    # Show confirmation
+    names = [os.path.basename(p) for p in file_paths]
+    size_kb = sum(os.path.getsize(p) for p in file_paths) // 1024
+    print(f"\n  \033[36m◆\033[0m {len(file_paths)} image{'s' if len(file_paths) != 1 else ''} ({size_kb}KB): {', '.join(names)}")
+    if prompt != "Describe this image." and prompt != f"Describe these {len(file_paths)} images.":
+        print(f"  \033[2m\"{prompt}\"\033[0m")
+    print()
+
+    return prompt
+
 
 # Add examples to the readline history
 examples = [
@@ -185,7 +303,16 @@ def terminal_interface(interpreter, message):
                 # Ignore empty messages when user presses enter without typing anything
                 continue
 
-            if message.startswith("%") and interactive:
+            # ── %image: clipboard/file vision ────────────────────────────
+            if (message == "%image" or message.startswith("%image ")) and interactive:
+                _img_result = _handle_image_command(interpreter, message)
+                if _img_result is None:
+                    # Error already printed, go back to prompt
+                    continue
+                # _img_result is the text prompt to send (images already in interpreter.messages)
+                message = _img_result
+
+            elif message.startswith("%") and interactive:
                 handle_magic_command(interpreter, message)
                 continue
 

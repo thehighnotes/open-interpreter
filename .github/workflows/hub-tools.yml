@@ -1,0 +1,134 @@
+name: Hub Tools CI
+
+on:
+  push:
+    branches: [main]
+    paths: ['tools/hub/**']
+  pull_request:
+    branches: [main]
+    paths: ['tools/hub/**']
+
+jobs:
+  lint-amd64:
+    name: Lint (Python ${{ matrix.python-version }}, amd64)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile all Python files
+        run: python -m py_compile tools/hub/hub_common.py
+        # py_compile each file to catch syntax errors
+      - name: Compile all hub scripts
+        run: |
+          for f in tools/hub/hub_common.py tools/hub/install.py \
+                   tools/hub/webui/server.py tools/hub/webui/oi_bridge.py \
+                   tools/hub/profiles/hub-profile.example.py; do
+            echo "Compiling $f"
+            python -m py_compile "$f"
+          done
+
+      - name: Compile extensionless Python scripts
+        run: |
+          for f in tools/hub/hub tools/hub/work tools/hub/backup \
+                   tools/hub/hubgrep tools/hub/code tools/hub/overview \
+                   tools/hub/search tools/hub/begin tools/hub/git \
+                   tools/hub/prepare tools/hub/notify tools/hub/edit \
+                   tools/hub/autosummary tools/hub/research \
+                   tools/hub/health-probe; do
+            if head -1 "$f" | grep -q python; then
+              echo "Compiling $f"
+              python -m py_compile "$f"
+            fi
+          done
+
+      - name: Import hub_common with mock HOME
+        run: |
+          export HOME=$(mktemp -d)
+          python -c "
+          import sys
+          sys.path.insert(0, 'tools/hub')
+          import hub_common
+          print('hub_common loaded OK')
+          print('  load_config:', hasattr(hub_common, 'load_config'))
+          print('  ollama_query:', hasattr(hub_common, 'ollama_query'))
+          "
+
+      - name: Validate install.py exports
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'tools/hub')
+          import install
+          print('install.py loaded OK')
+          "
+
+  lint-arm64:
+    name: Lint (Python ${{ matrix.python-version }}, arm64)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Run checks in arm64 container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            python:${{ matrix.python-version }}-slim \
+            bash -c '
+              set -e
+              echo "=== Architecture ==="
+              uname -m
+
+              echo "=== Compile Python files ==="
+              for f in tools/hub/hub_common.py tools/hub/install.py \
+                       tools/hub/webui/server.py tools/hub/webui/oi_bridge.py \
+                       tools/hub/profiles/hub-profile.example.py; do
+                echo "Compiling $f"
+                python -m py_compile "$f"
+              done
+
+              echo "=== Compile extensionless scripts ==="
+              for f in tools/hub/hub tools/hub/work tools/hub/backup \
+                       tools/hub/hubgrep tools/hub/code tools/hub/overview \
+                       tools/hub/search tools/hub/begin tools/hub/git \
+                       tools/hub/prepare tools/hub/notify tools/hub/edit \
+                       tools/hub/autosummary tools/hub/research \
+                       tools/hub/health-probe; do
+                if head -1 "$f" | grep -q python; then
+                  echo "Compiling $f"
+                  python -m py_compile "$f"
+                fi
+              done
+
+              echo "=== Import hub_common ==="
+              export HOME=$(mktemp -d)
+              python -c "
+          import sys
+          sys.path.insert(0, \"tools/hub\")
+          import hub_common
+          print(\"hub_common loaded OK\")
+          "
+
+              echo "=== Verify termios/tty available ==="
+              python -c "
+          import termios, tty
+          print(\"termios: OK\")
+          print(\"tty: OK\")
+          "
+
+              echo "=== All arm64 checks passed ==="
+            '

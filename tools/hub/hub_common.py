@@ -57,6 +57,20 @@ _DEFAULT_CONFIG = {
     'code_assistant': {'host': 'local', 'port': 5002},
     'backup': {'destination': '~/hub-backup'},
     'git': {'github_username': '', 'email': ''},
+    'research': {
+        'threshold': 7,
+        'arxiv_categories': ['eess.AS', 'cs.SD', 'cs.CL', 'cs.LG', 'cs.AI'],
+        'arxiv_keywords': [
+            'TTS', 'speech', 'synthesis', 'voice', 'vocoder',
+            'transformer', 'memory', 'attention', 'inference', 'embedding',
+            'knowledge graph', 'continual learning', 'curriculum',
+            'interactive', 'tutorial',
+        ],
+        'arxiv_max_results': 30,
+        'github_repos': [
+            'NVIDIA/TensorRT', 'ollama/ollama', 'pytorch/pytorch', 'ggml-org/llama.cpp',
+        ],
+    },
 }
 
 
@@ -85,6 +99,49 @@ def load_config():
             pass  # Fall back to defaults on parse error
 
     return config
+
+
+def save_config(config):
+    """Write full config dict to ~/.config/hub/config.json."""
+    CONFIG_JSON.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_JSON, 'w') as f:
+        json.dump(config, f, indent=2)
+        f.write('\n')
+
+
+def reload_config():
+    """Re-read config from disk and update all module-level globals in-place."""
+    global LOCAL_HOST, OLLAMA_HOST, OLLAMA_PORT, DEFAULT_MODEL
+    global GITHUB_USERNAME, GIT_EMAIL, BACKUP_DEST
+    global CODE_ASSISTANT_URL
+
+    fresh = load_config()
+    HUB_CONFIG.clear()
+    HUB_CONFIG.update(fresh)
+
+    LOCAL_HOST = HUB_CONFIG['hub']['local_host']
+    OLLAMA_HOST = HUB_CONFIG['ollama']['host']
+    OLLAMA_PORT = HUB_CONFIG['ollama']['port']
+    DEFAULT_MODEL = HUB_CONFIG['ollama']['default_model']
+    GITHUB_USERNAME = HUB_CONFIG['git']['github_username']
+    GIT_EMAIL = HUB_CONFIG['git']['email']
+    BACKUP_DEST = HUB_CONFIG['backup']['destination']
+
+    HOSTS.clear()
+    for _key, _host in HUB_CONFIG['hosts'].items():
+        HOSTS[_key] = {
+            'alias': _key,
+            'name': _host.get('name', _key),
+            'ip': _host.get('ip', '127.0.0.1'),
+            'user': _host.get('user', 'user'),
+            'roles': _host.get('roles', []),
+            'wol_mac': _host.get('wol_mac', ''),
+        }
+
+    _ca_hk = HUB_CONFIG['code_assistant']['host']
+    _ca_i = HOSTS.get(_ca_hk, {}).get('ip', '127.0.0.1')
+    _ca_p = HUB_CONFIG['code_assistant']['port']
+    CODE_ASSISTANT_URL = f'http://{_ca_i}:{_ca_p}/api/v1/assistant'
 
 
 HUB_CONFIG = load_config()

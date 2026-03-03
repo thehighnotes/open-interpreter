@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0a0f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>OI WebUI</title>
+  <link rel="stylesheet" href="/static/css/design-system.css">
+  <link rel="stylesheet" href="/static/css/shared.css">
+  <link rel="stylesheet" href="/static/css/webui.css">
+  <link rel="stylesheet" href="/static/js/vendor/github-dark.min.css">
+</head>
+<body>
+  <div id="toast-container" class="toast-container"></div>
+
+  <div class="app">
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <div class="sidebar-logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+        </svg>
+        <div>
+          <span>OI WebUI</span>
+          <div class="hub-name" id="hub-name">Dev Hub</div>
+        </div>
+      </div>
+
+      <div class="sidebar-nav">
+        <button class="sidebar-tab active" data-tab="chat">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <span class="tab-label">Chat</span>
+        </button>
+        <button class="sidebar-tab" data-tab="status">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          <span class="tab-label">Status</span>
+        </button>
+        <button class="sidebar-tab" data-tab="projects">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+          <span class="tab-label">Projects</span>
+        </button>
+        <button class="sidebar-tab" data-tab="repo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+          <span class="tab-label">Repo</span>
+        </button>
+        <button class="sidebar-tab" data-tab="research">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+          <span class="tab-label">Research</span>
+        </button>
+        <button class="sidebar-tab" data-tab="notify">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+          <span class="tab-label">Notify</span>
+        </button>
+        <button class="sidebar-tab" data-tab="help">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          <span class="tab-label">Help</span>
+        </button>
+        <button class="sidebar-tab" data-tab="settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+          <span class="tab-label">Settings</span>
+        </button>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="connection-status">
+          <div class="connection-dot" id="connection-dot"></div>
+          <span id="connection-label">Connecting...</span>
+        </div>
+      </div>
+    </nav>
+
+    <!-- Main content area -->
+    <div class="main">
+
+      <!-- Chat tab -->
+      <div class="tab-content active" id="tab-chat">
+        <div class="chat-container">
+          <!-- Welcome screen -->
+          <div class="welcome-screen" id="welcome-screen">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+            </svg>
+            <div class="welcome-title">Open Interpreter</div>
+            <div class="welcome-subtitle">Your hub-integrated terminal assistant. Ask questions, run commands, manage projects.</div>
+            <div class="welcome-chips">
+              <div class="welcome-chip" data-prompt="%status">Hub Status</div>
+              <div class="welcome-chip" data-prompt="What projects am I working on?">My Projects</div>
+              <div class="welcome-chip" data-prompt="%research">Research Digest</div>
+              <div class="welcome-chip" data-prompt="Show me today's git activity across all projects">Git Activity</div>
+            </div>
+          </div>
+
+          <!-- Messages -->
+          <div class="chat-messages hidden" id="chat-messages"></div>
+
+          <!-- Input -->
+          <div class="chat-input-container">
+            <div class="chat-input-box">
+              <textarea class="chat-textarea" id="chat-input" placeholder="Ask anything, or use %commands..." rows="1"></textarea>
+              <div class="chat-input-actions">
+                <button class="image-btn" id="image-btn" title="Upload image">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                </button>
+                <input type="file" id="image-input" accept="image/*" capture="environment" style="display: none;">
+                <button class="send-btn" id="send-btn" title="Send (Enter)">
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                </button>
+                <button class="stop-btn hidden" id="stop-btn" title="Stop">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Status tab -->
+      <div class="tab-content" id="tab-status">
+        <div class="data-tab">
+          <div class="data-tab-header">
+            <div class="data-tab-title">Hub Status</div>
+            <button class="btn btn-sm btn-icon" onclick="Tabs.loaded.status=false; Tabs.loadStatus();" title="Refresh">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            </button>
+          </div>
+          <div id="status-content"></div>
+        </div>
+      </div>
+
+      <!-- Projects tab -->
+      <div class="tab-content" id="tab-projects">
+        <div class="data-tab">
+          <div class="data-tab-header">
+            <div class="data-tab-title">Projects</div>
+            <button class="btn btn-sm btn-icon" onclick="Tabs.loaded.projects=false; Tabs.loadProjects();" title="Refresh">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            </button>
+          </div>
+          <div id="projects-content"></div>
+        </div>
+      </div>
+
+      <!-- Repo tab -->
+      <div class="tab-content" id="tab-repo">
+        <div class="data-tab">
+          <div class="data-tab-header">
+            <div class="data-tab-title">Git Repository</div>
+            <button class="btn btn-sm btn-icon" onclick="Tabs.loaded.repo=false; Tabs.loadRepo();" title="Refresh">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            </button>
+          </div>
+          <div id="repo-content"></div>
+        </div>
+      </div>
+
+      <!-- Research tab -->
+      <div class="tab-content" id="tab-research">
+        <div class="data-tab">
+          <div class="data-tab-header">
+            <div class="data-tab-title">Research Digest</div>
+            <button class="btn btn-sm btn-icon" onclick="Tabs.loaded.research=false; Tabs.loadResearch();" title="Refresh">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            </button>
+          </div>
+          <div id="research-content"></div>
+        </div>
+      </div>
+
+      <!-- Notifications tab -->
+      <div class="tab-content" id="tab-notify">
+        <div class="data-tab">
+          <div class="data-tab-header">
+            <div class="data-tab-title">Notifications</div>
+          </div>
+          <div id="notify-content"></div>
+        </div>
+      </div>
+
+      <!-- Help tab -->
+      <div class="tab-content" id="tab-help">
+        <div class="data-tab">
+          <div class="data-tab-header">
+            <div class="data-tab-title">Command Reference</div>
+          </div>
+          <div id="help-content"></div>
+        </div>
+      </div>
+
+      <!-- Settings tab -->
+      <div class="tab-content" id="tab-settings">
+        <div class="data-tab">
+          <div class="data-tab-header">
+            <div class="data-tab-title">Settings</div>
+          </div>
+          <div id="settings-content"></div>
+        </div>
+      </div>
+
+    </div><!-- /main -->
+
+    <!-- Mobile bottom tab bar -->
+    <div class="mobile-tab-bar">
+      <button class="mobile-tab active" data-tab="chat">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        Chat
+      </button>
+      <button class="mobile-tab" data-tab="status">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        Status
+      </button>
+      <button class="mobile-tab" data-tab="projects">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        Projects
+      </button>
+      <button class="mobile-tab" data-tab="repo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+        Repo
+      </button>
+      <button class="mobile-tab" data-tab="notify">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        Notify
+      </button>
+      <button class="mobile-tab" data-tab="help">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        Help
+      </button>
+      <button class="mobile-tab" data-tab="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Settings
+      </button>
+    </div>
+  </div>
+
+  <!-- Vendor JS -->
+  <script src="/static/js/vendor/marked.min.js"></script>
+  <script src="/static/js/vendor/highlight.min.js"></script>
+  <!-- App JS -->
+  <script src="/static/js/webui.js"></script>
+  <script src="/static/js/chat.js"></script>
+  <script src="/static/js/help.js"></script>
+  <script src="/static/js/settings.js"></script>
+  <script src="/static/js/tabs.js"></script>
+</body>
+</html>

@@ -16,5 +16,12 @@
   },
   "code_assistant": { "host": "local", "port": 5002 },
   "backup": { "destination": "~/hub-backup" },
-  "git": { "github_username": "myuser", "email": "me@example.com" }
+  "git": { "github_username": "myuser", "email": "me@example.com" },
+  "research": {
+    "threshold": 7,
+    "arxiv_categories": ["eess.AS", "cs.SD", "cs.CL", "cs.LG", "cs.AI"],
+    "arxiv_keywords": ["TTS", "speech", "transformer", "inference"],
+    "arxiv_max_results": 30,
+    "github_repos": ["ollama/ollama", "pytorch/pytorch"]
+  }
 }

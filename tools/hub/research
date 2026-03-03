@@ -26,30 +26,31 @@ from hub_common import *
 CACHE_DIR = RESEARCH_CACHE_DIR
 # DEFAULT_MODEL is imported from hub_common (config-derived)
 
-# Scoring threshold — items below this are not shown in digests
-RELEVANCE_THRESHOLD = 7
+# ─────────────────────────────────────────────────────────────────────────────
+# Research config — reads from hub config with hardcoded fallback defaults
+# ─────────────────────────────────────────────────────────────────────────────
+_research_cfg = HUB_CONFIG.get('research', {})
 
-# ─────────────────────────────────────────────────────────────────────────────
-# arxiv configuration
-# ─────────────────────────────────────────────────────────────────────────────
-ARXIV_CATEGORIES = ['eess.AS', 'cs.SD', 'cs.CL', 'cs.LG', 'cs.AI']
-ARXIV_KEYWORDS = [
+RELEVANCE_THRESHOLD = _research_cfg.get('threshold', 7)
+
+ARXIV_CATEGORIES = _research_cfg.get('arxiv_categories',
+    ['eess.AS', 'cs.SD', 'cs.CL', 'cs.LG', 'cs.AI'])
+
+ARXIV_KEYWORDS = _research_cfg.get('arxiv_keywords', [
     'TTS', 'speech', 'synthesis', 'voice', 'vocoder',
     'transformer', 'memory', 'attention', 'inference', 'embedding',
     'knowledge graph', 'continual learning', 'curriculum',
     'interactive', 'tutorial',
-]
-ARXIV_MAX_RESULTS = 30
+])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GitHub repos to track
-# ─────────────────────────────────────────────────────────────────────────────
-GITHUB_REPOS = [
+ARXIV_MAX_RESULTS = _research_cfg.get('arxiv_max_results', 30)
+
+GITHUB_REPOS = _research_cfg.get('github_repos', [
     'NVIDIA/TensorRT',
     'ollama/ollama',
     'pytorch/pytorch',
     'ggml-org/llama.cpp',
-]
+])
 
 
 # ─────────────────────────────────────────────────────────────────────────────

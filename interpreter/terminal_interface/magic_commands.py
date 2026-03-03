@@ -82,6 +82,7 @@ def handle_help(self, arguments):
         "%switch [project]": "Switch project context (fuzzy match).",
         "%overview [project]": "Project overview (defaults to current project).",
         "%notify [flags]": "Notification history (--all, --clear, --count).",
+        "%image [paths] [prompt]": "Send image to vision model (clipboard or file paths).",
     }
 
     base_message = ["> **Available Commands:**\n\n"]

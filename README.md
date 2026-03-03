@@ -4,6 +4,24 @@
 
 > Fork of [OpenInterpreter/open-interpreter](https://github.com/OpenInterpreter/open-interpreter) v0.4.3 (AGPL-3.0) — for upstream docs see the [original README](https://github.com/OpenInterpreter/open-interpreter/blob/main/README.md).
 
+### Why this exists
+
+Multi-machine dev setups mean scattered repos, different SSH configs, services that need coordinating, and context that lives in your head instead of your tools. This hub eliminates that friction — one terminal gives you git dashboards, service management, LLM-powered research, automated backups, and session workflows across every machine you own.
+
+### Origin
+
+Built over 50+ phases on [AIquest](https://aiquest.info), a Jetson Orin Nano + AGX Orin setup. Born on ARM + NVIDIA but designed to be architecture-generic — everything is pure Python, SSH, and config files. If you can run Python 3.10+ and reach your machines over SSH, it works.
+
+### Platform support
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| Ubuntu x86_64 | Tested | Primary CI target. Bare metal and WSL2. |
+| Jetson (ARM64) | Tested | Built on Orin Nano + AGX Orin. |
+| Debian / RPi | Community | Pure Python + SSH — should work. Not CI-tested. |
+| macOS | Untested | TUI menus fall back to numbered input. Core tools likely work. |
+| Windows | Not supported | Requires WSL2. Uses `termios`, `tty`, Unix signals. |
+
 ### Architecture
 
 ```
@@ -92,6 +110,7 @@ $ work myapp
   - [notify — Notification History](#notify-notification-history)
   - [hubgrep — Cross-Ecosystem Search](#hubgrep-cross-ecosystem-search)
   - [search — Web Search](#search-web-search)
+  - [oi-web — Web Interface](#oi-web-web-interface)
 - [OI Integration](#oi-integration)
 - [OI Improvements](#oi-improvements)
 - [Reference](#reference)
@@ -227,6 +246,7 @@ The `tools/hub/` directory contains a suite of CLI tools that manage a multi-mac
 | `hubgrep` | — | Search across all hub files (tools, config, cache, memory) |
 | `edit` | — | Structured remote file editing via SSH |
 | `search` | — | DuckDuckGo web search helper |
+| `oi-web` | — | Web UI for OI — chat, hub tabs, image upload (port 8585) |
 | `autosummary` | — | Post-session daemon: journaling, cache refresh |
 
 ---
@@ -709,6 +729,100 @@ Requires the `ddgs` Python package (`pip install ddgs`).
 
 ---
 
+### `oi-web` — Web Interface
+
+A browser-based UI for Open Interpreter, served from the hub machine. Provides the full OI chat experience plus hub dashboard tabs — accessible from any device on the network (designed for tablet use via RustDesk or direct browser).
+
+```
+oi-web                          Start the WebUI server on port 8585
+```
+
+Open `http://<hub-ip>:8585` in a browser.
+
+#### Architecture
+
+```
+Browser  ──HTTP──▶  Hub:8585 (Starlette)  ──Python──▶  OI Interpreter
+                           │                                  │
+                           ├── hub_common.py (config, projects)
+                           ├── hub tools (subprocess)         ▼
+                           └── static files (HTML/CSS/JS)   Ollama
+```
+
+A single Starlette server hosts the API and serves static files. The interpreter runs in-process as a singleton — chat responses stream via SSE (Server-Sent Events). Hub tool endpoints (`/api/status`, `/api/repo`, etc.) run the corresponding tool as a subprocess and return stripped output.
+
+#### Tabs
+
+| Tab | Content |
+|-----|---------|
+| **Chat** | Full OI conversation with streaming markdown, syntax-highlighted code blocks, Run/Skip approval buttons, image upload |
+| **Status** | Hub dashboard (`hub --status` output) |
+| **Projects** | Project list with switch buttons — changes the interpreter's project context |
+| **Repo** | Git dashboard (`repo` output) |
+| **Research** | Research digest |
+| **Notify** | Notification history with mark-read |
+| **Settings** | Model switcher, context window, max tokens, connection status, session reset |
+
+#### Chat Features
+
+- **Streaming** — LLM responses stream token-by-token via SSE, rendered as markdown with syntax highlighting (vendored marked.js + highlight.js)
+- **Code approval** — unsafe commands show a code block with Run/Skip buttons; safe commands (read-only, hub tools) auto-run using the same `_SAFE_PREFIXES` list as the terminal OI profile
+- **Magic commands** — lines starting with `%` are detected client-side and routed to `POST /api/magic`, which runs the corresponding hub tool and returns output in a terminal-style block
+- **Image upload** — button next to the input opens a file picker (with camera capture on mobile); uploads to `/tmp/oi-images/` and inserts an `%image /path` message
+- **Session restore** — on page load, previous messages are fetched from the interpreter's in-memory history
+- **Welcome screen** — suggestion chips for common actions (Hub Status, My Projects, Research Digest, Git Activity)
+
+#### API Endpoints
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/api/chat` | SSE streaming chat |
+| POST | `/api/chat/approve` | Approve/skip pending code execution |
+| POST | `/api/chat/stop` | Abort current generation |
+| POST | `/api/magic` | Execute magic command |
+| GET | `/api/config` | Hub config (name, hosts, model) |
+| GET | `/api/session` | Session info (message count, model, connection) |
+| GET | `/api/session/messages` | Message history for restore |
+| POST | `/api/session/reset` | Clear conversation |
+| GET | `/api/status` | Hub status output |
+| GET | `/api/projects` | Project list from registry |
+| POST | `/api/projects/switch` | Switch project context |
+| GET | `/api/repo` | Git dashboard output |
+| GET | `/api/research` | Research digest output |
+| GET | `/api/notifications` | Notification history |
+| POST | `/api/notifications/clear` | Mark notifications read |
+| GET | `/api/settings` | Current model, context, connection |
+| POST | `/api/settings/update` | Update model/context/max tokens |
+| POST | `/api/image` | Upload image file |
+
+#### Responsive Layout
+
+- **Desktop (>1024px)** — 220px sidebar with labels + content area
+- **Tablet (768–1024px)** — Icon-only sidebar (56px) + content
+- **Mobile (<768px)** — Sidebar hidden, horizontal tab bar at bottom
+
+The UI is optimized for tablet viewing at 1600x900 (18px root font, 44px touch targets).
+
+#### Configuration
+
+The server reads hub config from `~/.config/hub/config.json` (via `hub_common.load_config()`). An optional `webui/config.json` can override the port:
+
+```json
+{ "port": 8585 }
+```
+
+`webui/config.json` is gitignored. The server, frontend, and vendored dependencies are all in the repo at `tools/hub/webui/`.
+
+#### Service Registration
+
+The WebUI is registered as a service in `projects.json` and appears in `hub --services` and `hub --status`:
+
+```json
+{ "port": 8585, "name": "OI WebUI", "start_cmd": "python3 tools/hub/webui/server.py", "dir": "." }
+```
+
+---
+
 ## OI Integration
 
 The hub tools connect to Open Interpreter through **magic commands** — type them directly in an OI session to operate your hub without leaving the conversation. Without the hub tools installed, the magic commands print a "tool not found" error and return gracefully — the core OI improvements still work fine.
@@ -747,6 +861,17 @@ The hub tools connect to Open Interpreter through **magic commands** — type th
 | `%backup [--dry-run]` | Run the backup script — rsyncs hub config to a remote host |
 | `%research [--fetch]` | Research digest — shows scored arxiv papers and GitHub releases relevant to your projects |
 | `%notify [--all\|--clear]` | Notification history — shows desktop notifications logged during the session |
+
+### Vision
+
+| Command | What it does |
+|---------|--------------|
+| `%image` | Send the clipboard image to the LLM (grabs via xclip, saves to `/tmp/oi-images/`) |
+| `%image <prompt>` | Send clipboard image with a text prompt |
+| `%image /path/to/file.png` | Send a specific image file |
+| `%image /a.png /b.png <prompt>` | Send multiple images with a prompt |
+
+Requires a vision-capable model and `xclip` installed for clipboard mode. Images must be at least 32x32 pixels. In the WebUI, use the image upload button instead — it handles the `%image` message automatically.
 
 ### Built-in OI Commands
 
@@ -882,7 +1007,7 @@ export RAG_ENTRIES_PATH=/path/to/my-entries.json
 | `interpreter/core/utils/truncate_output.py` | Spillover handling + ANSI strip |
 | `interpreter/core/computer/terminal/languages/subprocess_language.py` | Sudo detection |
 | `interpreter/terminal_interface/terminal_interface.py` | Auto-run flow, state indicators, configurable inference host probe |
-| `interpreter/terminal_interface/magic_commands.py` | Hub magic commands |
+| `interpreter/terminal_interface/magic_commands.py` | Hub magic commands, `%image` vision support |
 | `interpreter/terminal_interface/components/code_block.py` | Rich output integration |
 | `interpreter/terminal_interface/components/base_block.py` | Refresh throttle |
 | `interpreter/terminal_interface/components/message_block.py` | Refresh throttle |
@@ -896,6 +1021,9 @@ export RAG_ENTRIES_PATH=/path/to/my-entries.json
 | `interpreter/vendor/tokentrim/` | Vendored tokentrim with [double-subtraction fix](https://github.com/KillianLucas/tokentrim/issues/11) |
 | `rag-entries.example.json` | Sample RAG entries to get started |
 | `tools/hub/` | Hub tools ecosystem — 15 scripts + shared module, config templates, install wizard |
+| `tools/hub/webui/server.py` | Starlette server — 19 API routes, static file serving, hub tool subprocess runner |
+| `tools/hub/webui/oi_bridge.py` | Interpreter wrapper — singleton, SSE streaming via thread+queue, approval flow |
+| `tools/hub/webui/static/` | Frontend — HTML, CSS (dark theme), JS (chat, tabs), vendored marked.js + highlight.js |
 | `tools/hub/hub_common.py` | Shared module — config loading, SSH helpers, project registry, terminal UI primitives |
 | `tools/hub/install.py` | Interactive setup wizard — generates config.json and creates symlinks |
 | `tools/hub/config.example.json` | Minimal single-host config template |

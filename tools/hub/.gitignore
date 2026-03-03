@@ -3,3 +3,6 @@ config.json
 diagrams.json
 __pycache__/
 *.pyc
+
+# WebUI local config
+webui/config.json
