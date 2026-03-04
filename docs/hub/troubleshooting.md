@@ -46,6 +46,33 @@ Usually a port conflict (8585). Use `oi-web --port <other>` or check what's list
 
 ---
 
+## Command execution timeout
+
+**`[Execution timed out after 120s of silence]`**
+
+The timeout is based on **inactivity**, not total runtime. It resets every time the command produces output. If a command is actively printing (spinners, progress, logs), it will never time out.
+
+If you're running commands that go silent for long periods (large builds, slow network calls), increase the timeout:
+
+```python
+# In your profile:
+os.environ["OI_EXECUTION_TIMEOUT"] = "300"  # 5 minutes
+```
+
+**Command still running after Escape/Ctrl+C?**
+
+Pressing Escape sends Ctrl+C to the subprocess and returns to the `>` prompt. If the process ignores SIGINT, it may continue in the background. Use `kill` or `pkill` to clean it up.
+
+---
+
+## Tokenizer fork warnings
+
+**`huggingface/tokenizers: The current process just got forked...`**
+
+This warning is captured during subprocess creation and rendered inside the code block's output panel. If you see it raw in the terminal instead, the stderr capture may not be active — ensure you're running the latest fork.
+
+---
+
 ## Port reference
 
 | Port | Service |

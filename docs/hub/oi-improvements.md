@@ -106,6 +106,29 @@ Real-time tracking of how much context window is used per turn. Before each LLM 
 
 Color coding: green (<60%), yellow (60–80%), red (>80%). The `context_window` value is set in your profile or `config.json` and also passed as `num_ctx` to Ollama so the server allocates the right KV cache.
 
+## Streaming command output
+
+Command output now appears live in the terminal code block as it's produced, instead of waiting for the command to finish. This means long-running commands (builds, SSH probes, LLM calls) show progress in real time — spinners, status updates, and partial results are all visible immediately.
+
+The implementation snapshots the PTY's virtual terminal state every ~1 second. Output that grows (new lines) is sent as a delta and appended. Output that rewrites in place (spinners using `\r`) is sent as a full snapshot that replaces the block content, so the display stays clean.
+
+### Inactivity timeout
+
+The execution timeout (`OI_EXECUTION_TIMEOUT`, default 120s) is now an **inactivity** timeout — it resets every time new output arrives. A command that's actively producing output will never time out. The timer only fires after 120 seconds of complete silence.
+
+```bash
+# Override the default in your profile:
+export OI_EXECUTION_TIMEOUT=300  # 5 minutes of silence before timeout
+```
+
+### Escape to interrupt
+
+Press **Escape** during LLM generation or command execution to cancel the current operation and return to the `>` prompt. The running subprocess receives Ctrl+C so it doesn't continue in the background. Ctrl+C still exits OI entirely.
+
+### Fork-time stderr capture
+
+Libraries like HuggingFace tokenizers write warnings directly to OS file descriptor 2 during `fork()`, bypassing Python's `sys.stderr` and corrupting Rich Live rendering. These warnings are now captured via a temporary pipe redirect during subprocess creation and rendered inside the code block's output panel.
+
 ## Other improvements
 
 | Feature | What it does |

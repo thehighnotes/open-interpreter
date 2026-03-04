@@ -8,8 +8,8 @@
 | `interpreter/core/respond.py` | Callable custom_instructions support, prompt token counting |
 | `interpreter/core/llm/llm.py` | Vendored tokentrim import, `num_ctx` pass-through for Ollama |
 | `interpreter/core/utils/truncate_output.py` | Spillover handling + ANSI strip |
-| `interpreter/core/computer/terminal/languages/subprocess_language.py` | Sudo detection |
-| `interpreter/terminal_interface/terminal_interface.py` | Auto-run flow, state indicators, configurable inference host probe, context token stats |
+| `interpreter/core/computer/terminal/languages/subprocess_language.py` | Sudo detection, streaming output, inactivity timeout, fork-time stderr capture, Escape interrupt |
+| `interpreter/terminal_interface/terminal_interface.py` | Auto-run flow, state indicators, configurable inference host probe, context token stats, Escape key interrupt, snapshot output handling |
 | `interpreter/terminal_interface/magic_commands.py` | Hub magic commands, `%image` vision support |
 | `interpreter/terminal_interface/components/code_block.py` | Rich output integration |
 | `interpreter/terminal_interface/components/base_block.py` | Refresh throttle |
@@ -37,10 +37,17 @@
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RAG_ENTRIES_PATH` | `~/.config/hub/rag-entries.json` | Path to RAG knowledge base |
+| `OI_EXECUTION_TIMEOUT` | `120` | Inactivity timeout in seconds — resets on any output, only fires after silence |
 | `OI_INFERENCE_HOST` | *(none)* | SSH alias for remote inference host (shows memory usage in status bar) |
 | `OI_CTX` | `44000` | Context window size (tokens) — used by WebUI bridge when no saved config exists |
 | `OI_WOL_SCRIPT` | `~/wol.sh` | Script called by `%wake` |
 | `OI_PROJECT` | *(none)* | Current project key (set by `%switch`) |
+
+## Config keys (config.json)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `session_persist` | `false` | Save/restore OI conversation across sessions (stored in `~/.cache/oi-sessions/`) |
 
 ## Modification conventions
 

@@ -16,6 +16,7 @@
     "num_ctx": 44000
   },
   "code_assistant": { "host": "local", "port": 5002 },
+  "session_persist": false,
   "backup": { "destination": "~/hub-backup" },
   "git": { "github_username": "myuser", "email": "me@example.com" },
   "research": {

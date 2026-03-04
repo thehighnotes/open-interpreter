@@ -24,6 +24,9 @@ Standalone enhancements that work without hub tools — just install and use:
 - **Callable custom_instructions** — dynamic system message that updates each turn. Enables RAG injection, project context switching, and any logic that needs to react to conversation state.
 - **Mini-RAG** — lightweight semantic retrieval engine (all-MiniLM-L6-v2, 384-dim). Loads entries from a JSON file, embeds them, and injects the best matches into the system message each turn. No vector database — just cosine similarity.
 - **Vision support** — `%image` command sends clipboard or file images to vision-capable models. Multi-image and prompted modes.
+- **Streaming command output** — output appears live in the code block as it's produced, not after the command finishes. Spinners and progress updates are visible in real time
+- **Escape to interrupt** — press Escape to cancel LLM generation or a running command and return to the prompt. The subprocess is killed cleanly
+- **Inactivity timeout** — the 120s execution timeout resets on any output. Active commands never time out; only silent ones do
 - **Sudo detection** — intercepts `sudo` commands with a warning before execution
 - **Truncation fixes** — large outputs preserve their tail (not just head), ANSI escape codes stripped cleanly
 - **Refresh throttle** — fast streaming output no longer floods the scrollback

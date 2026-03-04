@@ -76,9 +76,13 @@ import os
 import platform
 import random
 import re
+import select
 import subprocess
+import sys
 import tempfile
+import termios
 import time
+import tty
 
 from ..core.utils.scan_code import scan_code
 from ..core.utils.system_debug_info import system_info
@@ -229,6 +233,57 @@ except:
     pass
 
 
+class _EscapeWatcher:
+    """Watch for Escape key in a background thread during streaming.
+
+    Puts stdin into raw mode to detect single keypresses, then restores
+    it when stopped.  Sets `self.pressed` when Escape is detected.
+    """
+
+    def __init__(self):
+        self.pressed = False
+        self._stop = False
+        self._thread = None
+        self._old_settings = None
+
+    def start(self):
+        """Begin watching for Escape on stdin."""
+        if not sys.stdin.isatty():
+            return
+        self.pressed = False
+        self._stop = False
+        try:
+            self._old_settings = termios.tcgetattr(sys.stdin)
+        except termios.error:
+            return
+        tty.setcbreak(sys.stdin.fileno())
+        import threading
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+        self._thread.start()
+
+    def _watch(self):
+        while not self._stop:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if ready:
+                try:
+                    ch = sys.stdin.read(1)
+                except Exception:
+                    break
+                if ch == '\x1b':  # Escape
+                    self.pressed = True
+                    break
+
+    def stop(self):
+        """Stop watching and restore terminal settings."""
+        self._stop = True
+        if self._old_settings is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._old_settings)
+            except termios.error:
+                pass
+            self._old_settings = None
+
+
 def terminal_interface(interpreter, message):
     # Auto run and offline (this.. this isn't right) don't display messages.
     # Probably worth abstracting this to something like "debug_cli" at some point.
@@ -264,6 +319,7 @@ def terminal_interface(interpreter, message):
 
     active_block = None
     voice_subprocess = None
+    _esc_watcher = _EscapeWatcher()
 
     while True:
         if interactive:
@@ -360,6 +416,9 @@ def terminal_interface(interpreter, message):
             _llm_waiting = False
             _llm_spinner = None
 
+            # Escape key watcher — press Esc to interrupt LLM or command
+            _esc_watcher.start()
+
             # Show thinking indicator for initial LLM call
             if not interpreter.plain_text_display:
                 from rich.console import Console as _RCon
@@ -369,6 +428,21 @@ def terminal_interface(interpreter, message):
 
             for chunk in interpreter.chat(message, display=False, stream=True):
                 yield chunk
+
+                # Escape pressed — interrupt current operation
+                if _esc_watcher.pressed:
+                    _esc_watcher.stop()
+                    if _llm_spinner:
+                        _llm_spinner.stop()
+                        _llm_spinner = None
+                    if active_block:
+                        active_block.refresh(cursor=False)
+                        active_block.end()
+                        active_block = None
+                    if not interpreter.plain_text_display:
+                        from rich.console import Console as _RCon
+                        _RCon().print("  [dim]Interrupted[/dim]")
+                    break
 
                 # Is this for thine eyes?
                 if "recipient" in chunk and chunk["recipient"] != "user":
@@ -409,6 +483,7 @@ def terminal_interface(interpreter, message):
                             active_block.end()
                             active_block = None
 
+
                         code_to_run = chunk["content"]
                         language = code_to_run["format"]
                         code = code_to_run["content"]
@@ -447,6 +522,7 @@ def terminal_interface(interpreter, message):
                             active_block.language = language
                             active_block.code = code
                             active_block.output_only = True  # Don't re-render the code panel
+
                         elif response.strip().lower() == "e":
                             # Edit
 
@@ -472,6 +548,7 @@ def terminal_interface(interpreter, message):
                             active_block.margin_top = False  # <- Aesthetic choice
                             active_block.language = language
                             active_block.code = code
+
                         else:
                             # User declined — ask for redirect context
                             _decline_msg = "I have declined to run this code."
@@ -516,9 +593,11 @@ def terminal_interface(interpreter, message):
                         if chunk["type"] == "console":
                             active_block.end()
                             active_block = None
+
                         else:
                             active_block.end()
                             active_block = None
+
 
                         # Message ended → show inference stats + context fill
                         if chunk["type"] == "message" and _llm_first_token and not interpreter.plain_text_display:
@@ -584,6 +663,7 @@ def terminal_interface(interpreter, message):
                         _llm_first_token = time.time()
                         _llm_token_count = 0
                         active_block = MessageBlock()
+
                         render_cursor = True
 
                     if "content" in chunk:
@@ -642,6 +722,7 @@ def terminal_interface(interpreter, message):
                             _llm_waiting = False
                         active_block = CodeBlock()
                         active_block.language = chunk["format"]
+
                         render_cursor = True
 
                     if "content" in chunk:
@@ -725,10 +806,15 @@ def terminal_interface(interpreter, message):
                         # output would hit the short-circuit and fail).
                         if not hasattr(active_block, '_raw_output'):
                             active_block._raw_output = ""
-                        active_block._raw_output += "\n" + chunk["content"]
-                        active_block._raw_output = (
-                            active_block._raw_output.strip()
-                        )
+                        if chunk.get("snapshot"):
+                            # Full screen snapshot — replace (handles \r spinners)
+                            active_block._raw_output = chunk["content"].strip()
+                        else:
+                            # Delta output — append
+                            active_block._raw_output += "\n" + chunk["content"]
+                            active_block._raw_output = (
+                                active_block._raw_output.strip()
+                            )
 
                         # Collapse or truncate output for terminal display
                         _threshold = getattr(interpreter, 'display_collapse_lines', 15)
@@ -812,13 +898,15 @@ def terminal_interface(interpreter, message):
                                 active_block.end()
                             active_block = CodeBlock()
 
+
                 if active_block:
                     active_block.refresh(cursor=render_cursor)
 
-            # Clean up spinner if still active
+            # Clean up spinner and escape watcher
             if _llm_spinner:
                 _llm_spinner.stop()
                 _llm_spinner = None
+            _esc_watcher.stop()
 
             # (Sometimes -- like if they CTRL-C quickly -- active_block is still None here)
             if "active_block" in locals():
@@ -833,6 +921,7 @@ def terminal_interface(interpreter, message):
 
         except KeyboardInterrupt:
             # Exit gracefully
+            _esc_watcher.stop()
             if _llm_spinner:
                 _llm_spinner.stop()
                 _llm_spinner = None
@@ -846,6 +935,7 @@ def terminal_interface(interpreter, message):
             else:
                 break
         except:
+            _esc_watcher.stop()
             if interpreter.debug:
                 system_info(interpreter)
             raise

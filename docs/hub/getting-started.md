@@ -94,7 +94,8 @@ All hub tools read from two files:
   "ollama": { "host": "gpu", "port": 11434, "default_model": "llama3:8b", "num_ctx": 44000 },
   "code_assistant": { "host": "gpu", "port": 5002 },
   "backup": { "destination": "gpu:~/hub-backup" },
-  "git": { "github_username": "myuser", "email": "me@example.com" }
+  "git": { "github_username": "myuser", "email": "me@example.com" },
+  "session_persist": false
 }
 ```
 
