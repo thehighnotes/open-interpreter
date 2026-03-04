@@ -244,6 +244,16 @@ def prepare(project_key, no_wake=False):
         else:
             print(f"  {GRAY}● No new decisions found{RESET}")
 
+    # 4e2: Extract repo references from transcript
+    if ok:
+        with Spinner("Extracting repo references from transcript..."):
+            new_repos = extract_repos_from_transcript(project_key)
+        if new_repos:
+            for r in new_repos:
+                print(f"  {GREEN}●{RESET} Repo tracked: {r}")
+        else:
+            print(f"  {GRAY}● No new repo references found{RESET}")
+
     # 4f: Refresh code pulse (for indexed projects)
     ca_key = resolve_code_project(project_key)
     if ca_key:

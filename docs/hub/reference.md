@@ -49,6 +49,39 @@
 |-----|---------|-------------|
 | `session_persist` | `false` | Save/restore OI conversation across sessions (stored in `~/.cache/oi-sessions/`) |
 
+## projects.json schema
+
+Each project entry in `projects.json` supports these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Display name |
+| `tagline` | string | Short description |
+| `host` | string | Host key from config.json |
+| `path` | string | Project path on the host (supports `~`) |
+| `claude_md` | string | CLAUDE.md filename (empty to skip) |
+| `services` | array | Persistent services (port, name, start_cmd, dir) |
+| `dev_services` | array | Ephemeral dev servers (port, name, dev_cmd, dir, enabled) |
+| `code_index` | string | Code Assistant project key (empty to skip) |
+| `git_remote` | string | GitHub org/repo (e.g. `thehighnotes/myapp`) |
+| `git_branch` | string | Default branch |
+| `related_repos` | array | GitHub repos of interest for research monitoring |
+
+### `related_repos`
+
+A list of GitHub `org/repo` strings representing dependencies and libraries relevant to the project. Used by the `research` tool to fetch releases and score them with project-specific context.
+
+Repos are populated two ways:
+- **Automatically** — `prepare` extracts repo references from the previous session's Claude Code transcript using regex (GitHub URLs, `git clone`, `pip install git+`) and LLM analysis (package name → repo mapping)
+- **Manually** — edit `projects.json` directly
+
+Example:
+```json
+"related_repos": ["tiangolo/fastapi", "encode/httpx", "ratatui/ratatui"]
+```
+
+Repos shared across projects (e.g. `tiangolo/fastapi` used by three projects) are fetched once but scored for all owning projects. The project's own repo (`git_remote`) is automatically excluded from extraction.
+
 ## Modification conventions
 
 All modified OI source files carry a `# Modified by hub-integration` header comment so changes are easy to find. Modifications are minimal and surgical — we avoid rewriting functions, preferring to add hooks and callables that leave the original logic intact.

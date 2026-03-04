@@ -213,6 +213,7 @@ def load_projects():
     for key, proj in data['projects'].items():
         proj.setdefault('services', [])
         proj.setdefault('dev_services', [])
+        proj.setdefault('related_repos', [])
         proj.setdefault('tagline', '')
         proj.setdefault('claude_md', 'CLAUDE.md')
         proj['claude_dir'] = derive_claude_dir(proj['host'], proj['path'])
@@ -223,7 +224,7 @@ def load_projects():
 
 def save_projects(projects, order, ignored=None):
     """Write projects back to JSON (strips computed fields)."""
-    stored_fields = ('name', 'tagline', 'host', 'path', 'claude_md', 'services', 'dev_services', 'code_index', 'git_remote', 'git_branch')
+    stored_fields = ('name', 'tagline', 'host', 'path', 'claude_md', 'services', 'dev_services', 'code_index', 'git_remote', 'git_branch', 'related_repos')
     data = {'projects': {}, 'order': list(order)}
     for key, proj in projects.items():
         data['projects'][key] = {k: v for k, v in proj.items() if k in stored_fields}
@@ -1705,6 +1706,142 @@ Rules:
         existing_texts.add(desc.lower())
 
     return new_decisions
+
+
+def extract_repos_from_transcript(project_key):
+    """Extract GitHub repo references from the latest transcript.
+
+    Uses regex to find GitHub URLs, git clone commands, and pip git+ installs.
+    Then uses Ollama to identify notable package/library references that map to repos.
+    Merges new repos into the project's related_repos list in projects.json.
+    Returns list of newly added repo strings (e.g. "encode/starlette").
+    """
+    proj = PROJECTS[project_key]
+    host_alias = HOSTS[proj['host']]['alias']
+    claude_dir = proj.get('claude_dir')
+    if not claude_dir:
+        return []
+
+    # Get latest transcript
+    cmd = (
+        f'find ~/.claude/projects/{claude_dir}/ -maxdepth 1 -name "*.jsonl" '
+        f'-printf "%T@ %p\\n" 2>/dev/null | sort -rn | head -1'
+    )
+    ok, output = ssh_cmd(host_alias, cmd, timeout=5)
+    if not ok or not output.strip():
+        return []
+
+    parts = output.strip().split(' ', 1)
+    if len(parts) != 2:
+        return []
+    jsonl_path = parts[1]
+
+    ok, raw = ssh_cmd(host_alias, f'cat {jsonl_path}', timeout=15)
+    if not ok or not raw:
+        return []
+
+    # Condense transcript text
+    full_text = []
+    for jline in raw.split('\n'):
+        jline = jline.strip()
+        if not jline:
+            continue
+        try:
+            obj = json.loads(jline)
+        except json.JSONDecodeError:
+            continue
+        typ = obj.get('type', '')
+        if typ not in ('user', 'assistant'):
+            continue
+        msg = obj.get('message', {})
+        content = msg.get('content', '')
+        if isinstance(content, str):
+            full_text.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if block.get('type') == 'text' and block.get('text', '').strip():
+                    full_text.append(block['text'])
+
+    text = '\n'.join(full_text)
+    if not text:
+        return []
+
+    # Phase 1: Regex extraction (fast, no LLM needed)
+    repo_pattern = re.compile(
+        r'(?:https?://)?github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)',
+        re.IGNORECASE
+    )
+    git_clone_pattern = re.compile(
+        r'git\s+clone\s+(?:https?://)?github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)',
+        re.IGNORECASE
+    )
+    pip_git_pattern = re.compile(
+        r'pip\s+install\s+git\+https?://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)',
+        re.IGNORECASE
+    )
+
+    found_repos = set()
+    for pattern in [repo_pattern, git_clone_pattern, pip_git_pattern]:
+        for match in pattern.finditer(text):
+            repo = match.group(1).rstrip('./')
+            # Strip .git suffix
+            if repo.endswith('.git'):
+                repo = repo[:-4]
+            found_repos.add(repo)
+
+    # Phase 2: LLM extraction for package references (if AGX is reachable)
+    # Use last ~6000 chars for efficiency
+    transcript_tail = text[-6000:] if len(text) > 6000 else text
+    if OLLAMA_HOST == LOCAL_HOST or check_host_reachable(OLLAMA_HOST):
+        system_msg = """/no_think
+You identify GitHub repositories referenced in development conversations.
+Return JSON: {"repos": ["org/repo", ...]}
+Rules:
+- Extract repos that were meaningfully discussed, used, or referenced
+- Convert package names to their GitHub repos when obvious (e.g. "starlette" → "encode/starlette", "fastapi" → "tiangolo/fastapi")
+- Only include repos the developer interacted with or considered using — not passing mentions
+- Use "org/repo" format (e.g. "pytorch/pytorch", not full URLs)
+- Do NOT include the project's own repo
+- Return {"repos": []} if none found
+- Max 10 repos per session"""
+
+        user_msg = f"Find GitHub repos referenced in this {proj['name']} session:\n\n{transcript_tail}"
+
+        result = ollama_query(
+            model=DEFAULT_MODEL,
+            system_msg=system_msg,
+            user_msg=user_msg,
+            timeout=60,
+            temperature=0.2,
+            num_predict=512,
+        )
+
+        if result and isinstance(result.get('repos'), list):
+            for repo in result['repos'][:10]:
+                if isinstance(repo, str) and '/' in repo:
+                    repo = repo.strip().rstrip('./')
+                    if repo.endswith('.git'):
+                        repo = repo[:-4]
+                    found_repos.add(repo)
+
+    if not found_repos:
+        return []
+
+    # Filter out the project's own repo
+    own_remote = proj.get('git_remote', '')
+    if own_remote:
+        found_repos.discard(own_remote)
+
+    # Merge into projects.json (deduplicate)
+    existing = set(proj.get('related_repos', []))
+    new_repos = sorted(found_repos - existing)
+
+    if new_repos:
+        proj['related_repos'] = sorted(existing | found_repos)
+        save_projects(PROJECTS, PROJECT_ORDER, IGNORED)
+        reload_projects()
+
+    return new_repos
 
 
 def read_decisions(project_key, limit=None, category=None):

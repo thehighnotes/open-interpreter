@@ -128,6 +128,7 @@ def generate_digests(items_data):
                 'published': item.get('published', ''),
                 'score': score_val,
                 'reason': proj_score.get('reason', ''),
+                'actionable': proj_score.get('actionable', ''),
                 'age_days': age_days,
             }
 
@@ -273,26 +274,46 @@ def fetch_arxiv(known_ids):
             'url': f'https://arxiv.org/abs/{arxiv_id}',
             'published': published,
             'fetched': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
-            'abstract': abstract[:1500],
+            'abstract': abstract[:4000],
             'scores': {},
         })
 
     return items
 
 
-def fetch_github_releases(known_ids):
-    """Fetch latest releases from tracked GitHub repos.
+def _collect_all_github_repos():
+    """Build combined set of global + per-project GitHub repos.
 
-    Returns list of new item dicts (not yet scored).
+    Returns (all_repos_set, project_repo_map) where project_repo_map is
+    {repo: [project_keys]} for per-project repos (used for scoring context).
+    """
+    all_repos = set(GITHUB_REPOS)
+    project_repo_map = {}  # repo → [project_keys that care about it]
+
+    for pk in PROJECT_ORDER:
+        proj = PROJECTS[pk]
+        for repo in proj.get('related_repos', []):
+            all_repos.add(repo)
+            project_repo_map.setdefault(repo, []).append(pk)
+
+    return all_repos, project_repo_map
+
+
+def fetch_github_releases(known_ids):
+    """Fetch latest releases from tracked GitHub repos (global + per-project).
+
+    Returns (items_list, project_repo_map) where project_repo_map links
+    per-project repos to their owning projects for scoring context.
     """
     try:
         import urllib.request
     except ImportError:
-        return []
+        return [], {}
 
+    all_repos, project_repo_map = _collect_all_github_repos()
     items = []
 
-    for repo in GITHUB_REPOS:
+    for repo in sorted(all_repos):
         url = f'https://api.github.com/repos/{repo}/releases?per_page=3'
         try:
             req = urllib.request.Request(url, headers={
@@ -329,18 +350,24 @@ def fetch_github_releases(known_ids):
                 except ValueError:
                     published = published_at[:10]
 
-            items.append({
+            item = {
                 'id': item_id,
                 'source': 'github',
                 'title': f'{repo} {name}',
                 'url': html_url,
                 'published': published,
                 'fetched': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
-                'abstract': body[:1500],
+                'abstract': body[:4000],
                 'scores': {},
-            })
+            }
 
-    return items
+            # Tag with source projects if this is a per-project repo
+            if repo in project_repo_map:
+                item['source_projects'] = project_repo_map[repo]
+
+            items.append(item)
+
+    return items, project_repo_map
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,35 +402,45 @@ def build_project_contexts():
 def score_item(item, project_contexts):
     """Score a single item against all projects via Ollama on AGX.
 
-    Returns scores dict: {project_key: {score: N, reason: "..."}}
+    Returns scores dict: {project_key: {score: N, reason: "...", actionable: "..."}}
     """
     source = item.get('source', 'unknown')
     title = item.get('title', '')
     abstract = item.get('abstract', '')
+    source_projects = item.get('source_projects', [])
 
     projects_block = '\n'.join(
         f'  {pk}: {ctx}' for pk, ctx in project_contexts.items()
     )
 
-    system_msg = '/no_think\nYou are a relevance scoring tool. Output ONLY a JSON object. No other text.'
+    # Note if this item came from a project-specific repo
+    source_hint = ''
+    if source_projects:
+        source_hint = f'\n  Tracked by: {", ".join(source_projects)} (score these projects carefully — this is a dependency they use)'
 
-    user_msg = f"""Score this item's relevance to each project (0-10).
+    system_msg = '/no_think\nYou are a relevance scoring tool for a multi-project development hub. Output ONLY a JSON object. No other text.'
 
-0 = completely unrelated
-3 = tangentially related (same broad field)
-6 = moderately relevant (related technique or dependency)
-8 = highly relevant (directly applicable to current work)
-10 = critical (solves an active blocker or is a direct dependency update)
+    user_msg = f"""Score this item's relevance to each project (0-10) and explain how it could be applied.
+
+Scoring rules:
+- 0 = completely unrelated — no connection to the project's domain or tech
+- 3 = tangentially related — same broad field but no direct application
+- 5 = loosely related — shares some technology but not directly useful now
+- 7 = relevant — addresses a technology or technique the project uses
+- 8 = highly relevant — directly applicable to current work or active focus
+- 10 = critical — solves an active blocker or is a direct dependency update
+
+IMPORTANT: Only score ≥6 if the item directly mentions a technology the project uses, addresses a listed blocker, or is a tracked dependency release. Broad-field overlap alone is NOT enough for ≥6.
 
 Item:
   Source: {source}
   Title: {title}
-  Content: {abstract[:1000]}
+  Content: {abstract[:3000]}{source_hint}
 
 Projects:
 {projects_block}
 
-Return: {{{', '.join(f'"{pk}": {{"score": N, "reason": "..."}}' for pk in PROJECT_ORDER)}}}"""
+Return: {{{', '.join(f'"{pk}": {{"score": N, "reason": "brief justification", "actionable": "how this could be applied (or empty if score < 7)"}}' for pk in PROJECT_ORDER)}}}"""
 
     data = ollama_query(
         model=DEFAULT_MODEL,
@@ -411,7 +448,7 @@ Return: {{{', '.join(f'"{pk}": {{"score": N, "reason": "..."}}' for pk in PROJEC
         user_msg=user_msg,
         timeout=90,
         temperature=0.2,
-        num_predict=512,
+        num_predict=1024,
     )
 
     if data is None:
@@ -429,11 +466,15 @@ def parse_scores_from_dict(data):
         if pk in data and isinstance(data[pk], dict):
             score = data[pk].get('score', 0)
             reason = data[pk].get('reason', '')
+            actionable = data[pk].get('actionable', '')
             try:
                 score = int(float(score))
             except (ValueError, TypeError):
                 score = 0
-            scores[pk] = {'score': max(0, min(10, score)), 'reason': str(reason)[:200]}
+            entry = {'score': max(0, min(10, score)), 'reason': str(reason)[:200]}
+            if actionable and str(actionable).strip():
+                entry['actionable'] = str(actionable)[:300]
+            scores[pk] = entry
     return scores
 
 
@@ -467,8 +508,11 @@ def do_fetch():
     new_items.extend(arxiv_items)
 
     with Spinner("Fetching GitHub releases..."):
-        github_items = fetch_github_releases(known_ids)
-    print(f"  {GREEN}●{RESET} GitHub: {len(github_items)} new releases")
+        github_items, project_repo_map = fetch_github_releases(known_ids)
+    project_repo_count = len(project_repo_map)
+    global_count = len(GITHUB_REPOS)
+    total_repos = len(set(GITHUB_REPOS) | set(project_repo_map.keys()))
+    print(f"  {GREEN}●{RESET} GitHub: {len(github_items)} new releases ({total_repos} repos: {global_count} global + {project_repo_count} project-specific)")
     new_items.extend(github_items)
 
     if not new_items:
@@ -764,6 +808,9 @@ def render_project_detail(project_key):
             reason = item.get('reason', '')
             if reason:
                 print(f"         {DIM}{reason}{RESET}")
+            actionable = item.get('actionable', '')
+            if actionable:
+                print(f"         {CYAN}→ {actionable}{RESET}")
             print()
     else:
         print(f"  {WHITE}RELEVANT PAPERS{RESET}")
@@ -786,6 +833,9 @@ def render_project_detail(project_key):
             reason = item.get('reason', '')
             if reason:
                 print(f"         {DIM}{reason}{RESET}")
+            actionable = item.get('actionable', '')
+            if actionable:
+                print(f"         {CYAN}→ {actionable}{RESET}")
             print()
     else:
         print(f"  {WHITE}TRACKED RELEASES{RESET}")
@@ -853,6 +903,18 @@ def render_status():
     print(f"  Aging (>7d):  {aging}")
     print()
 
+    # Per-project tracked repos
+    all_project_repos = _collect_all_github_repos()[1]
+    if all_project_repos:
+        print(f"  {WHITE}PROJECT-SPECIFIC REPOS{RESET}")
+        divider()
+        for pk in PROJECT_ORDER:
+            proj = PROJECTS[pk]
+            repos = proj.get('related_repos', [])
+            if repos:
+                print(f"  {pk:12s}  {', '.join(repos[:5])}{' +' + str(len(repos)-5) if len(repos) > 5 else ''}")
+        print()
+
     # Per-project digest stats
     print(f"  {WHITE}DIGESTS{RESET}")
     divider()
@@ -918,8 +980,9 @@ def print_usage():
   {', '.join(PROJECT_ORDER) if PROJECT_ORDER else '(none — run hub --scan first)'}
 
 {WHITE}Sources:{RESET}
-  arxiv:  {', '.join(ARXIV_CATEGORIES)}
-  GitHub: {', '.join(GITHUB_REPOS)}
+  arxiv:   {', '.join(ARXIV_CATEGORIES)}
+  GitHub:  {', '.join(GITHUB_REPOS)} (global)
+  + per-project repos from projects.json (auto-discovered from sessions)
 
 {WHITE}Cron:{RESET}
   0 */6 * * * ~/research --fetch >> ~/.cache/research/research.log 2>&1

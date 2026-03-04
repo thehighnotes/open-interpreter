@@ -235,7 +235,7 @@ Four-step flow:
 1. **Check host** — SSH probe; sends Wake-on-LAN if the host has the `wakeable` role (waits up to 120s)
 2. **Warm Ollama** — background curl to load the model into GPU memory
 3. **Start services** — launches persistent services (from `projects.json`) + enabled dev services in tmux
-4. **Refresh cache** — runs `overview --refresh`, fetches code pulse from Code Assistant, extracts decisions from session journal
+4. **Refresh cache** — runs `overview --refresh`, fetches code pulse from Code Assistant, extracts decisions from session journal, extracts repo references for the research tool
 
 ### `begin` — Session Bootstrap
 
@@ -297,7 +297,7 @@ Results are cached per-project in `~/.cache/overview/` for fast re-access. The c
 
 ## `research` — Arxiv & GitHub Monitor
 
-Continuous research monitoring that fetches papers and releases, scores them against your projects via Ollama.
+Continuous research monitoring that fetches papers and releases, scores them against your projects via Ollama. Automatically discovers relevant repos from your development sessions.
 
 ```
 research                        Show digests for all projects
@@ -307,11 +307,62 @@ research --calibrate            Score test items against threshold matrix
 research --status               Fetch state, item counts, source health
 ```
 
-**Sources:**
-- **Arxiv** — cs.AS, cs.SD, cs.CL, cs.LG, cs.AI categories
-- **GitHub** — releases from TensorRT, Ollama, PyTorch, llama.cpp (configurable)
+### Sources
 
-Items are scored 1-10 for relevance against each project. Threshold is 7 (configurable). Items older than 30 days are pruned. State is deduplicated by arxiv ID.
+Two layers of GitHub monitoring plus arxiv:
+
+- **Arxiv** — cs.AS, cs.SD, cs.CL, cs.LG, cs.AI categories, keyword-filtered
+- **Global GitHub repos** — TensorRT, Ollama, PyTorch, llama.cpp (configurable in `config.json`)
+- **Per-project GitHub repos** — tracked in `projects.json` under `related_repos` per project
+
+Per-project repos are discovered automatically: when `prepare` runs at the start of a session, it scans the previous session's transcript for GitHub URLs, `git clone` commands, `pip install git+` references, and notable package names. New repos are merged into `projects.json` and picked up by the next `research --fetch`. You can also add them manually by editing `projects.json`.
+
+Repos shared across projects (e.g. `tiangolo/fastapi` used by three projects) are fetched once but scored for all owning projects.
+
+### Scoring
+
+Items are scored 0-10 for relevance against each project simultaneously via a single Ollama call per item:
+
+| Score | Meaning |
+|-------|---------|
+| 0 | Completely unrelated |
+| 3 | Tangentially related (same broad field) |
+| 5 | Loosely related (shares some technology) |
+| 7 | Relevant (addresses a technology the project uses) |
+| 8 | Highly relevant (directly applicable to current work) |
+| 10 | Critical (solves an active blocker or is a direct dependency update) |
+
+The scoring prompt enforces strict rules: items only score ≥6 if they directly mention a project's technology, address a listed blocker, or are a tracked dependency release. Items from per-project repos include a hint to the model identifying which projects track that dependency.
+
+Each score includes:
+- **reason** — brief justification for the score
+- **actionable** — how the item could be applied (for scores ≥7)
+
+### Display
+
+The **compact digest** (`research`) shows the top 3 papers and 2 releases per project with score, age, and title.
+
+The **detailed view** (`research <project>`) adds URLs, reasons, and actionable insights highlighted in cyan:
+
+```
+  [10] ↑ ratatui/ratatui ratatui-v0.30.0
+       https://github.com/ratatui/ratatui/releases/tag/v0.30.0  (12d ago)
+       Direct dependency — ratatui is the TUI framework for LearnLocal
+       → Update ratatui dependency to v0.30.0 for new widget APIs
+```
+
+### Status
+
+`research --status` shows fetch timestamps, cache stats, age distribution, per-project digest summaries, per-project tracked repos, and Ollama health.
+
+### Configuration
+
+- **Threshold:** `config.json` → `research.threshold` (default: 7)
+- **Arxiv categories:** `config.json` → `research.arxiv_categories`
+- **Arxiv keywords:** `config.json` → `research.arxiv_keywords`
+- **Global repos:** `config.json` → `research.github_repos`
+- **Per-project repos:** `projects.json` → `<project>.related_repos`
+- **Pruning:** items older than 30 days are removed on each fetch
 
 **Cron:** `0 */6 * * * ~/research --fetch >> ~/.cache/research/research.log 2>&1`
 
