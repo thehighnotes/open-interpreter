@@ -81,6 +81,18 @@ def respond(interpreter):
 
         ### RUN THE LLM ###
 
+        # Count prompt tokens for context tracking
+        try:
+            from ..terminal_interface.utils.count_tokens import count_tokens
+            _prompt_tokens = 0
+            for _m in messages_for_llm:
+                _c = _m.get("content", "")
+                if isinstance(_c, str) and _c:
+                    _prompt_tokens += count_tokens(_c)
+            interpreter._last_prompt_tokens = _prompt_tokens
+        except Exception:
+            interpreter._last_prompt_tokens = 0
+
         assert (
             len(interpreter.messages) > 0
         ), "User message was not passed in. You need to pass in at least one message."

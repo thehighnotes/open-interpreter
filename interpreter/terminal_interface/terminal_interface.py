@@ -533,15 +533,19 @@ def terminal_interface(interpreter, message):
                             _stats_parts.append(f"gen {_gen:.1f}s")
                             if _tps > 0:
                                 _stats_parts.append(f"~{_tps:.0f} tok/s")
-                            # Context fill estimate (~4 chars per token)
+                            # Context fill — use real token count from respond.py
                             _ctx_win = getattr(interpreter.llm, 'context_window', 0)
-                            if _ctx_win > 0:
-                                _sys_chars = len(getattr(interpreter, 'system_message', '') or '')
-                                _msg_chars = sum(len(str(m.get('content', ''))) for m in interpreter.messages)
-                                _est_tokens = (_sys_chars + _msg_chars) // 4
-                                _ctx_pct = min(int(_est_tokens / _ctx_win * 100), 100)
+                            _prompt_tok = getattr(interpreter, '_last_prompt_tokens', 0)
+                            if _ctx_win > 0 and _prompt_tok > 0:
+                                _ctx_pct = min(int(_prompt_tok / _ctx_win * 100), 100)
                                 _ctx_color = "green" if _ctx_pct < 60 else "yellow" if _ctx_pct < 80 else "red"
-                                _stats_parts.append(f"[{_ctx_color}]ctx {_ctx_pct}%[/{_ctx_color}]")
+                                # Format token counts: 1234 → "1.2K", 44000 → "44K"
+                                def _fmt_k(n):
+                                    if n >= 1000:
+                                        v = n / 1000
+                                        return f"{v:.1f}K" if v < 10 else f"{v:.0f}K"
+                                    return str(n)
+                                _stats_parts.append(f"[{_ctx_color}]ctx {_fmt_k(_prompt_tok)}/{_fmt_k(_ctx_win)} ({_ctx_pct}%)[/{_ctx_color}]")
                             # Remote inference host memory usage (quick SSH probe)
                             _inf_host = os.environ.get("OI_INFERENCE_HOST", "")
                             if _inf_host:

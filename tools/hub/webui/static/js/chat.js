@@ -257,6 +257,18 @@ const Chat = {
               break;
 
             case 'done':
+              if (event.stats) {
+                const pt = event.stats.prompt_tokens;
+                const cw = event.stats.context_window;
+                if (pt > 0 && cw > 0) {
+                  const pct = Math.min(Math.round(pt / cw * 100), 100);
+                  const fmtK = n => n >= 1000 ? (n < 10000 ? (n/1000).toFixed(1)+'K' : Math.round(n/1000)+'K') : n;
+                  const statsEl = document.createElement('div');
+                  statsEl.className = 'msg-stats';
+                  statsEl.textContent = `ctx ${fmtK(pt)} / ${fmtK(cw)} (${pct}%)`;
+                  msgDiv.querySelector('.msg-body').appendChild(statsEl);
+                }
+              }
               break;
           }
         }

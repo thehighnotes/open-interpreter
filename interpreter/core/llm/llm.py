@@ -301,6 +301,10 @@ Continuing...
         if hasattr(self.interpreter, "conversation_id"):
             params["conversation_id"] = self.interpreter.conversation_id
 
+        # Pass num_ctx for Ollama models so the server allocates the right context
+        if model.startswith("ollama/") and self.context_window:
+            params["num_ctx"] = self.context_window
+
         # Set some params directly on LiteLLM
         if self.max_budget:
             litellm.max_budget = self.max_budget

@@ -43,6 +43,7 @@ A single Starlette server hosts the API and serves static files. The interpreter
 - **Code approval** — unsafe commands show a code block with Run/Skip buttons; safe commands (read-only, hub tools) auto-run using the same `_SAFE_PREFIXES` list as the terminal OI profile
 - **Magic commands** — lines starting with `%` are detected client-side and routed to `POST /api/magic`, which runs the corresponding hub tool and returns output in a terminal-style block
 - **Image upload** — button next to the input opens a file picker (with camera capture on mobile); uploads to `/tmp/oi-images/` and inserts an `%image /path` message
+- **Context stats** — after each response, a `ctx 3.4K / 44K (8%)` footer shows real token usage (prompt tokens vs context window)
 - **Session restore** — on page load, previous messages are fetched from the interpreter's in-memory history
 - **Welcome screen** — suggestion chips for common actions (Hub Status, My Projects, Research Digest, Git Activity)
 

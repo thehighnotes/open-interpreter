@@ -28,6 +28,7 @@ Standalone enhancements that work without hub tools — just install and use:
 - **Truncation fixes** — large outputs preserve their tail (not just head), ANSI escape codes stripped cleanly
 - **Refresh throttle** — fast streaming output no longer floods the scrollback
 - **Rich output panels** — colored diffs, aligned tables, highlighted errors
+- **Context token tracking** — real token counts (via tiktoken) shown after each response in both terminal (`ctx 3.4K/44K (8%)`) and WebUI, with color-coded fill level
 - **Vendored tokentrim** — fixes a [double-subtraction bug](https://github.com/KillianLucas/tokentrim/issues/11) in context window management
 
 Full reference: **[OI Improvements documentation](docs/hub/oi-improvements.md)**

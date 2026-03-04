@@ -90,6 +90,22 @@ Set `RAG_ENTRIES_PATH` to load entries from a different path:
 export RAG_ENTRIES_PATH=/path/to/my-entries.json
 ```
 
+## Context token tracking
+
+Real-time tracking of how much context window is used per turn. Before each LLM call, the prompt is tokenized (via tiktoken) and the count is displayed in both the terminal and WebUI.
+
+**Terminal** — shown in the stats line after each response:
+```
+  prompt 1.2s | gen 4.8s | ~22 tok/s | ctx 3.4K/44K (8%)
+```
+
+**WebUI** — shown as a footer below each assistant message:
+```
+  ctx 3.4K / 44K (8%)
+```
+
+Color coding: green (<60%), yellow (60–80%), red (>80%). The `context_window` value is set in your profile or `config.json` and also passed as `num_ctx` to Ollama so the server allocates the right KV cache.
+
 ## Other improvements
 
 | Feature | What it does |

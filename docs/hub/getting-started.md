@@ -45,7 +45,7 @@ from interpreter import interpreter
 interpreter.llm.model = "ollama/llama3:8b"         # any Ollama model
 interpreter.llm.api_base = "http://localhost:11434" # Ollama host (local or remote IP)
 interpreter.llm.api_key = "unused"
-interpreter.llm.context_window = 8000
+interpreter.llm.context_window = 44000              # num_ctx sent to Ollama
 interpreter.llm.max_tokens = 1000
 interpreter.llm.supports_functions = False
 interpreter.llm.supports_vision = False
@@ -91,7 +91,7 @@ All hub tools read from two files:
       "roles": ["wakeable"], "wol_mac": "AA:BB:CC:DD:EE:FF"
     }
   },
-  "ollama": { "host": "gpu", "port": 11434, "default_model": "llama3:8b" },
+  "ollama": { "host": "gpu", "port": 11434, "default_model": "llama3:8b", "num_ctx": 44000 },
   "code_assistant": { "host": "gpu", "port": 5002 },
   "backup": { "destination": "gpu:~/hub-backup" },
   "git": { "github_username": "myuser", "email": "me@example.com" }

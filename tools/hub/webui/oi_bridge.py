@@ -95,7 +95,7 @@ class OIBridge:
         interpreter.llm.api_base = _OLLAMA_BASE
         interpreter.llm.api_key = "unused"
         interpreter.llm.context_window = self._saved_cfg.get(
-            "context_window", int(os.environ.get("OI_CTX", 16000)))
+            "context_window", int(os.environ.get("OI_CTX", 44000)))
         interpreter.llm.max_tokens = self._saved_cfg.get("max_tokens", 1200)
         interpreter.llm.supports_functions = False
         interpreter.llm.supports_vision = True
@@ -233,7 +233,14 @@ class OIBridge:
             if error_holder[0]:
                 yield f"data: {json.dumps({'type': 'error', 'content': error_holder[0]})}\n\n"
 
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            # Emit context stats with done event
+            _done = {'type': 'done'}
+            if self._interpreter:
+                _pt = getattr(self._interpreter, '_last_prompt_tokens', 0)
+                _cw = getattr(self._interpreter.llm, 'context_window', 0)
+                if _pt > 0 and _cw > 0:
+                    _done['stats'] = {'prompt_tokens': _pt, 'context_window': _cw}
+            yield f"data: {json.dumps(_done)}\n\n"
 
         finally:
             self._current_thread = None

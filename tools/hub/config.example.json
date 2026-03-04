@@ -12,7 +12,8 @@
   "ollama": {
     "host": "local",
     "port": 11434,
-    "default_model": "llama3.2:3b"
+    "default_model": "llama3.2:3b",
+    "num_ctx": 44000
   },
   "code_assistant": { "host": "local", "port": 5002 },
   "backup": { "destination": "~/hub-backup" },

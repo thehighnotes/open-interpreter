@@ -325,6 +325,15 @@
   margin: 0.5em 0;
 }
 
+/* Context stats footer */
+.msg-stats {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  text-align: right;
+  padding: var(--space-xs) 0 0;
+  opacity: 0.6;
+}
+
 /* Code blocks from OI */
 .code-block {
   background: #0d0d0d;
