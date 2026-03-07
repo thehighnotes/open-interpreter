@@ -432,7 +432,12 @@ def launch_claude(project_key, proj, host, host_alias, continue_session):
 
 
 def launch_oi(project_key, preamble, continue_session):
-    """Launch Open Interpreter locally with project context."""
+    """Launch Open Interpreter with project context.
+
+    Hub role: if the project host IS this machine, launch locally.
+              Otherwise SSH into the project host and launch there.
+    Node role: always launch locally (we are the project host).
+    """
     proj = PROJECTS[project_key]
     host_key = proj['host']
     host_alias = HOSTS[host_key]['alias']
@@ -445,82 +450,216 @@ def launch_oi(project_key, preamble, continue_session):
     with open(preamble_path, 'w') as f:
         f.write(preamble)
 
-    # Set env vars for OI profile to pick up
-    os.environ['OI_PROJECT'] = project_key
-    os.environ['OI_PROJECT_HOST'] = host_alias
-    os.environ['OI_PROJECT_PATH'] = proj['path']
+    # Determine whether to launch locally or remotely
+    launch_remote = is_hub() and host_key != LOCAL_HOST
 
-    print()
-    print(f"  {CYAN}Launching Open Interpreter (project mode)...{RESET}")
-    print()
+    if launch_remote:
+        # Hub launching OI on a remote node — SCP preamble, then SSH in
+        print()
+        print(f"  {CYAN}Launching Open Interpreter on {HOSTS[host_key]['name']}...{RESET}")
+        print()
 
-    os.execvp('interpreter', ['interpreter', '--profile', 'linux-admin'])
+        # Copy preamble to remote host
+        scp_result = subprocess.run(
+            ['scp', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+             preamble_path, f'{host_alias}:/tmp/_oi_preamble.txt'],
+            capture_output=True, text=True, timeout=10
+        )
+        if scp_result.returncode != 0:
+            print(f"  {RED}● Failed to copy preamble to {HOSTS[host_key]['name']}{RESET}")
+            sys.exit(1)
+
+        # SSH into remote host and launch interpreter there
+        # OI_PROJECT_HOST="" signals local file mode (no SSH prefix needed)
+        remote_cmd = (
+            f'cd {proj["path"]} && '
+            f'OI_PROJECT={project_key} '
+            f'OI_PROJECT_HOST= '
+            f'OI_PROJECT_PATH={proj["path"]} '
+            f'OI_HUB_HOST={LOCAL_HOST} '
+            f'interpreter --profile linux-admin'
+        )
+        os.execvp('ssh', [
+            'ssh', '-t',
+            '-o', 'ConnectTimeout=3',
+            '-o', 'StrictHostKeyChecking=no',
+            host_alias,
+            remote_cmd
+        ])
+    else:
+        # Launch locally — files are local
+        os.environ['OI_PROJECT'] = project_key
+        os.environ['OI_PROJECT_HOST'] = ''  # empty = files are local
+        os.environ['OI_PROJECT_PATH'] = proj['path']
+        os.environ['OI_HUB_HOST'] = HUB_HOST or ''
+
+        print()
+        print(f"  {CYAN}Launching Open Interpreter (project mode)...{RESET}")
+        print()
+
+        os.execvp('interpreter', ['interpreter', '--profile', 'linux-admin'])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main flow
 # ─────────────────────────────────────────────────────────────────────────────
 
-def begin(project_key, continue_session=False, dry_run=False, use_oi=False):
-    """Bootstrap a Claude Code (or OI) session with context."""
+def begin_from_node(project_key, continue_session=False, dry_run=False, use_oi=False):
+    """Node-side begin: delegate context to hub, launch OI locally.
+
+    The hub owns all state (caches, journals, overview). The node asks
+    the hub to build the preamble via `begin --preamble-only`, then
+    launches OI locally with native file access.
+    """
+    proj = PROJECTS[project_key]
+
+    print()
+    header_bar()
+    mode = "OI" if use_oi else "NEW SESSION"
+    print(f"{BRIGHT_GREEN}  BEGIN — {proj['name']} ({mode}) on {HOSTS.get(LOCAL_HOST, {}).get('name', LOCAL_HOST)}{RESET}")
+    header_bar()
+    print()
+
+    # Check hub reachability
+    print(f"  {WHITE}[1/3]{RESET} Checking hub ({HUB_HOST})...")
+    if not check_host_reachable(HUB_HOST):
+        print(f"  {RED}● Hub ({HUB_HOST}) unreachable — cannot build context{RESET}")
+        sys.exit(1)
+    print(f"  {GREEN}● Hub is online{RESET}")
+
+    # Ask hub to build preamble + record session start
+    print(f"  {WHITE}[2/3]{RESET} Building context via hub...")
+    oi_flag = ' --oi' if use_oi else ''
+    ok, preamble = ssh_cmd(HUB_HOST,
+        f'~/begin {project_key} --preamble-only{oi_flag}',
+        timeout=30)
+    if not ok or not preamble:
+        print(f"  {YELLOW}● Hub preamble failed — launching without context{RESET}")
+        preamble = f"SESSION: {proj['name']} (no hub context available)"
+
+    if dry_run:
+        print()
+        label = "COMPRESSED PREAMBLE" if use_oi else "PREAMBLE PREVIEW"
+        print(f"  {WHITE}--- {label} ({len(preamble)} chars) ---{RESET}")
+        print()
+        for line in preamble.split('\n'):
+            print(f"  {GRAY}{line}{RESET}")
+        print()
+        header_bar()
+        print(f"{GRAY}  Dry run — no session launched{RESET}")
+        header_bar()
+        return
+
+    # Launch
+    print(f"  {WHITE}[3/3]{RESET} Launching...")
+    launch_oi(project_key, preamble, continue_session)
+
+
+def begin(project_key, continue_session=False, dry_run=False, use_oi=False,
+          preamble_only=False):
+    """Bootstrap a Claude Code (or OI) session with context.
+
+    On a node, delegates to begin_from_node() which calls back to hub.
+    The --preamble-only flag outputs raw preamble text to stdout (for nodes
+    to capture) and records the session start event, but doesn't launch.
+    """
+    # Node: use the node-specific flow
+    if is_node() and HUB_HOST and not preamble_only:
+        begin_from_node(project_key, continue_session, dry_run, use_oi)
+        return
+
     proj = PROJECTS[project_key]
     host_key = proj['host']
     host = HOSTS[host_key]
     host_alias = host['alias']
 
-    print()
-    header_bar()
-    mode = "OI" if use_oi else "CONTINUE" if continue_session else "NEW SESSION"
-    print(f"{BRIGHT_GREEN}  BEGIN — {proj['name']} ({mode}){RESET}")
-    header_bar()
-    print()
+    if not preamble_only:
+        print()
+        header_bar()
+        mode = "OI" if use_oi else "CONTINUE" if continue_session else "NEW SESSION"
+        print(f"{BRIGHT_GREEN}  BEGIN — {proj['name']} ({mode}){RESET}")
+        header_bar()
+        print()
 
     # Step 1: Check host
-    print(f"  {WHITE}[1/5]{RESET} Checking {host['name']}...")
+    if not preamble_only:
+        print(f"  {WHITE}[1/5]{RESET} Checking {host['name']}...")
     if not check_host_reachable(host_alias):
+        if preamble_only:
+            sys.exit(1)
         print(f"  {host_offline_msg(host_key, project_key)}")
         sys.exit(1)
-    print(f"  {GREEN}● {host['name']} is online{RESET}")
+    if not preamble_only:
+        print(f"  {GREEN}● {host['name']} is online{RESET}")
 
     # Step 2: Gather context
-    print(f"  {WHITE}[2/5]{RESET} Gathering context...")
+    if not preamble_only:
+        print(f"  {WHITE}[2/5]{RESET} Gathering context...")
 
     notes_str = fetch_notes(project_key)
     git_str = fetch_git_log(host_alias, proj['path'])
 
     # Step 3: Load overview cache (local file)
-    print(f"  {WHITE}[3/5]{RESET} Loading overview cache...")
+    if not preamble_only:
+        print(f"  {WHITE}[3/5]{RESET} Loading overview cache...")
     cache_data = load_overview_cache(project_key)
-    if cache_data:
-        print(f"  {GREEN}● Cache loaded{RESET}")
-    else:
-        print(f"  {YELLOW}● No cache — run {WHITE}prepare {project_key}{YELLOW} for richer context{RESET}")
+    if not preamble_only:
+        if cache_data:
+            print(f"  {GREEN}● Cache loaded{RESET}")
+        else:
+            print(f"  {YELLOW}● No cache — run {WHITE}prepare {project_key}{YELLOW} for richer context{RESET}")
 
     # Step 4: Quick environment probe
-    print(f"  {WHITE}[4/5]{RESET} Checking environment...")
+    if not preamble_only:
+        print(f"  {WHITE}[4/5]{RESET} Checking environment...")
     env_status = None
     services = load_services(project_key)
     if services:
         running = sum(1 for svc in services if probe_service(host_alias, svc['port'], timeout=3))
         env_status = f"{running}/{len(services)} services running"
-        color = GREEN if running == len(services) else YELLOW
-        print(f"  {color}● {env_status}{RESET}")
-    else:
+        if not preamble_only:
+            color = GREEN if running == len(services) else YELLOW
+            print(f"  {color}● {env_status}{RESET}")
+    elif not preamble_only:
         print(f"  {GRAY}● No services configured{RESET}")
 
     # Probe dev services
     dev_svcs = load_dev_services(project_key, enabled_only=True)
-    if dev_svcs:
+    if dev_svcs and not preamble_only:
         dev_running = sum(1 for ds in dev_svcs if probe_service(host_alias, ds['port'], timeout=3))
         dev_color = GREEN if dev_running == len(dev_svcs) else YELLOW
         print(f"  {dev_color}● {dev_running}/{len(dev_svcs)} dev services running{RESET}")
 
-    # Step 5: Build and deliver preamble
-    print(f"  {WHITE}[5/5]{RESET} Building preamble...")
+    # Step 5: Build preamble
+    if not preamble_only:
+        print(f"  {WHITE}[5/5]{RESET} Building preamble...")
     if use_oi:
         preamble = build_compressed_preamble(project_key, cache_data, notes_str, git_str, env_status=env_status)
     else:
         preamble = build_preamble(project_key, cache_data, notes_str, git_str, env_status=env_status)
+
+    # --preamble-only: output preamble to stdout, record session, exit
+    if preamble_only:
+        # Record session start on hub
+        git_head = fetch_git_head(host_alias, proj['path'])
+        session_start_event = {
+            'ts': time.time(),
+            'type': 'session_start',
+            'project': project_key,
+            'git_head': git_head,
+            'mode': 'oi' if use_oi else 'claude',
+        }
+        if cache_data:
+            session_start_event['cache_snapshot'] = {
+                'phase': cache_data.get('phase', ''),
+                'blockers': cache_data.get('blockers', []),
+                'focus': cache_data.get('current_focus', []),
+            }
+        close_previous_session(project_key)
+        append_journal(project_key, [session_start_event])
+        # Output raw preamble to stdout (node captures this)
+        sys.stdout.write(preamble)
+        return
 
     if dry_run:
         print()
@@ -615,7 +754,8 @@ def print_usage():
 {WHITE}OI mode:{RESET}
   Uses a compressed preamble (~1500-2000 chars) optimized for OI's smaller context.
   Sets OI_PROJECT, OI_PROJECT_HOST, OI_PROJECT_PATH env vars.
-  Use ~/edit for structured file operations on remote files.
+  On a hub: SSHes into the project host and runs OI there (native file access).
+  On a node: launches OI locally, fetches context from hub via --preamble-only.
 
 {WHITE}Projects:{RESET}
   {', '.join(PROJECT_ORDER) if PROJECT_ORDER else '(none — run hub --scan first)'}
@@ -632,8 +772,9 @@ def main():
     continue_session = '--continue' in args or '-c' in args
     dry_run = '--dry-run' in args
     use_oi = '--oi' in args
+    preamble_only = '--preamble-only' in args
 
-    clean_args = [a for a in args if a not in ('--continue', '-c', '--dry-run', '--oi')]
+    clean_args = [a for a in args if a not in ('--continue', '-c', '--dry-run', '--oi', '--preamble-only')]
 
     if not clean_args:
         print_usage()
@@ -643,7 +784,8 @@ def main():
     if not project_key:
         sys.exit(1)
 
-    begin(project_key, continue_session=continue_session, dry_run=dry_run, use_oi=use_oi)
+    begin(project_key, continue_session=continue_session, dry_run=dry_run,
+          use_oi=use_oi, preamble_only=preamble_only)
 
 
 if __name__ == '__main__':

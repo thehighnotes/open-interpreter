@@ -73,6 +73,51 @@ This warning is captured during subprocess creation and rendered inside the code
 
 ---
 
+## Node can't reach hub
+
+**`work <project> --oi` fails with "Hub unreachable"**
+
+Check SSH connectivity from the node to the hub:
+```bash
+ssh nano "echo ok"
+```
+
+If this fails:
+1. Verify `hub_host` in `~/.config/hub/config.json` matches your SSH alias
+2. Check `~/.ssh/config` has an entry for the hub
+3. Re-run `ssh-copy-id <hub-user>@<hub-ip>` to authorize your key
+
+**Node shows "No cache on hub"**
+
+The hub needs to have run `prepare <project>` at least once. From the hub:
+```bash
+prepare <project>
+```
+
+---
+
+## Update issues
+
+**`interpreter --update` fails with "Pull failed"**
+
+Usually means local changes conflict with upstream. Options:
+1. `git stash && git pull && git stash pop` — save your changes, update, restore
+2. `git diff` — review what's different before deciding
+
+**Auto-update not working**
+
+Ensure `oi_auto_update` is set in config.json (not the hub section — top level):
+```json
+{
+  "oi_auto_update": true,
+  ...
+}
+```
+
+Also: the check runs once every 6 hours (cached in `~/.cache/oi-update-check.json`). Delete the cache file to force a fresh check.
+
+---
+
 ## Port reference
 
 | Port | Service |

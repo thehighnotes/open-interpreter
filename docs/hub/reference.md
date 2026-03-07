@@ -4,16 +4,20 @@
 
 | File | Changes |
 |------|---------|
+| `interpreter/terminal_interface/utils/check_for_update.py` | (rewritten) Git-based update checker, replaces PyPI version check |
 | `interpreter/core/core.py` | Callable auto_run, callable custom_instructions |
 | `interpreter/core/respond.py` | Callable custom_instructions support, prompt token counting |
 | `interpreter/core/llm/llm.py` | Vendored tokentrim import, `num_ctx` pass-through for Ollama |
 | `interpreter/core/utils/truncate_output.py` | Spillover handling + ANSI strip |
 | `interpreter/core/computer/terminal/languages/subprocess_language.py` | Sudo detection, streaming output, inactivity timeout, fork-time stderr capture, Escape interrupt |
+| `interpreter/terminal_interface/start_terminal_interface.py` | `--update` CLI flag |
 | `interpreter/terminal_interface/terminal_interface.py` | Auto-run flow, state indicators, configurable inference host probe, context token stats, Escape key interrupt, snapshot output handling |
 | `interpreter/terminal_interface/magic_commands.py` | Hub magic commands, `%image` vision support |
 | `interpreter/terminal_interface/components/code_block.py` | Rich output integration |
 | `interpreter/terminal_interface/components/base_block.py` | Refresh throttle |
 | `interpreter/terminal_interface/components/message_block.py` | Refresh throttle |
+| `tools/hub/begin` | `--preamble-only` flag, hub/node-aware launch |
+| `tools/hub/work` | Node-aware delegation to hub |
 
 ## New files
 
@@ -27,10 +31,11 @@
 | `tools/hub/webui/server.py` | Starlette server — 20 API routes, static file serving, hub tool subprocess runner |
 | `tools/hub/webui/oi_bridge.py` | Interpreter wrapper — singleton, SSE streaming via thread+queue, approval flow |
 | `tools/hub/webui/static/` | Frontend — HTML, CSS (dark theme), JS (chat, tabs, help), vendored marked.js + highlight.js |
-| `tools/hub/hub_common.py` | Shared module — config loading, SSH helpers, project registry, terminal UI primitives |
-| `tools/hub/install.py` | Interactive setup wizard — generates config.json and creates symlinks |
+| `tools/hub/hub_common.py` | Shared module — config loading, SSH helpers, project registry, terminal UI primitives, hub/node role support (`ROLE`, `HUB_HOST`, `is_hub()`, `is_node()`) |
+| `tools/hub/install.py` | (rewritten) Hub/node setup wizard with SSH key exchange, `--update` command |
 | `tools/hub/config.example.json` | Minimal single-host config template |
 | `tools/hub/profiles/hub-profile.example.py` | OI profile template that reads from config.json |
+| `tools/hub/bootstrap.sh` | One-command installer for hub or node setup |
 
 ## Environment variables
 
@@ -42,12 +47,17 @@
 | `OI_CTX` | `44000` | Context window size (tokens) — used by WebUI bridge when no saved config exists |
 | `OI_WOL_SCRIPT` | `~/wol.sh` | Script called by `%wake` |
 | `OI_PROJECT` | *(none)* | Current project key (set by `%switch`) |
+| `OI_HUB_HOST` | *(none)* | SSH alias of hub machine (set by begin for OI profile) |
+| `OI_PROJECT_HOST` | *(none)* | Empty string = local files, host alias = remote files via SSH |
 
 ## Config keys (config.json)
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `session_persist` | `false` | Save/restore OI conversation across sessions (stored in `~/.cache/oi-sessions/`) |
+| `hub.role` | `"hub"` | Machine role: `"hub"` (owns state) or `"node"` (delegates to hub) |
+| `hub.hub_host` | *(none)* | SSH alias of the hub (required for nodes) |
+| `oi_auto_update` | `false` | Auto-pull latest OI changes from origin on startup |
 
 ## projects.json schema
 

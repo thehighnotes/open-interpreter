@@ -35,34 +35,50 @@ def work(project_key, continue_session=False, dry_run=False, use_oi=False):
     print()
     header_bar()
     mode = "DRY RUN" if dry_run else "OI" if use_oi else "CONTINUE" if continue_session else "NEW SESSION"
-    print(f"{BRIGHT_GREEN}  WORK SESSION — {proj['name']} ({mode}){RESET}")
+    node_label = f" on {HOSTS.get(LOCAL_HOST, {}).get('name', LOCAL_HOST)}" if is_node() else ""
+    print(f"{BRIGHT_GREEN}  WORK SESSION — {proj['name']} ({mode}){node_label}{RESET}")
     header_bar()
     print()
 
-    # Step 1: Prepare
+    # Step 1: Prepare (hub runs locally, node delegates to hub)
     print(f"  {WHITE}[1/3]{RESET} Preparing...")
     divider()
     print()
 
-    result = subprocess.run(
-        [str(home / 'prepare'), project_key],
-        timeout=300
-    )
+    if is_node() and HUB_HOST:
+        print(f"  {CYAN}Delegating to hub ({HUB_HOST})...{RESET}")
+        result = subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', '-o', 'BatchMode=yes',
+             HUB_HOST, f'~/prepare {project_key}'],
+            timeout=300
+        )
+    else:
+        result = subprocess.run(
+            [str(home / 'prepare'), project_key],
+            timeout=300
+        )
     if result.returncode != 0:
         print(f"\n  {RED}● Prepare failed — aborting{RESET}")
         sys.exit(1)
 
     print()
 
-    # Step 2: Overview
+    # Step 2: Overview (hub runs locally, node delegates to hub)
     print(f"  {WHITE}[2/3]{RESET} Overview...")
     divider()
     print()
 
-    subprocess.run(
-        [str(home / 'overview'), project_key],
-        timeout=120
-    )
+    if is_node() and HUB_HOST:
+        subprocess.run(
+            ['ssh', '-o', 'ConnectTimeout=5', '-o', 'BatchMode=yes',
+             HUB_HOST, f'~/overview {project_key}'],
+            timeout=120
+        )
+    else:
+        subprocess.run(
+            [str(home / 'overview'), project_key],
+            timeout=120
+        )
 
     print()
 

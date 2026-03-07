@@ -1,8 +1,10 @@
 {
   "hub": {
     "name": "My Dev Hub",
-    "local_host": "local"
+    "local_host": "local",
+    "role": "hub"
   },
+  "oi_auto_update": false,
   "hosts": {
     "local": {
       "name": "Hub", "ip": "127.0.0.1", "user": "myuser",

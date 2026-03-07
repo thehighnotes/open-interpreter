@@ -32,6 +32,7 @@ Standalone enhancements that work without hub tools — just install and use:
 - **Refresh throttle** — fast streaming output no longer floods the scrollback
 - **Rich output panels** — colored diffs, aligned tables, highlighted errors
 - **Context token tracking** — real token counts (via tiktoken) shown after each response in both terminal (`ctx 3.4K/44K (8%)`) and WebUI, with color-coded fill level
+- **Self-update** — `interpreter --update` pulls latest from origin, with optional auto-update on startup via `oi_auto_update` config
 - **Vendored tokentrim** — fixes a [double-subtraction bug](https://github.com/KillianLucas/tokentrim/issues/11) in context window management
 
 Full reference: **[OI Improvements documentation](docs/hub/oi-improvements.md)**
@@ -39,6 +40,14 @@ Full reference: **[OI Improvements documentation](docs/hub/oi-improvements.md)**
 ---
 
 ## Quick Start
+
+**One-command bootstrap** (installs OI + hub tools, creates config):
+
+```bash
+curl -sL https://raw.githubusercontent.com/thehighnotes/open-interpreter/main/tools/hub/bootstrap.sh | bash
+```
+
+**Or manually:**
 
 ```bash
 git clone https://github.com/thehighnotes/open-interpreter.git
@@ -48,11 +57,14 @@ pip install -e .
 
 For OI improvements only, you're done — create a [profile](docs/hub/getting-started.md#quick-start-with-ollama) pointing at your Ollama instance and run `interpreter --profile my-profile.py`.
 
-For hub tools (multi-machine management), also run:
+For hub tools (multi-machine management), also run the install wizard:
 
 ```bash
-python3 tools/hub/install.py    # interactive setup wizard
+python3 tools/hub/install.py             # hub mode — full state, cron, all tools
+python3 tools/hub/install.py --node      # node mode — OI + state delegation to hub
 ```
+
+Keep your installation up to date with `interpreter --update` (or enable `oi_auto_update` in config for automatic pulls on startup).
 
 See the [Getting Started guide](docs/hub/getting-started.md) for configuration details, Ollama profiles, and the full `config.json` schema.
 
@@ -67,6 +79,7 @@ See the [Getting Started guide](docs/hub/getting-started.md) for configuration d
 | `hub` | `hub`, `status` | Dashboard, priorities, services, config |
 | `git` | `repo` | Git dashboard, commit, push, checkpoint, deploy |
 | `work` | — | One-command session: prepare → overview → begin |
+| `work --oi` | — | Launch OI natively on a remote node for local file access |
 | `overview` | — | LLM-powered project briefings |
 | `research` | — | Arxiv + GitHub release monitor |
 | `backup` | — | Rsync hub ecosystem to backup target |
@@ -114,21 +127,27 @@ $ work myapp
 ### Architecture
 
 ```
-┌──────────────┐         SSH          ┌──────────────────┐
-│   Hub (ARM)  │◄───────────────────► │   GPU Server     │
-│              │                      │                  │
-│  hub tools   │    ┌────────────┐    │  Ollama (LLM)    │
-│  OI / Claude │    │ Workstation│    │  Code Assistant  │
-│  cron jobs   │◄──►│            │    │  project repos   │
-│  backups     │SSH │ gh CLI     │    │  backup storage  │
-└──────────────┘    │ project    │    └──────────────────┘
-       ▲            │ repos      │             ▲
-       │            └────────────┘             │
-       │              SSH ▲                    │
-       └──────────────────┴────────────────────┘
-                    all linked via
-                  ~/.config/hub/config.json
+┌──────────────────┐       SSH        ┌──────────────────┐
+│   Hub            │◄────────────────►│   GPU Server     │
+│   (source of     │                  │   (node)         │
+│    truth)        │  ┌────────────┐  │                  │
+│                  │  │ Workstation│  │  Ollama (LLM)    │
+│  all state:      │  │ (node)     │  │  OI (native)     │
+│   config, caches │  │            │  │  project repos   │
+│   journals, cron │  │ OI (native)│  │  backup storage  │
+│  hub tools       │◄►│ gh CLI     │  └──────────────────┘
+│  backups         │SS│ project    │           ▲
+└──────────────────┘H │ repos      │           │
+       ▲              └────────────┘           │
+       │                SSH ▲                  │
+       └────────────────────┴──────────────────┘
+             nodes delegate state to hub
+           via SSH — config, caches, journals
 ```
+
+### Hub / Node Architecture
+
+The **hub** is the single source of truth — it owns all state: config, caches, journals, research data, and cron jobs. **Nodes** are remote machines where OI is installed for native file access and local code execution, but they delegate all persistent state back to the hub via SSH. This means you get full-speed file operations on the node while keeping one canonical set of project metadata. Install a node with `install.py --node` or use the bootstrap script with the `--node` flag.
 
 ---
 

@@ -62,6 +62,19 @@ Commands chain naturally — `%switch` loads project context into the system mes
 
 Requires a vision-capable model and `xclip` installed for clipboard mode. Images must be at least 32x32 pixels. In the WebUI, use the image upload button instead — it handles the `%image` message automatically.
 
+## Node Mode
+
+When OI runs on a node (via `work <project> --oi`), files are **local** — no `host:` prefix needed for `~/edit`. Hub tools that need state (overview, research, timeline) are available as SSH stubs that delegate to the hub automatically.
+
+In the OI system message, you'll see `PROJECT MODE: aiquest on local:/path` instead of `on ws:/path`, confirming local file access.
+
+Hub tool commands still work from inside OI on a node:
+```
+ssh nano "~/overview aiquest"     # explicit hub call
+~/hub --status                    # SSH stub, delegates automatically
+~/edit src/app.tsx --show          # local file, no prefix needed
+```
+
 ## Built-in OI Commands
 
 | Command | Description |

@@ -8,8 +8,8 @@ The `tools/hub/` directory contains a suite of CLI tools that manage a multi-mac
 | `git` | `repo` | Git management: dashboard, commit, push, checkpoint, deploy |
 | `overview` | — | LLM-powered project briefings |
 | `prepare` | — | Session setup: wake hosts, warm Ollama, start services |
-| `begin` | — | Session bootstrap: build preamble, launch Claude Code or OI |
-| `work` | — | One-command workflow: prepare → overview → begin |
+| `begin` | — | Session bootstrap: build preamble, launch Claude Code, OI, or OI on remote node |
+| `work` | — | One-command workflow: prepare → overview → begin (hub or node) |
 | `backup` | — | Rsync hub ecosystem to backup target |
 | `research` | — | Monitor arxiv + GitHub releases, score by relevance |
 | `health-probe` | — | Probe hosts and services, track transitions |
@@ -224,6 +224,8 @@ work <project> --oi             Launch Open Interpreter instead of Claude Code
 
 Runs `prepare`, then `overview`, then shows a 5-second countdown (Ctrl+C to cancel) before launching `begin`. Passes flags through to downstream tools.
 
+**Node behavior:** When run on a machine with `role: "node"` in `config.json`, `work` delegates `prepare` and `overview` to the hub via SSH (since the hub owns caches, services, and Ollama access). The OI session itself launches locally on the node, giving it native file access to the project directory without SSH round-trips.
+
 ### `prepare` — Session Setup
 
 ```
@@ -244,7 +246,14 @@ begin <project>                 Launch Claude Code with context preamble
 begin <project> --continue      Continue previous session with updated context
 begin <project> --dry-run       Print preamble without launching
 begin <project> --oi            Launch Open Interpreter instead
+begin <project> --preamble-only Output raw preamble text to stdout (no UI chrome)
 ```
+
+**`--preamble-only`:** Outputs the raw preamble text to stdout without any UI chrome (no banners, countdowns, or color), and records the session start in the timeline. This is used internally by nodes to fetch context from the hub over SSH.
+
+**Hub behavior with `--oi`:** If the project's host is a remote machine, `begin --oi` SSHes into that host and launches OI there, so it has native file access to the project directory.
+
+**Node behavior:** On a node, `begin` calls `begin --preamble-only` on the hub via SSH to fetch the context preamble, then launches OI locally. This gives the session native file access to the project on the node while still pulling centralized context (overview cache, research digest, service status) from the hub.
 
 Gathers context from five sources:
 1. Host reachability check
@@ -465,6 +474,8 @@ edit <file> --create                           Create empty file (with parent di
 ```
 
 **Remote files:** use `host:path` syntax — `edit gpu:~/projects/myapp/main.py --show`
+
+**On a node:** Since OI runs locally with native file access, no `host:` prefix is needed. OI just uses `~/edit path/to/file` with a plain local path.
 
 **Safety:**
 - `--find` requires exactly 1 match (fails on 0 or 2+ matches with closest-line hints)

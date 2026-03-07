@@ -9,6 +9,16 @@
 
 ## Install
 
+**Option 1 — One-command bootstrap:**
+
+```bash
+curl -sL https://raw.githubusercontent.com/thehighnotes/open-interpreter/main/tools/hub/bootstrap.sh | bash
+```
+
+This clones the repo, installs OI, and launches the install wizard.
+
+**Option 2 — Manual:**
+
 ```bash
 git clone https://github.com/thehighnotes/open-interpreter.git
 cd open-interpreter
@@ -24,7 +34,8 @@ pip install sentence-transformers
 ## Hub tools setup
 
 ```bash
-python3 tools/hub/install.py
+python3 tools/hub/install.py          # hub (full install)
+python3 tools/hub/install.py --node   # node (connects to existing hub)
 ```
 
 The install wizard will:
@@ -33,7 +44,46 @@ The install wizard will:
 3. Configure Ollama location and GitHub username
 4. Write `~/.config/hub/config.json`
 5. Create symlinks from `~/` to `tools/hub/` for each tool
-6. Set up bash aliases (`hub`, `repo`, `status`)
+6. Detect your shell (bash/zsh) and set up aliases (`hub`, `repo`, `status`)
+7. Generate SSH keys if none exist (`~/.ssh/id_ed25519`)
+8. Set up `~/.ssh/config` entries for remote hosts
+9. Copy SSH keys to remote hosts via `ssh-copy-id`
+
+## Node Setup
+
+A **node** is a machine that runs OI locally (for native file access and editing) but delegates hub state operations (project registry, session management, status queries) to the hub via SSH. This gives you the performance of local OI with the coordination of a central hub.
+
+**Install:**
+
+```bash
+python3 tools/hub/install.py --node
+```
+
+The node wizard will:
+1. Ask for the hub's IP address and username
+2. Establish SSH connectivity (generate keys, `ssh-copy-id`)
+3. Sync `config.json` and `projects.json` from the hub
+4. Create SSH stub scripts that forward hub commands to the hub machine
+
+**Usage:**
+
+```bash
+work <project> --oi    # launch OI session on the node
+```
+
+OI runs natively on the node for fast file access, while `hub --status`, `repo`, and session state are forwarded transparently to the hub.
+
+## Updating
+
+Pull the latest changes from origin:
+
+```bash
+interpreter --update
+```
+
+**Auto-update:** Set `"oi_auto_update": true` in `config.json` to pull automatically on startup.
+
+When auto-update is off, OI checks the remote on launch and prints a notification if your local copy is behind origin.
 
 ## Quick Start with Ollama
 
@@ -71,11 +121,15 @@ All hub tools read from two files:
 
 ### config.json schema
 
+**Hub config** (full install):
+
 ```json
 {
+  "oi_auto_update": false,
   "hub": {
     "name": "My Dev Hub",
-    "local_host": "nano"
+    "local_host": "nano",
+    "role": "hub"
   },
   "hosts": {
     "nano": {
@@ -88,7 +142,7 @@ All hub tools read from two files:
     },
     "ws": {
       "name": "Workstation", "ip": "192.168.1.50", "user": "dev",
-      "roles": ["wakeable"], "wol_mac": "AA:BB:CC:DD:EE:FF"
+      "roles": ["wakeable", "node"], "wol_mac": "AA:BB:CC:DD:EE:FF"
     }
   },
   "ollama": { "host": "gpu", "port": 11434, "default_model": "llama3:8b", "num_ctx": 44000 },
@@ -99,6 +153,32 @@ All hub tools read from two files:
 }
 ```
 
+**Node config** (`--node` install):
+
+```json
+{
+  "oi_auto_update": false,
+  "hub": {
+    "name": "My Workstation",
+    "local_host": "ws",
+    "role": "node",
+    "hub_host": "nano"
+  },
+  "hosts": {
+    "ws": {
+      "name": "Workstation", "ip": "127.0.0.1", "user": "dev",
+      "roles": ["local", "node"]
+    },
+    "nano": {
+      "name": "Hub", "ip": "192.168.1.31", "user": "hubuser",
+      "roles": ["hub"]
+    }
+  },
+  "ollama": { "host": "nano", "port": 11434, "default_model": "llama3:8b", "num_ctx": 44000 },
+  "git": { "github_username": "myuser", "email": "me@example.com" }
+}
+```
+
 ### Host roles
 
 - `local` — the machine running the hub tools
@@ -106,6 +186,7 @@ All hub tools read from two files:
 - `code_assistant` — runs the Code Assistant (semantic search/RAG)
 - `backup_target` — receives rsync backups
 - `wakeable` — supports Wake-on-LAN (requires `wol_mac`)
+- `node` — a machine with OI installed locally, delegates hub state operations via SSH
 
 ## Platform support
 

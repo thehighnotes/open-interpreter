@@ -12,7 +12,7 @@ from interpreter.terminal_interface.contributing_conversations import (
 
 from .conversation_navigator import conversation_navigator
 from .profiles.profiles import open_storage_dir, profile, reset_profile
-from .utils.check_for_update import check_for_update
+from .utils.check_for_update import check_for_update, get_update_status
 from .validate_llm_settings import validate_llm_settings
 
 
@@ -275,6 +275,11 @@ def start_terminal_interface(interpreter):
             "type": bool,
         },
         {
+            "name": "update",
+            "help_text": "update Open Interpreter to latest version",
+            "type": bool,
+        },
+        {
             "name": "contribute_conversation",
             "help_text": "let Open Interpreter use the current conversation to train an Open-Source LLM",
             "type": bool,
@@ -414,6 +419,18 @@ Use """ to write multi-line messages.
         print(f"Open Interpreter {version} {update_name}")
         return
 
+    if args.update:
+        # Find and run install.py --update from the repo
+        from pathlib import Path
+        install_script = Path(__file__).resolve().parent.parent.parent / 'tools' / 'hub' / 'install.py'
+        if install_script.exists():
+            import subprocess as _sp
+            result = _sp.run([sys.executable, str(install_script), '--update'])
+            sys.exit(result.returncode)
+        else:
+            print("Update not available (not installed from source)")
+            sys.exit(1)
+
     if args.no_highlight_active_line:
         interpreter.highlight_active_line = False
 
@@ -515,17 +532,23 @@ Use """ to write multi-line messages.
         if interpreter.llm.supports_functions is None:
             interpreter.llm.supports_functions = True
 
-    ### Check for update
+    ### Check for update (git-based, with optional auto-update)
 
     try:
         if not interpreter.offline and not args.stdin:
-            # This message should actually be pushed into the utility
-            if check_for_update():
-                interpreter.display_message(
-                    "> **A new version of Open Interpreter is available.**\n>Please run: `pip install --upgrade open-interpreter`\n\n---"
-                )
-    except:
-        # Doesn't matter
+            check_for_update()  # may auto-pull if oi_auto_update is set
+            msg, is_update = get_update_status()
+            if msg:
+                if is_update:
+                    interpreter.display_message(
+                        f"> **{msg}**\n\n---"
+                    )
+                else:
+                    # Auto-updated notification
+                    interpreter.display_message(
+                        f"> {msg}\n\n---"
+                    )
+    except Exception:
         pass
 
     if interpreter.llm.api_base:

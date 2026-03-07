@@ -111,7 +111,7 @@ def save_config(config):
 
 def reload_config():
     """Re-read config from disk and update all module-level globals in-place."""
-    global LOCAL_HOST, OLLAMA_HOST, OLLAMA_PORT, DEFAULT_MODEL
+    global LOCAL_HOST, ROLE, HUB_HOST, OLLAMA_HOST, OLLAMA_PORT, DEFAULT_MODEL
     global GITHUB_USERNAME, GIT_EMAIL, BACKUP_DEST
     global CODE_ASSISTANT_URL
 
@@ -120,6 +120,8 @@ def reload_config():
     HUB_CONFIG.update(fresh)
 
     LOCAL_HOST = HUB_CONFIG['hub']['local_host']
+    ROLE = HUB_CONFIG['hub'].get('role', 'hub')
+    HUB_HOST = HUB_CONFIG['hub'].get('hub_host', None)
     OLLAMA_HOST = HUB_CONFIG['ollama']['host']
     OLLAMA_PORT = HUB_CONFIG['ollama']['port']
     DEFAULT_MODEL = HUB_CONFIG['ollama']['default_model']
@@ -148,12 +150,39 @@ HUB_CONFIG = load_config()
 
 # Config-derived convenience globals
 LOCAL_HOST = HUB_CONFIG['hub']['local_host']
+ROLE = HUB_CONFIG['hub'].get('role', 'hub')          # 'hub' or 'node'
+HUB_HOST = HUB_CONFIG['hub'].get('hub_host', None)   # SSH alias of hub (for nodes)
 OLLAMA_HOST = HUB_CONFIG['ollama']['host']
 OLLAMA_PORT = HUB_CONFIG['ollama']['port']
 DEFAULT_MODEL = HUB_CONFIG['ollama']['default_model']
 GITHUB_USERNAME = HUB_CONFIG['git']['github_username']
 GIT_EMAIL = HUB_CONFIG['git']['email']
 BACKUP_DEST = HUB_CONFIG['backup']['destination']
+
+
+def is_hub():
+    """True if this machine is the hub (owns all state)."""
+    return ROLE == 'hub'
+
+
+def is_node():
+    """True if this machine is a node (defers to hub for state)."""
+    return ROLE == 'node'
+
+
+def hub_cmd(cmd, timeout=30):
+    """Run a command on the hub. If we ARE the hub, run locally. Otherwise SSH."""
+    if is_hub():
+        try:
+            result = subprocess.run(
+                ['bash', '-c', cmd],
+                capture_output=True, text=True, timeout=timeout
+            )
+            return result.returncode == 0, result.stdout.strip()
+        except (subprocess.TimeoutExpired, Exception) as e:
+            return False, str(e)
+    else:
+        return ssh_cmd(HUB_HOST, cmd, timeout=timeout)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Host Registry — derived from config
