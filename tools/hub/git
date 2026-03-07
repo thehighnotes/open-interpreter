@@ -1538,7 +1538,7 @@ def do_checkpoint(message=None, auto_yes=False):
                 inc = f"{GREEN}[+]{RESET}" if item['included'] else f"{GRAY}[ ]{RESET}"
                 hl_start = HIGHLIGHT_BG if highlighted else ''
                 hl_end = HIGHLIGHT_OFF if highlighted else ''
-                return f"    {hl_start}{inc} {item['pk']:<14s} {item['dirty']:>4d} dirty{hl_end}"
+                return f"    {inc} {hl_start}{item['pk']:<14s} {item['dirty']:>4d} dirty{hl_end}"
 
             print()
             saved = interactive_toggle(

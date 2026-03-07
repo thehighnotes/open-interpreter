@@ -493,8 +493,8 @@ KEY_SPACE = 'SPACE'
 KEY_QUIT = 'q'
 KEY_ESCAPE = 'ESC'
 
-HIGHLIGHT_BG = '\033[7m'    # Inverse video
-HIGHLIGHT_OFF = '\033[27m'
+HIGHLIGHT_BG = '\033[48;5;238;38;5;255m'  # Dark gray bg + bright white fg
+HIGHLIGHT_OFF = '\033[0m'
 
 # Terminal state for atexit safety net
 _saved_termios = None
