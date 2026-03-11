@@ -909,7 +909,7 @@ done
         ca_host = HUB_CONFIG['code_assistant']['host']
         if e['host'] != ca_host:
             # Rsync from source host to CA host mirror
-            ca_mirror = f"~/projects/{e['ca_name']}"
+            ca_mirror = f"~/projects/.ca-mirrors/{e['ca_name']}"
             ca_host_name = HOSTS.get(ca_host, {}).get('name', ca_host)
             src_host_name = HOSTS.get(e['host'], {}).get('name', e['host'])
             print(f"  {CYAN}Syncing {e['dirname']} from {src_host_name} to {ca_host_name}...{RESET}")
@@ -1215,7 +1215,13 @@ def cmd_manage():
 
             ca_host = HUB_CONFIG['code_assistant']['host']
             ca_host_name = HOSTS.get(ca_host, {}).get('name', ca_host)
-            ca_mirror = proj.get('root_path', '').replace(f'/home/{HOSTS[ca_host]["user"]}', '~')
+            ca_user = HOSTS[ca_host]['user']
+            old_root = proj.get('root_path', '').replace(f'/home/{ca_user}', '~')
+            # Migrate from ~/projects/<name> to ~/projects/.ca-mirrors/<name>
+            if old_root.startswith('~/projects/') and '/.ca-mirrors/' not in old_root:
+                ca_mirror = old_root.replace('~/projects/', '~/projects/.ca-mirrors/', 1)
+            else:
+                ca_mirror = old_root
 
             print(f"\n  {CYAN}Syncing {ws_path} → {ca_host_name}...{RESET}")
             with Spinner(f"rsync {proj['name']}"):

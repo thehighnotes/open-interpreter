@@ -573,10 +573,11 @@ def _read_key(fd):
         return None
     c = ch[0]
     if c == 27:  # ESC — could be arrow key or standalone ESC
-        ready, _, _ = select.select([fd], [], [], 0.05)
+        ready, _, _ = select.select([fd], [], [], 0.1)
         if ready:
             seq = os.read(fd, 2)
-            if len(seq) == 2 and seq[0] == ord('['):
+            if len(seq) == 2 and seq[0] in (ord('['), ord('O')):
+                # \x1b[ = normal mode, \x1bO = application mode (RustDesk)
                 if seq[1] == ord('A'):
                     return KEY_UP
                 elif seq[1] == ord('B'):
