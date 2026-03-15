@@ -434,6 +434,31 @@ def install_oi():
 # Update
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _refresh_tools():
+    """Re-run symlinks, SSH stubs, and aliases for the current role."""
+    role = 'hub'
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            role = cfg.get('hub', {}).get('role', 'hub')
+        except Exception:
+            pass
+
+    symlink_tools = NODE_TOOLS if role == 'node' else HUB_TOOLS
+    create_symlinks(tools=symlink_tools)
+    if role == 'node':
+        hub_host = ''
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            hub_host = cfg.get('hub', {}).get('hub_host', '')
+        except Exception:
+            pass
+        if hub_host:
+            create_ssh_stubs(hub_host, tools=[t for t in HUB_TOOLS if t not in NODE_TOOLS])
+    # Aliases for all tools — on nodes, hub-only tools are SSH stubs
+    setup_shell_aliases(tools=HUB_TOOLS)
+
+
 def do_update():
     """Pull latest changes from origin and report what changed."""
     print_header("Open Interpreter — Update")
@@ -476,6 +501,7 @@ def do_update():
         print_ok(f"Already up to date on {branch} ({local_before})")
         if stashed:
             git_cmd('stash', 'pop')
+        _refresh_tools()
         return True
 
     # Show what's incoming
@@ -506,29 +532,7 @@ def do_update():
         else:
             print_warn("Could not restore stash — run: git stash pop")
 
-    # Re-run symlinks and aliases to pick up new/changed tools
-    role = 'hub'
-    if CONFIG_FILE.exists():
-        try:
-            cfg = json.loads(CONFIG_FILE.read_text())
-            role = cfg.get('hub', {}).get('role', 'hub')
-        except Exception:
-            pass
-
-    symlink_tools = NODE_TOOLS if role == 'node' else HUB_TOOLS
-    create_symlinks(tools=symlink_tools)
-    if role == 'node':
-        hub_host = ''
-        try:
-            cfg = json.loads(CONFIG_FILE.read_text())
-            hub_host = cfg.get('hub', {}).get('hub_host', '')
-        except Exception:
-            pass
-        if hub_host:
-            create_ssh_stubs(hub_host, tools=[t for t in HUB_TOOLS if t not in NODE_TOOLS])
-    # Aliases for all tools — on nodes, hub-only tools are SSH stubs
-    setup_shell_aliases(tools=HUB_TOOLS)
-
+    _refresh_tools()
     print_ok("Update complete")
     return True
 
