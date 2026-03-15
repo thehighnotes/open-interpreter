@@ -649,17 +649,17 @@ def launch_oi(project_key, preamble, continue_session):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def begin_from_node(project_key, continue_session=False, dry_run=False, use_oi=False):
-    """Node-side begin: delegate context to hub, launch OI locally.
+    """Node-side begin: delegate context to hub, launch locally.
 
     The hub owns all state (caches, journals, overview). The node asks
     the hub to build the preamble via `begin --preamble-only`, then
-    launches OI locally with native file access.
+    launches Claude Code (default) or OI (with --oi) locally.
     """
     proj = PROJECTS[project_key]
 
     print()
     header_bar()
-    mode = "OI" if use_oi else "NEW SESSION"
+    mode = "OI" if use_oi else "CONTINUE" if continue_session else "NEW SESSION"
     print(f"{BRIGHT_GREEN}  BEGIN — {proj['name']} ({mode}) on {HOSTS.get(LOCAL_HOST, {}).get('name', LOCAL_HOST)}{RESET}")
     header_bar()
     print()
@@ -696,7 +696,26 @@ def begin_from_node(project_key, continue_session=False, dry_run=False, use_oi=F
 
     # Launch
     print(f"  {WHITE}[3/3]{RESET} Launching...")
-    launch_oi(project_key, preamble, continue_session)
+    if use_oi:
+        launch_oi(project_key, preamble, continue_session)
+    else:
+        # Write preamble locally for Claude Code
+        safe_preamble = preamble.replace('"', "'")
+        ctx_path = '/tmp/_begin_ctx.txt'
+        with open(ctx_path, 'w') as f:
+            f.write(safe_preamble)
+
+        # Launch Claude Code locally
+        print()
+        print(f"  {CYAN}Launching Claude Code...{RESET}")
+        print()
+
+        claude_args = ['claude', '--append-system-prompt', safe_preamble]
+        if continue_session:
+            claude_args.insert(1, '-c')
+
+        os.chdir(os.path.expanduser(proj['path']))
+        os.execvp('claude', claude_args)
 
 
 def begin(project_key, continue_session=False, dry_run=False, use_oi=False,
