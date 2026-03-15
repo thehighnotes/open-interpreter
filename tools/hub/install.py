@@ -283,26 +283,70 @@ def create_symlinks(tools=None):
     return created
 
 
-def setup_shell_aliases():
+def setup_shell_aliases(tools=None):
     """Add shell aliases to .bashrc or .zshrc."""
+    if tools is None:
+        tools = HUB_TOOLS
     shell = detect_shell()
     rc_file = HOME / (f'.{shell}rc')
     marker = '# --- Hub Tools ---'
+    end_marker = '# --- End Hub Tools ---'
 
-    if rc_file.exists() and marker in rc_file.read_text():
-        print_ok("Shell aliases already configured")
-        return
+    # Build alias block
+    # Skip 'git' — would shadow system git; aliased as 'repo' instead
+    skip_alias = {'git'}
+    alias_lines = [
+        f'\n{marker}',
+        'export PATH="$HOME/.local/bin:$PATH"',
+    ]
+    for tool in tools:
+        if tool in skip_alias:
+            continue
+        tool_path = HOME / tool
+        if tool_path.exists() or tool_path.is_symlink():
+            # Use underscore alias for tools with hyphens
+            alias_name = tool.replace('-', '_')
+            alias_lines.append(f"alias {alias_name}='~/{tool}'")
+    alias_lines.append("alias repo='~/git'")
+    alias_lines.append("alias status='~/hub --status'")
+    alias_lines.append(end_marker)
+    alias_block = '\n'.join(alias_lines) + '\n'
 
-    aliases = f"""
-{marker}
-export PATH="$HOME/.local/bin:$PATH"
-alias repo='~/git'
-alias hub='~/hub'
-alias status='~/hub --status'
-"""
+    if rc_file.exists():
+        content = rc_file.read_text()
+        if marker in content:
+            start = content.index(marker)
+            if end_marker in content:
+                # New format — replace between markers
+                end = content.index(end_marker) + len(end_marker)
+            else:
+                # Old format without end marker — find end of alias block
+                # Scan forward from marker: skip lines that are aliases/exports/blank
+                lines = content[start:].split('\n')
+                block_len = 0
+                for i, line in enumerate(lines):
+                    stripped = line.strip()
+                    if i == 0:  # the marker line itself
+                        block_len += len(line) + 1
+                        continue
+                    if stripped.startswith('alias ') or stripped.startswith('export ') or stripped == '':
+                        block_len += len(line) + 1
+                    else:
+                        break
+                end = start + block_len
+            # Include trailing newline if present
+            if end < len(content) and content[end] == '\n':
+                end += 1
+            new_content = content[:start] + alias_block
+            if end < len(content):
+                new_content += content[end:]
+            rc_file.write_text(new_content)
+            print_ok(f"Shell aliases updated in ~/{rc_file.name}")
+            return
 
+    # Append new block
     with open(rc_file, 'a') as f:
-        f.write(aliases)
+        f.write(alias_block)
     print_ok(f"Aliases added to ~/{rc_file.name}")
 
 
@@ -461,6 +505,29 @@ def do_update():
             print_ok("Stashed changes restored")
         else:
             print_warn("Could not restore stash — run: git stash pop")
+
+    # Re-run symlinks and aliases to pick up new/changed tools
+    role = 'hub'
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            role = cfg.get('hub', {}).get('role', 'hub')
+        except Exception:
+            pass
+
+    symlink_tools = NODE_TOOLS if role == 'node' else HUB_TOOLS
+    create_symlinks(tools=symlink_tools)
+    if role == 'node':
+        hub_host = ''
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            hub_host = cfg.get('hub', {}).get('hub_host', '')
+        except Exception:
+            pass
+        if hub_host:
+            create_ssh_stubs(hub_host, tools=[t for t in HUB_TOOLS if t not in NODE_TOOLS])
+    # Aliases for all tools — on nodes, hub-only tools are SSH stubs
+    setup_shell_aliases(tools=HUB_TOOLS)
 
     print_ok("Update complete")
     return True
@@ -810,7 +877,8 @@ def setup_node():
     print_step(5, total_steps, "Tools & shell")
     create_symlinks(tools=NODE_TOOLS)
     create_ssh_stubs(hub_alias)
-    setup_shell_aliases()
+    # Aliases for all tools — node tools are symlinks, hub-only tools are SSH stubs
+    setup_shell_aliases(tools=HUB_TOOLS)
 
     # OI profile
     profile_src = SCRIPT_DIR / 'profiles' / 'hub-profile.example.py'
