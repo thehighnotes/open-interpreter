@@ -266,7 +266,14 @@ async def magic_command(request):
         "%notify": ["notify"],
         "%overview": ["overview"],
         "%backup": ["backup", "--list"],
+        "%vllm": ["hub", "--vllm"],
+        "%dev": ["hub", "--dev"],
+        "%prepare": ["prepare"],
+        "%begin": ["begin"],
+        "%work": ["work"],
     }
+
+    timeout_map = {"%prepare": 120, "%work": 180, "%begin": 120, "%vllm": 30}
 
     parts = cmd.split(None, 1)
     base = parts[0].lower()
@@ -283,7 +290,7 @@ async def magic_command(request):
         try:
             result = subprocess.run(
                 [tool_path] + args,
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=timeout_map.get(base, 30),
                 env=env,
             )
             raw = (result.stdout + result.stderr).strip()
@@ -755,6 +762,170 @@ async def upload_image(request):
     return JSONResponse({"path": str(dest), "filename": filename})
 
 
+# ── vLLM server controls ──────────────────────────────────────────────────
+
+async def get_vllm_status(request):
+    """Return vLLM server state, model, and endpoint info."""
+    if not hub_common:
+        return JSONResponse({"state": "unknown", "model": None})
+    llm_host = hub_common.LLM_HOST
+    ip = hub_common.HOSTS.get(llm_host, {}).get("ip", "127.0.0.1")
+    port = hub_common.LLM_PORT
+    ctx = hub_common.LLM_CONTEXT_WINDOW
+
+    # Check systemd state
+    try:
+        state_out = hub_common.ssh_cmd(llm_host, 'systemctl is-active vllm-server')
+        state = state_out.strip() if state_out else "unknown"
+    except Exception:
+        state = "unknown"
+
+    # Probe for model name
+    model = None
+    if state == "active":
+        try:
+            import urllib.request
+            req = urllib.request.urlopen(f"http://{ip}:{port}/v1/models", timeout=5)
+            data = json.loads(req.read())
+            models = data.get("data", [])
+            if models:
+                model = models[0].get("id")
+        except Exception:
+            pass
+
+    return JSONResponse({
+        "state": state,
+        "model": model,
+        "endpoint": f"http://{ip}:{port}",
+        "context_window": ctx,
+    })
+
+
+async def vllm_action(request):
+    """Start/stop/restart vLLM server. Body: { action: "start"|"stop"|"restart" }"""
+    if not hub_common:
+        return JSONResponse({"ok": False, "message": "hub_common not available"}, status_code=500)
+    body = await _json_body(request)
+    action = body.get("action", "").strip()
+    if action not in ("start", "stop", "restart"):
+        return JSONResponse({"ok": False, "message": f"Invalid action: {action}"}, status_code=400)
+
+    llm_host = hub_common.LLM_HOST
+    try:
+        out = hub_common.ssh_cmd(llm_host, f'sudo systemctl {action} vllm-server', timeout=20)
+        return JSONResponse({"ok": True, "message": f"vLLM {action} sent", "output": out or ""})
+    except Exception as e:
+        return JSONResponse({"ok": False, "message": str(e)})
+
+
+# ── Dev service toggle ────────────────────────────────────────────────────
+
+async def toggle_dev_service(request):
+    """Toggle a dev service enabled state. Body: { project, service, enabled }"""
+    if not hub_common:
+        return JSONResponse({"ok": False}, status_code=500)
+    body = await _json_body(request)
+    project_key = body.get("project", "").strip()
+    service_name = body.get("service", "").strip()
+    enabled = body.get("enabled", True)
+
+    projects, order, ignored = hub_common.load_projects()
+    if project_key not in projects:
+        return JSONResponse({"ok": False, "error": f"Project not found: {project_key}"}, status_code=404)
+
+    dev_services = projects[project_key].get("dev_services", [])
+    found = False
+    for svc in dev_services:
+        if svc.get("name") == service_name:
+            svc["enabled"] = bool(enabled)
+            found = True
+            break
+
+    if not found:
+        return JSONResponse({"ok": False, "error": f"Service not found: {service_name}"}, status_code=404)
+
+    hub_common.save_projects(projects, order, ignored)
+    return JSONResponse({"ok": True, "service": service_name, "enabled": bool(enabled)})
+
+
+# ── Project CRUD ──────────────────────────────────────────────────────────
+
+async def update_project(request):
+    """Update project fields. Body: { key, data: { name, tagline } }"""
+    if not hub_common:
+        return JSONResponse({"ok": False}, status_code=500)
+    body = await _json_body(request)
+    key = body.get("key", "").strip()
+    data = body.get("data", {})
+
+    projects, order, ignored = hub_common.load_projects()
+    if key not in projects:
+        return JSONResponse({"ok": False, "error": f"Project not found: {key}"}, status_code=404)
+
+    if "name" in data:
+        projects[key]["name"] = data["name"]
+    if "tagline" in data:
+        projects[key]["tagline"] = data["tagline"]
+
+    hub_common.save_projects(projects, order, ignored)
+    return JSONResponse({"ok": True})
+
+
+async def delete_project(request):
+    """Delete a project. Body: { key }"""
+    if not hub_common:
+        return JSONResponse({"ok": False}, status_code=500)
+    body = await _json_body(request)
+    key = body.get("key", "").strip()
+
+    projects, order, ignored = hub_common.load_projects()
+    if key not in projects:
+        return JSONResponse({"ok": False, "error": f"Project not found: {key}"}, status_code=404)
+
+    del projects[key]
+    if key in order:
+        order.remove(key)
+
+    hub_common.save_projects(projects, order, ignored)
+    return JSONResponse({"ok": True})
+
+
+# ── Code Assistant projects ───────────────────────────────────────────────
+
+async def get_ca_projects(request):
+    """Fetch indexed projects from Code Assistant."""
+    if not hub_common:
+        return JSONResponse({"projects": []})
+    try:
+        data = hub_common.code_assistant_get('projects')
+        return JSONResponse({"projects": data if isinstance(data, list) else []})
+    except Exception as e:
+        return JSONResponse({"projects": [], "error": str(e)})
+
+
+async def ca_reindex(request):
+    """Trigger reindex for a Code Assistant project. Body: { project }"""
+    if not hub_common:
+        return JSONResponse({"ok": False}, status_code=500)
+    body = await _json_body(request)
+    project = body.get("project", "").strip()
+    if not project:
+        return JSONResponse({"ok": False, "error": "Project name required"}, status_code=400)
+    try:
+        result = hub_common.code_assistant_post(f'projects/{project}/reindex', {}, timeout=300)
+        return JSONResponse({"ok": True, "result": result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+# ── Research fetch ────────────────────────────────────────────────────────
+
+async def research_fetch(request):
+    """Trigger research --fetch (long-running)."""
+    output = _run_tool("research", "--fetch", timeout=300)
+    return JSONResponse({"output": output})
+
+
 # ── App assembly ─────────────────────────────────────────────────────────────
 
 _TAB_ROUTES = ["chat", "status", "projects", "repo", "research", "notify", "help", "settings"]
@@ -795,8 +966,20 @@ routes = [
     Route("/api/settings/rag/add", add_rag, methods=["POST"]),
     Route("/api/settings/rag/update", update_rag, methods=["POST"]),
     Route("/api/settings/rag/delete", delete_rag, methods=["POST"]),
-    # Code Assistant probe
+    # Code Assistant
     Route("/api/settings/ca/probe", probe_code_assistant, methods=["POST"]),
+    Route("/api/ca/projects", get_ca_projects),
+    Route("/api/ca/reindex", ca_reindex, methods=["POST"]),
+    # vLLM controls
+    Route("/api/vllm/status", get_vllm_status),
+    Route("/api/vllm/action", vllm_action, methods=["POST"]),
+    # Dev service toggle
+    Route("/api/projects/dev-toggle", toggle_dev_service, methods=["POST"]),
+    # Project CRUD
+    Route("/api/projects/update", update_project, methods=["POST"]),
+    Route("/api/projects/delete", delete_project, methods=["POST"]),
+    # Research fetch
+    Route("/api/research/fetch", research_fetch, methods=["POST"]),
     Route("/api/image", upload_image, methods=["POST"]),
     Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),
 ]

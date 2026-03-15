@@ -192,7 +192,7 @@ const Settings = {
   // ── Hosts Section ────────────────────────────────────────────────────────
   renderHostsSection(config) {
     const hosts = config.hosts || {};
-    const allRoles = ['local', 'ollama', 'code_assistant', 'backup_target', 'wakeable'];
+    const allRoles = ['local', 'ollama', 'vllm', 'code_assistant', 'backup_target', 'wakeable'];
 
     let cards = '';
     for (const [alias, host] of Object.entries(hosts)) {
@@ -368,43 +368,66 @@ const Settings = {
 
   // ── LLM Section ──────────────────────────────────────────────────────────
   renderLLMSection(config) {
-    const ollama = config.ollama || {};
-    const ollamaHosts = Object.entries(config.hosts || {}).filter(([_, h]) => (h.roles || []).includes('ollama'));
+    const llm = config.llm || config.ollama || {};
+    const backend = llm.backend || 'ollama';
+    const isVllm = backend === 'vllm';
+
+    // Filter hosts by either vllm or ollama role
+    const llmHosts = Object.entries(config.hosts || {}).filter(([_, h]) => {
+      const roles = h.roles || [];
+      return roles.includes('vllm') || roles.includes('ollama');
+    });
 
     let hostOptions = '';
-    for (const [key, h] of ollamaHosts) {
-      const sel = key === ollama.host ? 'selected' : '';
+    for (const [key, h] of llmHosts) {
+      const sel = key === llm.host ? 'selected' : '';
       hostOptions += `<option value="${this._esc(key)}" ${sel}>${this._esc(h.name || key)} (${this._esc(h.ip || '?')})</option>`;
     }
-    // If no ollama host found, show text input fallback
-    if (!ollamaHosts.length) {
-      hostOptions = `<option value="${this._esc(ollama.host || 'local')}">${this._esc(ollama.host || 'local')}</option>`;
+    if (!llmHosts.length) {
+      hostOptions = `<option value="${this._esc(llm.host || 'local')}">${this._esc(llm.host || 'local')}</option>`;
     }
 
-    const sessionModel = this._sessionData?.model || ollama.default_model || '';
+    const defaultPort = isVllm ? 8000 : 11434;
+    const model = llm.model || llm.default_model || '';
+    const ctxWindow = llm.context_window || llm.num_ctx || 44000;
+    const backendBadge = isVllm
+      ? '<span class="badge badge-success" style="margin-left:8px;">vLLM</span>'
+      : '<span class="badge badge-info" style="margin-left:8px;">Ollama</span>';
 
     return `
       <div class="settings-section">
         <div class="settings-section-header">
-          <div class="settings-section-title">LLM / Ollama</div>
-          <span class="probe-result" id="s-ollama-probe"></span>
+          <div class="settings-section-title">LLM Backend${backendBadge}</div>
+          <span class="probe-result" id="s-llm-probe"></span>
         </div>
 
-        <div class="settings-group">
-          <div class="settings-label">Ollama Host</div>
+        ${isVllm ? `
+        <div class="settings-group" id="s-vllm-controls">
+          <div class="settings-label">vLLM Server</div>
           <div class="settings-row">
-            <select class="input" id="s-ollama-host" style="max-width:300px;">${hostOptions}</select>
+            <span class="probe-result" id="s-vllm-status"><span class="spinner-sm"></span> Checking...</span>
+            <button class="btn btn-sm" onclick="Settings.vllmAction('start')">Start</button>
+            <button class="btn btn-sm" onclick="Settings.vllmAction('stop')">Stop</button>
+            <button class="btn btn-sm" onclick="Settings.vllmAction('restart')">Restart</button>
+          </div>
+        </div>
+        ` : ''}
+
+        <div class="settings-group">
+          <div class="settings-label">LLM Host</div>
+          <div class="settings-row">
+            <select class="input" id="s-llm-host" style="max-width:300px;">${hostOptions}</select>
           </div>
         </div>
         <div class="settings-group">
           <div class="settings-label">Port</div>
-          <input type="number" class="input" id="s-ollama-port" value="${ollama.port || 11434}" style="max-width:120px;">
+          <input type="number" class="input" id="s-llm-port" value="${llm.port || defaultPort}" style="max-width:120px;">
         </div>
         <div class="settings-group">
-          <div class="settings-label">Default Model</div>
+          <div class="settings-label">Model</div>
           <div class="settings-row">
-            <select class="input" id="s-ollama-model" style="max-width:300px;">
-              <option value="${this._esc(ollama.default_model || '')}">${this._esc(ollama.default_model || 'loading...')}</option>
+            <select class="input" id="s-llm-model" style="max-width:300px;">
+              <option value="${this._esc(model)}">${this._esc(model || 'loading...')}</option>
             </select>
             <button class="btn btn-sm" onclick="Settings.refreshModels()">Refresh</button>
           </div>
@@ -412,7 +435,7 @@ const Settings = {
         </div>
         <div class="settings-group">
           <div class="settings-label">Context Window</div>
-          <input type="number" class="input" id="s-llm-ctx" value="${this._sessionData?.context_window || 16000}" style="max-width:160px;" min="1000" max="128000" step="1000">
+          <input type="number" class="input" id="s-llm-ctx" value="${this._sessionData?.context_window || ctxWindow}" style="max-width:160px;" min="1000" max="128000" step="1000">
         </div>
         <div class="settings-group">
           <div class="settings-label">Max Tokens (per response)</div>
@@ -421,14 +444,56 @@ const Settings = {
         <div class="settings-group">
           <div class="settings-row">
             <button class="btn btn-sm" onclick="Settings.saveLLM(this)">Save</button>
-            <button class="btn btn-sm" onclick="Settings.probeOllama()">Test Connection</button>
+            <button class="btn btn-sm" onclick="Settings.probeLLM()">Test Connection</button>
           </div>
         </div>
       </div>`;
   },
 
+  async loadVllmStatus() {
+    const el = document.getElementById('s-vllm-status');
+    if (!el) return;
+    el.innerHTML = '<span class="spinner-sm"></span> Checking...';
+    try {
+      const res = await fetch('/api/vllm/status');
+      const data = await res.json();
+      if (data.state === 'active') {
+        const model = data.model ? ` — ${this._esc(data.model)}` : '';
+        el.innerHTML = `<span class="badge badge-success">Running${model}</span>`;
+      } else if (data.state === 'activating') {
+        el.innerHTML = '<span class="badge badge-warning">Starting...</span>';
+      } else {
+        el.innerHTML = `<span class="badge badge-error">${this._esc(data.state || 'Stopped')}</span>`;
+      }
+    } catch (e) {
+      el.innerHTML = '<span class="badge badge-error">Error</span>';
+    }
+  },
+
+  async vllmAction(action) {
+    const el = document.getElementById('s-vllm-status');
+    if (el) el.innerHTML = `<span class="spinner-sm"></span> ${action}ing...`;
+    try {
+      const res = await fetch('/api/vllm/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        App.toast(`vLLM ${action} sent`, 'success');
+      } else {
+        App.toast(data.message || `vLLM ${action} failed`, 'error');
+      }
+    } catch (e) {
+      App.toast(`vLLM ${action} failed: ${e.message}`, 'error');
+    }
+    // Refresh status after delay (vLLM startup takes time)
+    setTimeout(() => this.loadVllmStatus(), action === 'start' ? 5000 : 3000);
+  },
+
   async refreshModels() {
-    const sel = document.getElementById('s-ollama-model');
+    const sel = document.getElementById('s-llm-model');
     const current = sel.value;
     sel.innerHTML = '<option>Loading...</option>';
     try {
@@ -446,14 +511,15 @@ const Settings = {
     }
   },
 
-  async probeOllama() {
-    const badge = document.getElementById('s-ollama-probe');
+  async probeLLM() {
+    const badge = document.getElementById('s-llm-probe');
     badge.innerHTML = '<span class="spinner-sm"></span>';
     try {
       const res = await fetch('/api/settings/ollama/probe', { method: 'POST' });
       const data = await res.json();
       if (data.reachable) {
-        badge.innerHTML = `<span class="badge badge-success">Connected (${data.model_count} models)</span>`;
+        const label = data.backend === 'vllm' ? 'vLLM' : 'Ollama';
+        badge.innerHTML = `<span class="badge badge-success">${label} Connected (${data.model_count} model${data.model_count !== 1 ? 's' : ''})</span>`;
       } else {
         badge.innerHTML = `<span class="badge badge-error">Unreachable</span>`;
       }
@@ -463,10 +529,10 @@ const Settings = {
   },
 
   async saveLLM(btn) {
-    const host = document.getElementById('s-ollama-host').value;
-    const port = parseInt(document.getElementById('s-ollama-port').value) || 11434;
-    const model = document.getElementById('s-ollama-model').value;
-    const ctx = parseInt(document.getElementById('s-llm-ctx').value) || 16000;
+    const host = document.getElementById('s-llm-host').value;
+    const port = parseInt(document.getElementById('s-llm-port').value) || 8000;
+    const model = document.getElementById('s-llm-model').value;
+    const ctx = parseInt(document.getElementById('s-llm-ctx').value) || 44000;
     const maxTok = parseInt(document.getElementById('s-llm-maxtok').value) || 1200;
 
     if (!model) { App.toast('Model name cannot be empty', 'error'); return; }
@@ -476,7 +542,14 @@ const Settings = {
 
     if (btn) { btn.disabled = true; btn.textContent = 'Saving...'; }
 
-    // Save to hub config
+    // Detect current backend
+    const llm = this._hubConfig?.llm || this._hubConfig?.ollama || {};
+    const backend = llm.backend || 'ollama';
+
+    // Save to hub config (llm section)
+    await this.saveSection('llm', { backend, host, port, model, context_window: ctx }, null);
+
+    // Backward compat: also write ollama section
     await this.saveSection('ollama', { host, port, default_model: model }, null);
 
     // Save runtime OI settings
@@ -532,8 +605,10 @@ const Settings = {
     } catch (e) {
       document.getElementById('s-rag-list').innerHTML = '<div class="text-muted">Failed to load RAG entries</div>';
     }
-    // Auto-load model list
+    // Auto-load model list and vLLM status
     this.refreshModels();
+    this.loadVllmStatus();
+    this._loadCAProjects();
   },
 
   filterRag() {
@@ -769,6 +844,10 @@ const Settings = {
             <button class="btn btn-sm" onclick="Settings.probeCA()">Test Connection</button>
           </div>
         </div>
+        <div class="settings-group">
+          <div class="settings-label">Indexed Projects</div>
+          <div id="s-ca-projects"><span class="text-muted">Loading...</span></div>
+        </div>
       </div>`;
   },
 
@@ -791,6 +870,63 @@ const Settings = {
     const port = parseInt(document.getElementById('s-ca-port').value) || 5002;
     if (port < 1 || port > 65535) { App.toast('Port must be 1-65535', 'error'); return; }
     await this.saveSection('code_assistant', { host, port }, btn);
+  },
+
+  async _loadCAProjects() {
+    const el = document.getElementById('s-ca-projects');
+    if (!el) return;
+    try {
+      const res = await fetch('/api/ca/projects');
+      const data = await res.json();
+      if (data.error) {
+        el.innerHTML = `<span class="text-muted">${this._esc(data.error)}</span>`;
+        return;
+      }
+      if (!data.projects || !data.projects.length) {
+        el.innerHTML = '<span class="text-muted">No indexed projects</span>';
+        return;
+      }
+      let html = '';
+      for (const p of data.projects) {
+        const name = p.name || p.project || 'unknown';
+        const codeFiles = p.code_files ?? p.code_count ?? '?';
+        const docFiles = p.doc_files ?? p.doc_count ?? '?';
+        html += `
+          <div class="data-card" style="padding:var(--space-sm) var(--space-md);margin-bottom:var(--space-xs);">
+            <div class="settings-row" style="justify-content:space-between;margin-bottom:0;">
+              <div>
+                <strong>${this._esc(name)}</strong>
+                <span class="text-xs text-muted" style="margin-left:var(--space-sm);">${codeFiles} code, ${docFiles} docs</span>
+              </div>
+              <button class="btn btn-sm" onclick="Settings.reindexCA('${this._esc(name)}', this)">Reindex</button>
+            </div>
+          </div>`;
+      }
+      el.innerHTML = html;
+    } catch (e) {
+      el.innerHTML = '<span class="text-muted">Failed to load</span>';
+    }
+  },
+
+  async reindexCA(project, btn) {
+    if (btn) { btn.disabled = true; btn.textContent = 'Reindexing...'; }
+    try {
+      const res = await fetch('/api/ca/reindex', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        App.toast(`Reindexed ${project}`, 'success');
+        await this._loadCAProjects();
+      } else {
+        App.toast(data.error || 'Reindex failed', 'error');
+      }
+    } catch (e) {
+      App.toast('Reindex failed: ' + e.message, 'error');
+    }
+    if (btn) { btn.disabled = false; btn.textContent = 'Reindex'; }
   },
 
   // ── Research Section ─────────────────────────────────────────────────────

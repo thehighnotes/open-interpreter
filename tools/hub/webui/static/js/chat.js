@@ -5,6 +5,28 @@ const Chat = {
   abortController: null,
   pendingApproval: false,
   imageFile: null,
+  _acIndex: -1,
+
+  // Magic command definitions for autocomplete
+  _magicCommands: [
+    { cmd: '%status', desc: 'Hub status dashboard' },
+    { cmd: '%next', desc: 'AI-suggested next tasks' },
+    { cmd: '%projects', desc: 'List registered projects' },
+    { cmd: '%repo', desc: 'Git dashboard' },
+    { cmd: '%services', desc: 'Service status' },
+    { cmd: '%research', desc: 'Research digest' },
+    { cmd: '%overview', desc: 'AI project overview' },
+    { cmd: '%notify', desc: 'Unread notifications' },
+    { cmd: '%health', desc: 'Health probe results' },
+    { cmd: '%backup', desc: 'Run backup' },
+    { cmd: '%vllm', args: '[status|start|stop|restart]', desc: 'vLLM server management' },
+    { cmd: '%prepare', args: '<project>', desc: 'Prepare project session' },
+    { cmd: '%begin', args: '<project>', desc: 'Build preamble, launch editor' },
+    { cmd: '%work', args: '<project>', desc: 'Full session: prepare + overview + begin' },
+    { cmd: '%dev', desc: 'Toggle dev services' },
+    { cmd: '%reset', desc: 'Clear conversation' },
+    { cmd: '%model', args: '[name]', desc: 'Show or switch model' },
+  ],
 
   init() {
     this.textarea = document.getElementById('chat-input');
@@ -15,16 +37,25 @@ const Chat = {
     this.imageBtn = document.getElementById('image-btn');
     this.imageInput = document.getElementById('image-input');
 
-    // Send on enter
+    // Send on enter (unless autocomplete is open)
     this.textarea.addEventListener('keydown', (e) => {
+      if (this._acHandleKey(e)) return;
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         this.send();
       }
     });
 
-    // Auto-resize textarea
-    this.textarea.addEventListener('input', () => this.autoResize());
+    // Auto-resize + autocomplete
+    this.textarea.addEventListener('input', () => {
+      this.autoResize();
+      this._acUpdate();
+    });
+
+    // Close autocomplete on blur (with delay for click)
+    this.textarea.addEventListener('blur', () => {
+      setTimeout(() => this._acHide(), 150);
+    });
 
     // Send button
     this.sendBtn.addEventListener('click', () => this.send());
@@ -48,6 +79,118 @@ const Chat = {
   autoResize() {
     this.textarea.style.height = 'auto';
     this.textarea.style.height = Math.min(this.textarea.scrollHeight, 150) + 'px';
+  },
+
+  // ── Magic command autocomplete ──────────────────────────────────────────
+
+  _acGetEl() {
+    let el = document.getElementById('magic-autocomplete');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'magic-autocomplete';
+      el.className = 'magic-autocomplete';
+      const box = document.querySelector('.chat-input-box');
+      if (box) box.parentElement.appendChild(el);
+    }
+    return el;
+  },
+
+  _acUpdate() {
+    const val = this.textarea.value;
+    // Only trigger when line starts with % and cursor is on that line
+    if (!val.startsWith('%')) { this._acHide(); return; }
+
+    const query = val.split(/\s/)[0].toLowerCase();
+    const matches = this._magicCommands.filter(m =>
+      m.cmd.startsWith(query)
+    );
+
+    if (!matches.length || (matches.length === 1 && matches[0].cmd === query && !val.includes(' '))) {
+      // Exact match with no args typed yet — keep showing if it has args
+      if (matches.length === 1 && matches[0].args && matches[0].cmd === query) {
+        // Show hint only
+      } else {
+        this._acHide();
+        return;
+      }
+    }
+
+    this._acIndex = -1;
+    const el = this._acGetEl();
+    el.innerHTML = matches.map((m, i) =>
+      `<div class="magic-ac-item" data-index="${i}" onclick="Chat._acSelect(${i})">` +
+      `<span class="magic-ac-cmd">${this._acEsc(m.cmd)}${m.args ? ' <span class="magic-ac-args">' + this._acEsc(m.args) + '</span>' : ''}</span>` +
+      `<span class="magic-ac-desc">${this._acEsc(m.desc)}</span>` +
+      `</div>`
+    ).join('');
+    el.style.display = 'block';
+    el._matches = matches;
+  },
+
+  _acEsc(s) {
+    if (!s) return '';
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  },
+
+  _acHide() {
+    const el = document.getElementById('magic-autocomplete');
+    if (el) el.style.display = 'none';
+  },
+
+  _acIsVisible() {
+    const el = document.getElementById('magic-autocomplete');
+    return el && el.style.display === 'block';
+  },
+
+  _acHandleKey(e) {
+    if (!this._acIsVisible()) return false;
+    const el = document.getElementById('magic-autocomplete');
+    const matches = el._matches || [];
+    if (!matches.length) return false;
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      this._acIndex = Math.min(this._acIndex + 1, matches.length - 1);
+      this._acHighlight(el);
+      return true;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      this._acIndex = Math.max(this._acIndex - 1, 0);
+      this._acHighlight(el);
+      return true;
+    }
+    if (e.key === 'Tab' || (e.key === 'Enter' && this._acIndex >= 0)) {
+      e.preventDefault();
+      const idx = this._acIndex >= 0 ? this._acIndex : 0;
+      this._acSelect(idx);
+      return true;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      this._acHide();
+      return true;
+    }
+    return false;
+  },
+
+  _acHighlight(el) {
+    el.querySelectorAll('.magic-ac-item').forEach((item, i) => {
+      item.classList.toggle('active', i === this._acIndex);
+    });
+  },
+
+  _acSelect(index) {
+    const el = document.getElementById('magic-autocomplete');
+    const matches = el?._matches || [];
+    if (index < 0 || index >= matches.length) return;
+    const m = matches[index];
+    // Replace the command portion, keep any existing args after space
+    const parts = this.textarea.value.split(/\s+/);
+    parts[0] = m.cmd;
+    this.textarea.value = parts.join(' ') + (parts.length === 1 && m.args ? ' ' : '');
+    this.textarea.focus();
+    this._acHide();
   },
 
   async send() {
@@ -243,13 +386,21 @@ const Chat = {
 
             case 'output':
               if (currentOutput) {
-                currentOutput.textContent += event.content;
+                currentOutput._rawBuffer = (currentOutput._rawBuffer || '') + event.content;
+                currentOutput.innerHTML = this.ansiToHtml(currentOutput._rawBuffer);
                 this.scrollToBottom();
               }
               break;
 
             case 'output_end':
+              if (currentOutput && currentOutput._rawBuffer) {
+                currentOutput.innerHTML = this.ansiToHtml(currentOutput._rawBuffer);
+              }
               currentOutput = null;
+              break;
+
+            case 'queue_status':
+              this.updateQueueStatus(msgDiv, event.content);
               break;
 
             case 'error':
@@ -257,6 +408,7 @@ const Chat = {
               break;
 
             case 'done':
+              this.removeQueueStatus(msgDiv);
               if (event.stats) {
                 const pt = event.stats.prompt_tokens;
                 const cw = event.stats.context_window;
@@ -303,6 +455,27 @@ const Chat = {
     return bubble;
   },
 
+  updateQueueStatus(msgDiv, info) {
+    const body = msgDiv.querySelector('.msg-body');
+    let indicator = body.querySelector('.queue-indicator');
+    if (!indicator) {
+      indicator = document.createElement('details');
+      indicator.className = 'queue-indicator';
+      indicator.innerHTML = `
+        <summary class="queue-summary"><span class="spinner-sm"></span> Queued</summary>
+        <div class="queue-details"></div>
+      `;
+      body.appendChild(indicator);
+    }
+    indicator.querySelector('.queue-details').textContent = info;
+    this.scrollToBottom();
+  },
+
+  removeQueueStatus(msgDiv) {
+    const indicator = msgDiv.querySelector('.queue-indicator');
+    if (indicator) indicator.remove();
+  },
+
   addCodeBlockToMsg(msgDiv, language) {
     const block = document.createElement('div');
     block.className = 'code-block';
@@ -344,8 +517,47 @@ const Chat = {
   addOutputToMsg(msgDiv) {
     const output = document.createElement('div');
     output.className = 'console-output';
+    output._rawBuffer = '';
     msgDiv.querySelector('.msg-body').appendChild(output);
     return output;
+  },
+
+  // Convert ANSI SGR codes to HTML spans
+  ansiToHtml(text) {
+    const SGR = {
+      '1': 'ansi-bold', '2': 'ansi-dim',
+      '30': 'ansi-black', '31': 'ansi-red', '32': 'ansi-green', '33': 'ansi-yellow',
+      '34': 'ansi-blue', '35': 'ansi-magenta', '36': 'ansi-cyan', '37': 'ansi-white',
+      '90': 'ansi-gray', '91': 'ansi-bright-red', '92': 'ansi-bright-green',
+      '93': 'ansi-bright-yellow', '94': 'ansi-bright-blue', '95': 'ansi-bright-magenta',
+      '96': 'ansi-bright-cyan', '97': 'ansi-white',
+    };
+    // Strip non-SGR escapes first
+    text = text.replace(/\x1b\[[0-9;]*[A-HJKSTfhln]/g, '');
+    text = text.replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, '');
+
+    const parts = text.split(/\x1b\[([0-9;]*)m/);
+    let out = '';
+    let open = false;
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 0) {
+        out += this.escapeHtml(parts[i]);
+      } else {
+        const codes = parts[i];
+        if (!codes || codes === '0' || codes === '00' || codes === '39') {
+          if (open) { out += '</span>'; open = false; }
+        } else {
+          const classes = codes.split(';').map(c => SGR[c]).filter(Boolean);
+          if (classes.length) {
+            if (open) out += '</span>';
+            out += `<span class="${classes.join(' ')}">`;
+            open = true;
+          }
+        }
+      }
+    }
+    if (open) out += '</span>';
+    return out;
   },
 
   addErrorToMsg(msgDiv, text) {
@@ -457,7 +669,7 @@ const Chat = {
       } else if (msg.role === 'computer' && msg.type === 'console') {
         if (!currentAssistantDiv) currentAssistantDiv = this.createAssistantMessage();
         const output = this.addOutputToMsg(currentAssistantDiv);
-        output.textContent = msg.content;
+        output.innerHTML = this.ansiToHtml(msg.content || '');
       }
     }
     this.scrollToBottom();

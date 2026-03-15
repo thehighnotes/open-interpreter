@@ -13,7 +13,7 @@ const Help = {
         terminal. The WebUI gives you browser access to the same capabilities.</p>
         <p>Everything connects through SSH and two config files:</p>
         <ul>
-          <li><code>~/.config/hub/config.json</code> - infrastructure (hosts, Ollama, GitHub, backup targets)</li>
+          <li><code>~/.config/hub/config.json</code> - infrastructure (hosts, LLM backend, GitHub, backup targets)</li>
           <li><code>~/.config/hub/projects.json</code> - project registry (names, paths, services, git remotes)</li>
         </ul>
         <p>Built on <a href="https://aiquest.info" target="_blank" rel="noopener">AIquest</a>,
@@ -28,7 +28,7 @@ const Help = {
 +--------------+         SSH          +------------------+
 |   Hub        |&lt;--------------------&gt;|   GPU Server     |
 |              |                      |                  |
-|  hub tools   |    +------------+    |  Ollama (LLM)    |
+|  hub tools   |    +------------+    |  vLLM / Ollama   |
 |  OI / Claude |    | Workstation|    |  Code Assistant  |
 |  cron jobs   |&lt;--&gt;|            |    |  project repos   |
 |  backups     |SSH | gh CLI     |    |  backup storage  |
@@ -45,6 +45,7 @@ const Help = {
         <p><strong>Host roles</strong> in config.json determine behavior:</p>
         <ul>
           <li><code>local</code> - the machine running hub tools</li>
+          <li><code>vllm</code> - runs the vLLM inference server (default)</li>
           <li><code>ollama</code> - runs the Ollama LLM server</li>
           <li><code>code_assistant</code> - runs semantic search / RAG</li>
           <li><code>backup_target</code> - receives rsync backups</li>
@@ -165,9 +166,9 @@ python3 tools/hub/install.py</pre>
   "hub": { "name": "My Dev Hub", "local_host": "nano" },
   "hosts": {
     "nano": { "name": "Hub", "ip": "127.0.0.1", "roles": ["local"] },
-    "gpu":  { "name": "GPU", "ip": "192.168.1.100", "roles": ["ollama", "backup_target"] }
+    "gpu":  { "name": "GPU", "ip": "192.168.1.100", "roles": ["vllm", "backup_target"] }
   },
-  "ollama": { "host": "gpu", "port": 11434, "default_model": "llama3:8b" },
+  "llm": { "backend": "vllm", "host": "gpu", "port": 8000, "model": "Qwen/Qwen3.5-35B", "context_window": 44000 },
   "backup": { "destination": "gpu:~/hub-backup" },
   "git": { "github_username": "myuser", "email": "me@example.com" }
 }</pre>
@@ -200,7 +201,7 @@ python3 tools/hub/install.py</pre>
           <tr><th>Problem</th><th>Fix</th></tr>
           <tr><td>Hub tools not found</td><td>Run <code>python3 tools/hub/install.py</code> to create symlinks, then <code>source ~/.bashrc</code></td></tr>
           <tr><td>SSH connection refused</td><td>Check <code>~/.ssh/config</code> has the host alias. Test with <code>ssh &lt;alias&gt; echo ok</code></td></tr>
-          <tr><td>Ollama not responding</td><td>Verify Ollama is running on the host defined in config.json. Check with <code>curl http://&lt;host&gt;:11434/api/tags</code></td></tr>
+          <tr><td>LLM not responding</td><td>Check vLLM/Ollama on the GPU host. vLLM: <code>hub --vllm status</code>. Ollama: <code>curl http://&lt;host&gt;:11434/api/tags</code></td></tr>
           <tr><td>LLM returns empty response</td><td>If using a thinking model (qwen3/3.5), ensure <code>think: false</code> is set in the API payload</td></tr>
           <tr><td>WebUI won't connect</td><td>Check the interpreter is loaded. Look at the connection dot in the sidebar footer</td></tr>
           <tr><td>Projects not showing up</td><td>Run <code>hub --scan &lt;host&gt;</code> to discover projects, or <code>hub --manage</code> to add manually</td></tr>
@@ -234,6 +235,7 @@ python3 tools/hub/install.py</pre>
         { cmd: 'hub --manage', desc: 'Interactive project editor (TUI)' },
         { cmd: 'hub --services', desc: 'Live service status across all projects' },
         { cmd: 'hub --dev', desc: 'Toggle dev services on/off (TUI)' },
+        { cmd: 'hub --vllm [status|start|stop|restart]', desc: 'Manage vLLM server on GPU host' },
       ],
     },
     {
@@ -293,6 +295,11 @@ python3 tools/hub/install.py</pre>
         { cmd: '%health', desc: 'Health probe results' },
         { cmd: '%services', desc: 'Service status' },
         { cmd: '%overview', desc: 'AI project overview' },
+        { cmd: '%vllm [status]', desc: 'vLLM server management' },
+        { cmd: '%prepare <project>', desc: 'Prepare project (wake hosts, warm LLM, start services)' },
+        { cmd: '%begin <project>', desc: 'Build context preamble, launch editor' },
+        { cmd: '%work <project>', desc: 'Full session: prepare + overview + begin' },
+        { cmd: '%dev', desc: 'Toggle dev services on/off' },
         { cmd: '%notify', desc: 'Unread notifications' },
         { cmd: '%image', desc: 'Send clipboard image to LLM' },
         { cmd: '%image <path>', desc: 'Send image file to LLM' },

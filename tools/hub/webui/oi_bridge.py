@@ -120,11 +120,37 @@ class OIBridge:
         interpreter.disable_telemetry = True
         interpreter.offline = True
 
-        interpreter.system_message = (
-            "You are a terminal assistant. Run one command per code block:\n"
-            "```bash\ncommand here\n```\n"
-            "Read files with cat. Edit files carefully. Ask before destructive operations.\n"
-        )
+        interpreter.system_message = """You are a terminal assistant. Run one command per code block:
+```bash
+command here
+```
+
+ENVIRONMENT:
+Nano  192.168.2.31  you are here
+AGX   192.168.2.33  ssh agx "command" — GPU, vLLM, Code Assistant
+WS    192.168.2.24  ssh ws "command"  — dev workstation
+NEVER run bare ssh. ALWAYS: ssh agx "free -h" (quoted command).
+
+HUB TOOLS (run directly, no install needed):
+~/hub --status        Live dashboard of hosts, services, caches
+~/hub --next          AI-suggested next tasks
+~/hub --scan <host>   Discover projects on a machine
+~/hub --services      Service status across all projects
+~/hub --vllm          vLLM server management
+~/overview            AI overview of all projects
+~/overview <project>  Deep view of a single project
+~/research            Research digest (arxiv + GitHub releases)
+~/code search <proj> "query"  Semantic code search
+~/code ask <proj> "question"  RAG-powered architecture question
+~/search "query"      DuckDuckGo web search (internet only, not for local files)
+~/notify              View unread notifications
+~/backup              Rsync hub to backup target
+
+Find files: find ~ -maxdepth 4 -iname "*keyword*" 2>/dev/null
+Search in files: grep -rn "pattern" /path --include="*.py"
+Edit files with cat + careful manual edits. Ask before destructive operations.
+Filesystem first. ~/search only for internet.
+Answers: 2-4 sentences. No output repetition. Never sudo."""
 
         # Load Mini-RAG if available
         self._rag = None
@@ -278,6 +304,12 @@ class OIBridge:
                 return msg.get("content", "")
         return ""
 
+    # Queue status pattern from LLM proxy (⏳ Queued ...)
+    _QUEUE_RE = re.compile(r'[\u23f3\u231b]\s*Queued\s*\(([^)]+)\)')
+    # Braille spinner chars used by hub Spinner class
+    _SPINNER_CHARS = set('⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏')
+    _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
     def _normalize_chunk(self, chunk):
         """Map OI chunk format to clean event dict."""
         if not isinstance(chunk, dict):
@@ -296,6 +328,10 @@ class OIBridge:
                 if end:
                     return {"type": "text_end"}
                 if content:
+                    # Detect proxy queue status messages
+                    m = self._QUEUE_RE.search(content)
+                    if m:
+                        return {"type": "queue_status", "content": m.group(1).strip()}
                     return {"type": "text", "content": content}
 
             elif msg_type == "code":
@@ -314,9 +350,38 @@ class OIBridge:
                 if end:
                     return {"type": "output_end"}
                 if content:
-                    return {"type": "output", "content": content}
+                    # Filter spinner frames from console output
+                    filtered = self._filter_console(content)
+                    if filtered:
+                        return {"type": "output", "content": filtered}
+                    return None
 
         return None
+
+    def _filter_console(self, content):
+        """Filter spinner frames and clean console output for web display."""
+        lines = content.split('\n')
+        result = []
+        for line in lines:
+            # Handle \r (carriage return) — keep only last segment
+            if '\r' in line:
+                segments = line.split('\r')
+                final = ''
+                for seg in segments:
+                    if seg.strip():
+                        final = seg
+                line = final
+            if not line:
+                continue
+            # Strip ANSI codes for spinner detection
+            plain = self._ANSI_RE.sub('', line).strip()
+            if not plain:
+                continue
+            # Drop lines starting with braille spinner chars
+            if plain and plain[0] in self._SPINNER_CHARS:
+                continue
+            result.append(line)
+        return '\n'.join(result) if result else ''
 
     def approve(self, approved):
         """Respond to a pending code approval."""
