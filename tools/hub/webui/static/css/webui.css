@@ -280,27 +280,48 @@
 }
 
 /* Markdown inside messages */
-.msg-bubble .markdown-content p { margin: 0 0 0.5em; }
+.msg-bubble .markdown-content { line-height: 1.7; }
+.msg-bubble .markdown-content p { margin: 0 0 1em; }
 .msg-bubble .markdown-content p:last-child { margin: 0; }
 .msg-bubble .markdown-content ul,
-.msg-bubble .markdown-content ol { margin: 0.25em 0; padding-left: 1.5em; }
-.msg-bubble .markdown-content li { margin: 0.15em 0; }
+.msg-bubble .markdown-content ol { margin: 0.5em 0; padding-left: 2em; }
+.msg-bubble .markdown-content li { margin: 0.25em 0; }
+.msg-bubble .markdown-content li > p { margin: 0.25em 0; }
 .msg-bubble .markdown-content h1,
-.msg-bubble .markdown-content h2,
-.msg-bubble .markdown-content h3 {
+.msg-bubble .markdown-content h2 {
   font-size: var(--font-size-lg);
-  margin: 0.5em 0 0.25em;
+  font-weight: 600;
+  margin: 1.2em 0 0.6em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border-secondary);
   color: var(--text-primary);
 }
+.msg-bubble .markdown-content h3,
+.msg-bubble .markdown-content h4,
+.msg-bubble .markdown-content h5,
+.msg-bubble .markdown-content h6 {
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  margin: 1em 0 0.4em;
+  color: var(--text-primary);
+}
+.msg-bubble .markdown-content h1:first-child,
+.msg-bubble .markdown-content h2:first-child,
+.msg-bubble .markdown-content h3:first-child { margin-top: 0; }
+.msg-bubble .markdown-content hr {
+  border: none;
+  border-top: 1px solid var(--border-secondary);
+  margin: 1em 0;
+}
 .msg-bubble .markdown-content code {
-  background: rgba(255,255,255,0.08);
-  padding: 1px 5px;
+  background: rgba(110,118,129,0.4);
+  padding: 2px 6px;
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
-  font-size: 0.9em;
+  font-size: 0.85em;
 }
 .msg-bubble .markdown-content pre {
-  margin: 0.5em 0;
+  margin: 0.75em 0;
   padding: 0;
   background: transparent;
 }
@@ -308,6 +329,7 @@
   display: block;
   padding: var(--space-sm) var(--space-md);
   background: #0d0d0d;
+  border: 1px solid var(--border-secondary);
   border-radius: var(--radius-md);
   overflow-x: auto;
   font-size: var(--font-size-sm);
@@ -315,14 +337,37 @@
 }
 .msg-bubble .markdown-content a {
   color: var(--accent-primary-hover);
-  text-decoration: underline;
+  text-decoration: none;
 }
+.msg-bubble .markdown-content a:hover { text-decoration: underline; }
 .msg-bubble .markdown-content strong { color: var(--text-primary); }
 .msg-bubble .markdown-content blockquote {
-  border-left: 3px solid var(--border-primary);
+  border-left: 4px solid #3b82f6;
   padding-left: var(--space-md);
   color: var(--text-secondary);
-  margin: 0.5em 0;
+  font-style: italic;
+  margin: 0.75em 0;
+}
+/* Tables */
+.msg-bubble .markdown-content table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.75em 0;
+  font-size: var(--font-size-sm);
+}
+.msg-bubble .markdown-content th,
+.msg-bubble .markdown-content td {
+  border: 1px solid var(--border-secondary);
+  padding: 6px 12px;
+  text-align: left;
+}
+.msg-bubble .markdown-content th {
+  background: var(--bg-elevated);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.msg-bubble .markdown-content tr:nth-child(even) {
+  background: rgba(255,255,255,0.02);
 }
 
 /* Context stats footer */
@@ -378,11 +423,38 @@
   border-top: 1px solid var(--border-secondary);
 }
 
-/* Console output */
-.console-output {
-  background: #050505;
+/* Console output (collapsible) */
+.console-output-wrap {
+  margin: var(--space-xs) 0;
   border: 1px solid var(--border-secondary);
   border-radius: var(--radius-md);
+  background: #050505;
+}
+.console-output-toggle {
+  cursor: pointer;
+  padding: var(--space-xs) var(--space-md);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-tertiary);
+  user-select: none;
+  list-style: none;
+}
+.console-output-toggle::-webkit-details-marker { display: none; }
+.console-output-toggle::before {
+  content: '\25b6';
+  display: inline-block;
+  margin-right: var(--space-xs);
+  font-size: 0.7em;
+  transition: transform 0.15s;
+}
+.console-output-wrap[open] > .console-output-toggle::before {
+  transform: rotate(90deg);
+}
+.console-output {
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--border-secondary);
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
   padding: var(--space-md);
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
@@ -391,7 +463,6 @@
   word-break: break-word;
   overflow-x: auto;
   line-height: 1.5;
-  margin: var(--space-xs) 0;
   max-height: 300px;
   overflow-y: auto;
 }

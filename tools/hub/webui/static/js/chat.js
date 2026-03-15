@@ -302,6 +302,7 @@ const Chat = {
     let currentCodeBlock = null;
     let currentOutput = null;
     let textBuffer = '';
+    let fullTextBuffer = '';  // accumulates across multiple text_start/text_end pairs
 
     try {
       const res = await fetch('/api/chat', {
@@ -333,12 +334,25 @@ const Chat = {
 
           switch (event.type) {
             case 'text_start':
-              currentBubble = this.addBubbleToMsg(msgDiv);
-              textBuffer = '';
+              // Reuse existing bubble if last child is a text bubble (merges fragmented text blocks)
+              if (!currentBubble) {
+                const body = msgDiv.querySelector('.msg-body');
+                const last = body.lastElementChild;
+                if (last && last.classList.contains('msg-bubble') && last.classList.contains('markdown-content')) {
+                  currentBubble = last;
+                  // Continue from previous text
+                  textBuffer = fullTextBuffer;
+                } else {
+                  currentBubble = this.addBubbleToMsg(msgDiv);
+                  textBuffer = '';
+                  fullTextBuffer = '';
+                }
+              }
               break;
 
             case 'text':
               textBuffer += event.content;
+              fullTextBuffer = textBuffer;
               this.renderMarkdown(currentBubble, textBuffer);
               this.scrollToBottom();
               break;
@@ -346,12 +360,21 @@ const Chat = {
             case 'text_end':
               if (currentBubble && textBuffer) {
                 this.renderMarkdown(currentBubble, textBuffer);
+                // DEBUG: log final text_end render
+                if (currentBubble._lastDebug) {
+                  const d = currentBubble._lastDebug;
+                  console.log('[MD-FINAL] input (first 500):', JSON.stringify(d.text.slice(0, 500)));
+                  console.log('[MD-FINAL] html (first 500):', d.html.slice(0, 500));
+                  console.log('[MD-FINAL] <p> count:', currentBubble.querySelectorAll('p').length);
+                }
               }
+              fullTextBuffer = textBuffer;
               currentBubble = null;
               textBuffer = '';
               break;
 
             case 'code_start':
+              fullTextBuffer = '';  // break text merge across code blocks
               currentCodeBlock = this.addCodeBlockToMsg(msgDiv, event.language || 'bash');
               break;
 
@@ -375,12 +398,14 @@ const Chat = {
               break;
 
             case 'confirmation':
+              fullTextBuffer = '';  // break text merge across confirmations
               currentCodeBlock = this.addCodeBlockWithApproval(msgDiv, event.language || 'bash', event.code || '');
               this.pendingApproval = true;
               this.scrollToBottom();
               break;
 
             case 'output_start':
+              fullTextBuffer = '';  // break text merge across output blocks
               currentOutput = this.addOutputToMsg(msgDiv);
               break;
 
@@ -395,6 +420,17 @@ const Chat = {
             case 'output_end':
               if (currentOutput && currentOutput._rawBuffer) {
                 currentOutput.innerHTML = this.ansiToHtml(currentOutput._rawBuffer);
+                // Auto-expand short output (≤5 lines), keep long output collapsed
+                const lines = currentOutput._rawBuffer.split('\n').length;
+                const wrap = currentOutput.closest('.console-output-wrap');
+                if (wrap) {
+                  if (lines <= 5) {
+                    wrap.open = true;
+                  }
+                  // Update summary with line count
+                  const summary = wrap.querySelector('.console-output-toggle');
+                  if (summary) summary.textContent = `Output (${lines} line${lines !== 1 ? 's' : ''})`;
+                }
               }
               currentOutput = null;
               break;
@@ -515,10 +551,14 @@ const Chat = {
   },
 
   addOutputToMsg(msgDiv) {
+    const details = document.createElement('details');
+    details.className = 'console-output-wrap';
+    details.innerHTML = `<summary class="console-output-toggle">Output</summary>`;
     const output = document.createElement('div');
     output.className = 'console-output';
     output._rawBuffer = '';
-    msgDiv.querySelector('.msg-body').appendChild(output);
+    details.appendChild(output);
+    msgDiv.querySelector('.msg-body').appendChild(details);
     return output;
   },
 
@@ -652,26 +692,54 @@ const Chat = {
     this.messagesEl.classList.remove('hidden');
 
     let currentAssistantDiv = null;
+    let mergedText = '';
+    let currentBubble = null;
+
+    const flushText = () => {
+      if (currentBubble && mergedText) {
+        this.renderMarkdown(currentBubble, mergedText);
+      }
+    };
+
     for (const msg of messages) {
       if (msg.role === 'user' && msg.type === 'message') {
+        flushText();
+        mergedText = '';
+        currentBubble = null;
         this.addMessage('user', msg.content);
         currentAssistantDiv = null;
       } else if (msg.role === 'assistant' && msg.type === 'message') {
-        currentAssistantDiv = this.createAssistantMessage();
-        const bubble = this.addBubbleToMsg(currentAssistantDiv);
-        this.renderMarkdown(bubble, msg.content);
+        if (!currentAssistantDiv) currentAssistantDiv = this.createAssistantMessage();
+        // Merge consecutive text messages into one bubble
+        if (!currentBubble) {
+          currentBubble = this.addBubbleToMsg(currentAssistantDiv);
+          mergedText = msg.content;
+        } else {
+          mergedText += '\n\n' + msg.content;
+        }
+        this.renderMarkdown(currentBubble, mergedText);
       } else if (msg.role === 'assistant' && msg.type === 'code') {
+        flushText();
+        mergedText = '';
+        currentBubble = null;
         if (!currentAssistantDiv) currentAssistantDiv = this.createAssistantMessage();
         const block = this.addCodeBlockToMsg(currentAssistantDiv, msg.format || 'bash');
         const body = block.querySelector('.code-block-body');
         body.textContent = msg.content;
         if (window.hljs) body.innerHTML = hljs.highlightAuto(msg.content).value;
       } else if (msg.role === 'computer' && msg.type === 'console') {
+        flushText();
+        mergedText = '';
+        currentBubble = null;
         if (!currentAssistantDiv) currentAssistantDiv = this.createAssistantMessage();
         const output = this.addOutputToMsg(currentAssistantDiv);
         output.innerHTML = this.ansiToHtml(msg.content || '');
+        // Show short output expanded, collapse long output
+        const lineCount = (msg.content || '').split('\n').length;
+        if (lineCount <= 5) output.closest('.console-output-wrap').open = true;
       }
     }
+    flushText();
     this.scrollToBottom();
   },
 
@@ -686,7 +754,10 @@ const Chat = {
 
   renderMarkdown(el, text) {
     if (window.marked) {
-      el.innerHTML = marked.parse(text, { breaks: true });
+      const html = marked.parse(text, { breaks: true, gfm: true });
+      el.innerHTML = html;
+      // DEBUG: log final render (store on element, print on text_end)
+      el._lastDebug = { text, html };
       // Highlight code blocks
       if (window.hljs) {
         el.querySelectorAll('pre code').forEach(block => {

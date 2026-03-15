@@ -114,7 +114,7 @@ class OIBridge:
         interpreter.llm.api_key = "unused"
         interpreter.llm.context_window = self._saved_cfg.get(
             "context_window", int(os.environ.get("OI_CTX", _CONTEXT_WINDOW)))
-        interpreter.llm.max_tokens = self._saved_cfg.get("max_tokens", 1200)
+        interpreter.llm.max_tokens = self._saved_cfg.get("max_tokens", 3000)
         interpreter.llm.supports_functions = False
         interpreter.llm.supports_vision = True
         interpreter.disable_telemetry = True
@@ -150,7 +150,7 @@ Find files: find ~ -maxdepth 4 -iname "*keyword*" 2>/dev/null
 Search in files: grep -rn "pattern" /path --include="*.py"
 Edit files with cat + careful manual edits. Ask before destructive operations.
 Filesystem first. ~/search only for internet.
-Answers: 2-4 sentences. No output repetition. Never sudo."""
+Give thorough, well-structured answers using markdown (headings, lists, code blocks). Be concise but complete — don't artificially shorten responses. Never sudo."""
 
         # Load Mini-RAG if available
         self._rag = None
