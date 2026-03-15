@@ -952,6 +952,36 @@ def resolve_project(query):
             closest_dist = d
             closest = k
 
+    # On nodes, sync projects.json from hub and retry once
+    if is_node() and HUB_HOST:
+        print(f"{CYAN}Project not found locally — syncing from hub...{RESET}")
+        try:
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'BatchMode=yes',
+                 HUB_HOST, 'cat ~/.config/hub/projects.json'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                hub_data = json.loads(result.stdout)
+                PROJECTS_JSON.parent.mkdir(parents=True, exist_ok=True)
+                with open(PROJECTS_JSON, 'w') as f:
+                    json.dump(hub_data, f, indent=2)
+                    f.write('\n')
+                reload_projects()
+                # Retry lookup
+                if q in PROJECTS:
+                    print(f"{GREEN}Synced — found '{q}'{RESET}")
+                    return q
+                for k, p in PROJECTS.items():
+                    basename = p['path'].rsplit('/', 1)[-1].lower()
+                    if q in k or q in p['name'].lower() or q in basename:
+                        matches.append(k)
+                if len(matches) == 1:
+                    print(f"{GREEN}Synced — found '{matches[0]}'{RESET}")
+                    return matches[0]
+        except Exception:
+            pass
+
     if closest and closest_dist <= 3:
         print(f"{RED}Unknown project '{query}'.{RESET} Did you mean {WHITE}{closest}{RESET}?")
     else:
