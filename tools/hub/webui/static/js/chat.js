@@ -360,13 +360,6 @@ const Chat = {
             case 'text_end':
               if (currentBubble && textBuffer) {
                 this.renderMarkdown(currentBubble, textBuffer);
-                // DEBUG: log final text_end render
-                if (currentBubble._lastDebug) {
-                  const d = currentBubble._lastDebug;
-                  console.log('[MD-FINAL] input (first 500):', JSON.stringify(d.text.slice(0, 500)));
-                  console.log('[MD-FINAL] html (first 500):', d.html.slice(0, 500));
-                  console.log('[MD-FINAL] <p> count:', currentBubble.querySelectorAll('p').length);
-                }
               }
               fullTextBuffer = textBuffer;
               currentBubble = null;
@@ -754,10 +747,7 @@ const Chat = {
 
   renderMarkdown(el, text) {
     if (window.marked) {
-      const html = marked.parse(text, { breaks: true, gfm: true });
-      el.innerHTML = html;
-      // DEBUG: log final render (store on element, print on text_end)
-      el._lastDebug = { text, html };
+      el.innerHTML = marked.parse(text, { breaks: true, gfm: true });
       // Highlight code blocks
       if (window.hljs) {
         el.querySelectorAll('pre code').forEach(block => {
