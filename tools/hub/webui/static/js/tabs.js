@@ -15,6 +15,7 @@ const Tabs = {
     const loaders = {
       status: () => this.loadStatus(),
       projects: () => this.loadProjects(),
+      apps: () => this.loadApps(),
       repo: () => this.loadRepo(),
       research: () => this.loadResearch(),
       notify: () => this.loadNotifications(),
@@ -275,6 +276,157 @@ const Tabs = {
   getCurrentProject() {
     // From env vars set by switch
     return window._currentProject || '';
+  },
+
+  // ── Apps ──────────────────────────────────────────────────────────────────
+
+  async loadApps() {
+    const container = document.getElementById('apps-content');
+    container.innerHTML = '<div class="tab-loading"><div class="spinner"></div>Loading apps...</div>';
+    try {
+      const res = await fetch('/api/apps');
+      const data = await res.json();
+      const apps = data.apps || [];
+      const tunnels = data.tunnels || [];
+
+      if (!apps.length) {
+        container.innerHTML = '<div class="text-muted" style="padding:var(--space-md);">No apps found. Configure services in projects.json.</div>';
+        return;
+      }
+
+      // Group by project
+      const byProject = {};
+      const projectOrder = [];
+      for (const app of apps) {
+        if (!byProject[app.project_key]) {
+          byProject[app.project_key] = { name: app.project_name, host: app.host, host_name: app.host_name, apps: [] };
+          projectOrder.push(app.project_key);
+        }
+        byProject[app.project_key].apps.push(app);
+      }
+
+      // Tunnel summary
+      let tunnelHtml = '';
+      if (tunnels.length) {
+        tunnelHtml = `<div style="margin-bottom:var(--space-md);padding:var(--space-sm);border:1px solid var(--border-secondary);border-radius:var(--radius-md);background:var(--bg-secondary);">
+          <div class="text-xs text-muted" style="margin-bottom:var(--space-xs);">Active Tunnels (${tunnels.length})</div>
+          ${tunnels.map(t => `<div class="text-xs" style="color:var(--status-info);">localhost:${t.local_port} &rarr; ${t.host}:${t.remote_port} <span class="text-muted">${this.escapeHtml(t.label)}</span></div>`).join('')}
+        </div>`;
+      }
+
+      let html = tunnelHtml;
+
+      for (const pk of projectOrder) {
+        const group = byProject[pk];
+        html += `<div class="project-card" style="margin-bottom:var(--space-sm);">
+          <div style="margin-bottom:var(--space-sm);display:flex;align-items:center;gap:var(--space-sm);">
+            <span class="project-name">${this.escapeHtml(group.name)}</span>
+            <span class="text-xs text-muted">${this.escapeHtml(group.host_name)}</span>
+          </div>`;
+
+        for (const app of group.apps) {
+          const statusColor = app.status === 'running' ? 'var(--status-success)' : app.status === 'offline' ? 'var(--status-error)' : 'var(--text-muted)';
+          const statusDot = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor};"></span>`;
+          const portStr = app.port ? `:${app.port}` : '';
+          const tunnelBadge = app.tunnel ? `<span class="badge badge-info" style="font-size:0.65rem;">&rarr; :${app.tunnel.local_port}</span>` : '';
+
+          let actions = '';
+          if (app.port) {
+            if (app.tunnel) {
+              actions += `<button class="btn btn-sm" onclick="Tabs.appOpen(${app.tunnel.local_port})">Open</button>`;
+              actions += `<button class="btn btn-sm" onclick="Tabs.appTunnel('${this.escapeHtml(app.host)}', ${app.port}, 'stop')">Untunnel</button>`;
+            } else {
+              actions += `<button class="btn btn-sm" onclick="Tabs.appTunnel('${this.escapeHtml(app.host)}', ${app.port}, 'start', '${this.escapeHtml(pk + '/' + app.app_name)}')">Tunnel</button>`;
+            }
+            if (app.status === 'running') {
+              actions += `<button class="btn btn-sm btn-danger" onclick="Tabs.appServiceAction('${this.escapeHtml(pk)}', ${app.port}, 'stop')">Stop</button>`;
+            } else if (app.status !== 'offline') {
+              actions += `<button class="btn btn-sm" onclick="Tabs.appServiceAction('${this.escapeHtml(pk)}', ${app.port}, 'start')">Start</button>`;
+            }
+          }
+
+          html += `
+            <div class="dev-svc-row" style="padding:var(--space-xs) 0;border-bottom:1px solid var(--border-primary);">
+              <span style="display:flex;align-items:center;gap:var(--space-xs);">
+                ${statusDot}
+                <span class="dev-svc-name">${this.escapeHtml(app.app_name)}</span>
+                <span class="text-xs text-muted">${portStr}</span>
+                ${tunnelBadge}
+              </span>
+              <span style="display:flex;gap:var(--space-xs);align-items:center;">
+                ${actions}
+              </span>
+            </div>`;
+        }
+
+        html += '</div>';
+      }
+
+      container.innerHTML = html;
+    } catch (e) {
+      container.innerHTML = `<div class="text-muted">Failed to load apps: ${e.message}</div>`;
+    }
+  },
+
+  appOpen(port) {
+    window.open(`http://localhost:${port}`, '_blank');
+  },
+
+  async appTunnel(host, port, action, label) {
+    try {
+      const res = await fetch('/api/apps/tunnel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host, port, action, label: label || '' }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        App.toast(data.message, 'success');
+        if (action === 'start' && data.local_port) {
+          App.toast(`Open: http://localhost:${data.local_port}`, 'info');
+        }
+      } else {
+        App.toast(data.message || 'Tunnel failed', 'error');
+      }
+      this.loaded.apps = false;
+      this.loadApps();
+    } catch (e) {
+      App.toast('Tunnel failed: ' + e.message, 'error');
+    }
+  },
+
+  async appServiceAction(project, port, action) {
+    try {
+      const res = await fetch('/api/apps/service', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project, port, action }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        App.toast(data.message, 'success');
+      } else {
+        App.toast(data.message || `${action} failed`, 'error');
+      }
+      setTimeout(() => { this.loaded.apps = false; this.loadApps(); }, 2000);
+    } catch (e) {
+      App.toast(`${action} failed: ` + e.message, 'error');
+    }
+  },
+
+  async cleanupTunnels() {
+    if (!confirm('Kill all active SSH tunnels?')) return;
+    try {
+      const res = await fetch('/api/apps/tunnel/cleanup', { method: 'POST' });
+      const data = await res.json();
+      if (data.ok) {
+        App.toast(`Stopped ${data.stopped} tunnel(s)`, 'success');
+      }
+      this.loaded.apps = false;
+      this.loadApps();
+    } catch (e) {
+      App.toast('Cleanup failed: ' + e.message, 'error');
+    }
   },
 
   // ── Repo ──────────────────────────────────────────────────────────────────

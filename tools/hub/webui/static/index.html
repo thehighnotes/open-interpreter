@@ -41,6 +41,10 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
           <span class="tab-label">Projects</span>
         </button>
+        <button class="sidebar-tab" data-tab="apps">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          <span class="tab-label">Apps</span>
+        </button>
         <button class="sidebar-tab" data-tab="repo">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
           <span class="tab-label">Repo</span>
@@ -142,6 +146,22 @@
         </div>
       </div>
 
+      <!-- Apps tab -->
+      <div class="tab-content" id="tab-apps">
+        <div class="data-tab">
+          <div class="data-tab-header">
+            <div class="data-tab-title">Apps</div>
+            <div style="display:flex;gap:var(--space-xs);">
+              <button class="btn btn-sm" onclick="Tabs.cleanupTunnels()" title="Kill all tunnels">Cleanup Tunnels</button>
+              <button class="btn btn-sm btn-icon" onclick="Tabs.loaded.apps=false; Tabs.loadApps();" title="Refresh">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="apps-content"></div>
+        </div>
+      </div>
+
       <!-- Repo tab -->
       <div class="tab-content" id="tab-repo">
         <div class="data-tab">
@@ -213,6 +233,10 @@
       <button class="mobile-tab" data-tab="projects">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
         Projects
+      </button>
+      <button class="mobile-tab" data-tab="apps">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        Apps
       </button>
       <button class="mobile-tab" data-tab="repo">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>

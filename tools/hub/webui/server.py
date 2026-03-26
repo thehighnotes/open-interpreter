@@ -918,6 +918,145 @@ async def ca_reindex(request):
         return JSONResponse({"ok": False, "error": str(e)})
 
 
+# ── Apps API ──────────────────────────────────────────────────────────────
+
+async def get_apps(request):
+    """Return app list with status and tunnel info."""
+    if not hub_common:
+        return JSONResponse({"apps": [], "tunnels": []})
+
+    app_list = hub_common.get_app_list()
+
+    # Probe hosts + ports in parallel
+    hosts_needed = set(a['host'] for a in app_list)
+    host_reachable = {}
+    for h in hosts_needed:
+        alias = hub_common.HOSTS.get(h, {}).get('alias', h)
+        host_reachable[h] = hub_common.check_host_reachable(alias) if h != hub_common.LOCAL_HOST else True
+
+    probe_tasks = {}
+    for app in app_list:
+        if host_reachable.get(app['host']) and app.get('port'):
+            alias = hub_common.HOSTS.get(app['host'], {}).get('alias', app['host'])
+            key = f"{app['host']}:{app['port']}"
+            if key not in probe_tasks:
+                probe_tasks[key] = lambda a=alias, p=app['port']: hub_common.probe_service(a, p, timeout=3)
+
+    probe_results = hub_common.run_parallel(probe_tasks) if probe_tasks else {}
+
+    tunnels = hub_common.list_tunnels()
+    tunnel_map = {(t['host'], t['remote_port']): t for t in tunnels}
+
+    result = []
+    for app in app_list:
+        host = app['host']
+        port = app.get('port')
+        probe_key = f"{host}:{port}" if port else None
+        reachable = host_reachable.get(host, False)
+
+        if not reachable:
+            status = 'offline'
+        elif probe_key and probe_key in probe_results:
+            status = 'running' if probe_results[probe_key] else 'stopped'
+        else:
+            status = 'unknown'
+
+        tun = tunnel_map.get((host, port))
+        host_name = hub_common.HOSTS.get(host, {}).get('name', host)
+
+        result.append({
+            'project_key': app['project_key'],
+            'project_name': app['project_name'],
+            'host': host,
+            'host_name': host_name,
+            'app_name': app['app_name'],
+            'type': app['type'],
+            'port': port,
+            'status': status,
+            'source': app['source'],
+            'tunnel': {'local_port': tun['local_port']} if tun else None,
+        })
+
+    return JSONResponse({
+        "apps": result,
+        "tunnels": [{"host": t['host'], "remote_port": t['remote_port'],
+                      "local_port": t['local_port'], "label": t.get('label', '')}
+                     for t in tunnels],
+    })
+
+
+async def app_tunnel(request):
+    """Create or remove a tunnel. Body: { host, port, action: "start"|"stop", label }"""
+    if not hub_common:
+        return JSONResponse({"ok": False, "message": "hub_common not available"}, status_code=500)
+    body = await _json_body(request)
+    host = body.get("host", "").strip()
+    port = body.get("port")
+    action = body.get("action", "start").strip()
+    label = body.get("label", "")
+
+    if not host or not port:
+        return JSONResponse({"ok": False, "message": "host and port required"}, status_code=400)
+
+    alias = hub_common.HOSTS.get(host, {}).get('alias', host)
+
+    if action == "stop":
+        ok, msg = hub_common.stop_tunnel(alias, int(port))
+        return JSONResponse({"ok": ok, "message": msg})
+    else:
+        ok, local_port, msg = hub_common.start_tunnel(alias, int(port), label=label)
+        return JSONResponse({"ok": ok, "local_port": local_port, "message": msg})
+
+
+async def app_tunnel_cleanup(request):
+    """Kill all active tunnels."""
+    if not hub_common:
+        return JSONResponse({"ok": False}, status_code=500)
+    count = hub_common.cleanup_tunnels()
+    return JSONResponse({"ok": True, "stopped": count})
+
+
+async def app_service_action(request):
+    """Start or stop a backing service. Body: { project, port, action: "start"|"stop" }"""
+    if not hub_common:
+        return JSONResponse({"ok": False, "message": "hub_common not available"}, status_code=500)
+    body = await _json_body(request)
+    project_key = body.get("project", "").strip()
+    port = body.get("port")
+    action = body.get("action", "start").strip()
+
+    projects, _, _ = hub_common.load_projects()
+    proj = projects.get(project_key)
+    if not proj:
+        return JSONResponse({"ok": False, "message": f"Project not found: {project_key}"}, status_code=404)
+
+    host = proj['host']
+    alias = hub_common.HOSTS.get(host, {}).get('alias', host)
+
+    # Find matching service or dev_service
+    svc = next((s for s in proj.get('services', []) if s.get('port') == port), None)
+    dev_svc = next((d for d in proj.get('dev_services', []) if d.get('port') == port), None)
+
+    if action == "start":
+        if dev_svc:
+            hub_common.start_dev_service(alias, proj['path'], dev_svc)
+        elif svc:
+            hub_common.start_service(alias, proj['path'], svc)
+        else:
+            return JSONResponse({"ok": False, "message": "Service not found"}, status_code=404)
+        return JSONResponse({"ok": True, "message": f"Start command sent"})
+    elif action == "stop":
+        if dev_svc:
+            hub_common.stop_dev_service(alias, dev_svc)
+        elif svc:
+            hub_common.stop_service(alias, svc)
+        else:
+            return JSONResponse({"ok": False, "message": "Service not found"}, status_code=404)
+        return JSONResponse({"ok": True, "message": f"Stop command sent"})
+
+    return JSONResponse({"ok": False, "message": f"Invalid action: {action}"}, status_code=400)
+
+
 # ── Research fetch ────────────────────────────────────────────────────────
 
 async def research_fetch(request):
@@ -928,7 +1067,7 @@ async def research_fetch(request):
 
 # ── App assembly ─────────────────────────────────────────────────────────────
 
-_TAB_ROUTES = ["chat", "status", "projects", "repo", "research", "notify", "help", "settings"]
+_TAB_ROUTES = ["chat", "status", "projects", "apps", "repo", "research", "notify", "help", "settings"]
 
 routes = [
     Route("/", index),
@@ -980,6 +1119,11 @@ routes = [
     Route("/api/projects/delete", delete_project, methods=["POST"]),
     # Research fetch
     Route("/api/research/fetch", research_fetch, methods=["POST"]),
+    # Apps
+    Route("/api/apps", get_apps),
+    Route("/api/apps/tunnel", app_tunnel, methods=["POST"]),
+    Route("/api/apps/tunnel/cleanup", app_tunnel_cleanup, methods=["POST"]),
+    Route("/api/apps/service", app_service_action, methods=["POST"]),
     Route("/api/image", upload_image, methods=["POST"]),
     Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),
 ]

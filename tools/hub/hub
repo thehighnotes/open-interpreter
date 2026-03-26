@@ -9,6 +9,7 @@ Usage:
     hub --explain        Same as above
     hub --status         Compact dashboard (fast, no LLM)
     hub --next           Prioritized action list — what needs attention
+    hub --apps           Launch, tunnel, and test project apps
     hub --dev            Show/toggle npm dev services
     hub --vllm           Manage vLLM server (status/start/stop/restart)
     hub --manage         Edit, delete, or reorder project entries
@@ -2303,6 +2304,402 @@ def manage_projects():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# --apps: App launcher with tunnel management
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_apps(args=None):
+    """Launch, tunnel, and access project apps from the hub.
+
+    hub --apps                   Interactive TUI launcher
+    hub --apps list              List all apps with status
+    hub --apps tunnels           Show active tunnels
+    hub --apps open <project>    Tunnel + open app in browser
+    hub --apps cleanup           Kill all tunnels
+    """
+    action = args[0].lower() if args else None
+
+    if action == 'cleanup':
+        count = cleanup_tunnels()
+        if count:
+            print(f"\n  {GREEN}✓{RESET} Stopped {count} tunnel(s)\n")
+        else:
+            print(f"\n  {GRAY}No active tunnels{RESET}\n")
+        return
+
+    if action == 'tunnels':
+        _apps_show_tunnels()
+        return
+
+    if action == 'list':
+        _apps_list()
+        return
+
+    if action == 'open':
+        if len(args) < 2:
+            print(f"\n  Usage: hub --apps open <project> [app-name]\n")
+            return
+        _apps_open(args[1], args[2] if len(args) > 2 else None)
+        return
+
+    # Default: interactive TUI
+    _apps_interactive()
+
+
+def _apps_show_tunnels():
+    """Show active SSH tunnels."""
+    tunnels = list_tunnels()
+    print()
+    if not tunnels:
+        print(f"  {GRAY}No active tunnels{RESET}")
+        print(f"  {DIM}Use {WHITE}hub --apps{RESET}{DIM} to launch apps and create tunnels{RESET}")
+        print()
+        return
+
+    print(f"  {WHITE}ACTIVE TUNNELS{RESET}")
+    thin_divider()
+    for t in tunnels:
+        host_name = HOSTS.get(t['host'], {}).get('name', t['host'])
+        label = f"  {GRAY}{t['label']}{RESET}" if t.get('label') else ''
+        print(f"    {GREEN}●{RESET} localhost:{t['local_port']} → {CYAN}{host_name}{RESET}:{t['remote_port']}{label}")
+    print(f"\n  {DIM}Cleanup: {WHITE}hub --apps cleanup{RESET}\n")
+
+
+def _apps_list():
+    """List all apps with live status probing."""
+    app_list = get_app_list()
+    if not app_list:
+        print(f"\n  {GRAY}No apps found — configure services/dev_services in projects.json{RESET}\n")
+        return
+
+    # Group by project
+    by_project = {}
+    for app in app_list:
+        pk = app['project_key']
+        if pk not in by_project:
+            by_project[pk] = []
+        by_project[pk].append(app)
+
+    # Check host reachability + probe ports in parallel
+    hosts_needed = set(a['host'] for a in app_list)
+    host_reachable = {}
+    for h in hosts_needed:
+        alias = HOSTS.get(h, {}).get('alias', h)
+        host_reachable[h] = check_host_reachable(alias) if h != LOCAL_HOST else True
+
+    probe_tasks = {}
+    for app in app_list:
+        if host_reachable.get(app['host']) and app.get('port'):
+            alias = HOSTS.get(app['host'], {}).get('alias', app['host'])
+            key = f"{app['host']}:{app['port']}"
+            if key not in probe_tasks:
+                probe_tasks[key] = lambda a=alias, p=app['port']: probe_service(a, p, timeout=3)
+
+    with Spinner("Probing apps..."):
+        probe_results = run_parallel(probe_tasks) if probe_tasks else {}
+
+    # Get active tunnels
+    tunnels = list_tunnels()
+    tunnel_map = {(t['host'], t['remote_port']): t for t in tunnels}
+
+    print()
+    print(f"  {WHITE}APPS{RESET}")
+    header_bar()
+
+    for pk in PROJECT_ORDER:
+        if pk not in by_project:
+            continue
+        apps = by_project[pk]
+        proj = PROJECTS[pk]
+        host = proj['host']
+        host_name = HOSTS.get(host, {}).get('name', host)
+        reachable = host_reachable.get(host, False)
+        host_dot = f"{GREEN}●{RESET}" if reachable else f"{RED}●{RESET}"
+
+        print(f"\n  {host_dot} {WHITE}{pk}{RESET}  {GRAY}{host_name}{RESET}")
+        thin_divider()
+
+        for app in apps:
+            port = app.get('port')
+            probe_key = f"{host}:{port}" if port else None
+
+            # Status
+            if not reachable:
+                dot = f"{RED}●{RESET}"
+                status = f"{RED}offline{RESET}"
+            elif probe_key and probe_key in probe_results:
+                up = probe_results[probe_key]
+                dot = f"{GREEN}●{RESET}" if up else f"{GRAY}○{RESET}"
+                status = f"{GREEN}running{RESET}" if up else f"{GRAY}stopped{RESET}"
+            else:
+                dot = f"{GRAY}○{RESET}"
+                status = f"{GRAY}unknown{RESET}"
+
+            # Tunnel indicator
+            tunnel_info = ''
+            tun = tunnel_map.get((host, port))
+            if tun:
+                tunnel_info = f"  {CYAN}→ localhost:{tun['local_port']}{RESET}"
+
+            port_str = f":{port}" if port else ''
+            print(f"    {dot} {app['app_name']:<22} {port_str:<7} {status}{tunnel_info}")
+
+    print()
+    header_bar()
+    print()
+
+
+def _apps_open(project_query, app_name=None):
+    """Tunnel to a project's app and open in browser."""
+    pk = resolve_project(project_query)
+    if not pk:
+        print(f"\n  {RED}Unknown project: {project_query}{RESET}\n")
+        return
+
+    app_list = get_app_list()
+    project_apps = [a for a in app_list if a['project_key'] == pk]
+    if not project_apps:
+        print(f"\n  {GRAY}No apps for {pk}{RESET}\n")
+        return
+
+    # Filter by name if given
+    if app_name:
+        project_apps = [a for a in project_apps if app_name.lower() in a['app_name'].lower()]
+        if not project_apps:
+            print(f"\n  {RED}No app matching '{app_name}' in {pk}{RESET}\n")
+            return
+
+    for app in project_apps:
+        host = app['host']
+        port = app.get('port')
+        if not port:
+            continue
+
+        if host == LOCAL_HOST:
+            # Local app — just open
+            url = f"http://localhost:{port}"
+        else:
+            # Remote — tunnel first
+            alias = HOSTS.get(host, {}).get('alias', host)
+            ok, local_port, msg = start_tunnel(alias, port, label=f"{pk}/{app['app_name']}")
+            if not ok:
+                print(f"  {RED}✗{RESET} {msg}")
+                continue
+            print(f"  {GREEN}✓{RESET} {msg}")
+            url = f"http://localhost:{local_port}"
+
+        print(f"  {CYAN}→{RESET} {url}")
+
+        # Try to open in browser
+        try:
+            subprocess.Popen(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            pass
+    print()
+
+
+def _apps_interactive():
+    """Interactive TUI for browsing and launching apps."""
+    app_list = get_app_list()
+    if not app_list:
+        print(f"\n  {GRAY}No apps found — add services to projects.json{RESET}\n")
+        return
+
+    # Group by project, build flat menu items
+    menu_items = []
+    current_pk = None
+    for app in app_list:
+        pk = app['project_key']
+        if pk != current_pk:
+            current_pk = pk
+            menu_items.append(('header', app))
+        menu_items.append(('app', app))
+
+    # Probe status for all apps
+    hosts_needed = set(a['host'] for a in app_list)
+    host_reachable = {}
+    for h in hosts_needed:
+        alias = HOSTS.get(h, {}).get('alias', h)
+        host_reachable[h] = check_host_reachable(alias) if h != LOCAL_HOST else True
+
+    probe_tasks = {}
+    for app in app_list:
+        if host_reachable.get(app['host']) and app.get('port'):
+            alias = HOSTS.get(app['host'], {}).get('alias', app['host'])
+            key = f"{app['host']}:{app['port']}"
+            if key not in probe_tasks:
+                probe_tasks[key] = lambda a=alias, p=app['port']: probe_service(a, p, timeout=3)
+
+    with Spinner("Probing apps..."):
+        probe_results = run_parallel(probe_tasks) if probe_tasks else {}
+
+    tunnels = list_tunnels()
+    tunnel_map = {(t['host'], t['remote_port']): t for t in tunnels}
+
+    def _render(item, idx, highlighted):
+        kind, app = item
+        if kind == 'header':
+            host = app['host']
+            host_name = HOSTS.get(host, {}).get('name', host)
+            reachable = host_reachable.get(host, False)
+            host_dot = f"{GREEN}●{RESET}" if reachable else f"{RED}●{RESET}"
+            return f"  {host_dot} {WHITE}{app['project_key']}{RESET}  {GRAY}{host_name}{RESET}"
+
+        host = app['host']
+        port = app.get('port')
+        probe_key = f"{host}:{port}" if port else None
+        reachable = host_reachable.get(host, False)
+
+        # Status dot
+        if not reachable:
+            dot = f"{RED}●{RESET}"
+        elif probe_key and probe_key in probe_results:
+            up = probe_results[probe_key]
+            dot = f"{GREEN}●{RESET}" if up else f"{GRAY}○{RESET}"
+        else:
+            dot = f"{GRAY}○{RESET}"
+
+        # Tunnel indicator
+        tun = tunnel_map.get((host, port))
+        tun_str = f" {CYAN}⇄{tun['local_port']}{RESET}" if tun else ''
+
+        port_str = f":{port}" if port else ''
+        name = f"{app['app_name']}"
+        line = f"{name:<22} {port_str:<6}{tun_str}"
+
+        if highlighted:
+            return f"    {dot} {HIGHLIGHT_BG}{line:<40}{HIGHLIGHT_OFF}"
+        return f"    {dot} {line}"
+
+    # Actions
+    actions = {
+        'o': ('open', 'tunnel + open in browser'),
+        't': ('tunnel', 'create/remove tunnel'),
+        's': ('start', 'start service'),
+        'x': ('stop', 'stop service'),
+    }
+
+    print()
+    title = f"  {WHITE}APPS{RESET}  {GRAY}— enter/o=open  t=tunnel  s=start  x=stop  q=quit{RESET}"
+    footer = f"  {DIM}Active tunnels: {len(tunnels)}{RESET}"
+
+    while True:
+        action, idx = interactive_select(
+            menu_items, _render, title=title, actions=actions, footer=footer,
+        )
+
+        if action is None:
+            break
+
+        if idx is None or idx >= len(menu_items):
+            continue
+
+        kind, app = menu_items[idx]
+        if kind == 'header':
+            continue
+
+        host = app['host']
+        port = app.get('port')
+        alias = HOSTS.get(host, {}).get('alias', host)
+
+        if action in (KEY_ENTER, 'o'):
+            if not port:
+                print(f"  {GRAY}No port — can't open{RESET}")
+                continue
+            if host == LOCAL_HOST:
+                url = f"http://localhost:{port}"
+            else:
+                ok, local_port, msg = start_tunnel(alias, port, label=f"{app['project_key']}/{app['app_name']}")
+                if not ok:
+                    print(f"  {RED}✗{RESET} {msg}")
+                    continue
+                print(f"  {GREEN}✓{RESET} {msg}")
+                url = f"http://localhost:{local_port}"
+                # Update tunnel state for display
+                tunnels = list_tunnels()
+                tunnel_map = {(t['host'], t['remote_port']): t for t in tunnels}
+                footer = f"  {DIM}Active tunnels: {len(tunnels)}{RESET}"
+
+            print(f"  {CYAN}→{RESET} {url}")
+            try:
+                subprocess.Popen(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                pass
+
+        elif action == 't':
+            if not port:
+                continue
+            tun = tunnel_map.get((host, port))
+            if tun:
+                # Remove tunnel
+                ok, msg = stop_tunnel(alias, port)
+                print(f"  {GREEN}✓{RESET} {msg}" if ok else f"  {RED}✗{RESET} {msg}")
+            else:
+                # Create tunnel
+                if host == LOCAL_HOST:
+                    print(f"  {GRAY}Local app — no tunnel needed{RESET}")
+                    continue
+                ok, local_port, msg = start_tunnel(alias, port, label=f"{app['project_key']}/{app['app_name']}")
+                print(f"  {GREEN}✓{RESET} {msg}" if ok else f"  {RED}✗{RESET} {msg}")
+
+            tunnels = list_tunnels()
+            tunnel_map = {(t['host'], t['remote_port']): t for t in tunnels}
+            footer = f"  {DIM}Active tunnels: {len(tunnels)}{RESET}"
+
+        elif action == 's':
+            if not port:
+                continue
+            # Start the backing service/dev_service
+            proj = PROJECTS.get(app['project_key'])
+            if not proj:
+                continue
+            if app['source'] == 'dev_service':
+                ds = next((d for d in proj.get('dev_services', []) if d['port'] == port), None)
+                if ds:
+                    print(f"  Starting {app['app_name']}...")
+                    start_dev_service(alias, proj['path'], ds)
+                    time.sleep(2)
+                    if probe_service(alias, port, timeout=3):
+                        probe_results[f"{host}:{port}"] = True
+                        print(f"  {GREEN}✓{RESET} Started")
+                    else:
+                        print(f"  {YELLOW}●{RESET} Starting up...")
+            else:
+                svc = next((s for s in proj.get('services', []) if s['port'] == port), None)
+                if svc:
+                    print(f"  Starting {app['app_name']}...")
+                    start_service(alias, proj['path'], svc)
+                    time.sleep(2)
+                    if probe_service(alias, port, timeout=3):
+                        probe_results[f"{host}:{port}"] = True
+                        print(f"  {GREEN}✓{RESET} Started")
+                    else:
+                        print(f"  {YELLOW}●{RESET} Starting up...")
+
+        elif action == 'x':
+            if not port:
+                continue
+            proj = PROJECTS.get(app['project_key'])
+            if not proj:
+                continue
+            if app['source'] == 'dev_service':
+                ds = next((d for d in proj.get('dev_services', []) if d['port'] == port), None)
+                if ds:
+                    print(f"  Stopping {app['app_name']}...")
+                    stop_dev_service(alias, ds)
+                    probe_results[f"{host}:{port}"] = False
+                    print(f"  {GREEN}✓{RESET} Stopped")
+            else:
+                svc = next((s for s in proj.get('services', []) if s['port'] == port), None)
+                if svc:
+                    print(f"  Stopping {app['app_name']}...")
+                    stop_service(alias, svc)
+                    probe_results[f"{host}:{port}"] = False
+                    print(f"  {GREEN}✓{RESET} Stopped")
+
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # --dev: Dev service management
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2549,6 +2946,7 @@ def print_usage():
   hub --status         Compact dashboard (fast)
   hub --next           Prioritized action list — what needs attention
   hub --services       Service status across all projects
+  hub --apps           Launch, tunnel, and test project apps from the hub
   hub --dev            Show/toggle npm dev services (enable/disable per project)
   hub --vllm           Manage vLLM server (status/start/stop/restart)
   hub --manage         Edit, delete, or reorder project entries
@@ -2587,6 +2985,10 @@ def main():
                 print(f"{RED}--scan requires a host argument ({host_list}){RESET}")
                 sys.exit(1)
             scan_projects(args[idx + 1])
+    elif '--apps' in args:
+        apps_idx = args.index('--apps')
+        apps_args = args[apps_idx + 1:]
+        render_apps(apps_args)
     elif '--dev' in args:
         dev_idx = args.index('--dev')
         dev_args = args[dev_idx + 1:]

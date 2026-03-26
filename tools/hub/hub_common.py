@@ -318,7 +318,7 @@ def load_projects():
 
 def save_projects(projects, order, ignored=None):
     """Write projects back to JSON (strips computed fields)."""
-    stored_fields = ('name', 'tagline', 'host', 'path', 'claude_md', 'services', 'dev_services', 'code_index', 'git_remote', 'git_branch', 'related_repos')
+    stored_fields = ('name', 'tagline', 'host', 'path', 'claude_md', 'services', 'dev_services', 'apps', 'code_index', 'git_remote', 'git_branch', 'related_repos')
     data = {'projects': {}, 'order': list(order)}
     for key, proj in projects.items():
         data['projects'][key] = {k: v for k, v in proj.items() if k in stored_fields}
@@ -382,6 +382,7 @@ DECISIONS_CACHE_DIR = Path.home() / '.cache' / 'decisions'
 DECISION_CATEGORIES = ('architecture', 'tooling', 'design', 'performance', 'abandoned')
 DEPLOY_CACHE_DIR = Path.home() / '.cache' / 'deploy'
 HEALTH_CACHE_DIR = Path.home() / '.cache' / 'health'
+TUNNEL_STATE_FILE = Path.home() / '.cache' / 'hub' / 'tunnels.json'
 OI_SESSION_DIR = Path.home() / '.cache' / 'oi-sessions'
 NOTIFY_LOG = Path.home() / '.cache' / 'hub' / 'notifications.jsonl'
 
@@ -2537,3 +2538,249 @@ def write_deploy_state(project_key, head, services_restarted=None):
         deploy_file.write_text(json.dumps(state, indent=2) + '\n')
     except OSError:
         pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSH tunnel management
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_tunnel_state():
+    """Load active tunnel state from disk. Returns list of tunnel dicts."""
+    if not TUNNEL_STATE_FILE.exists():
+        return []
+    try:
+        return json.loads(TUNNEL_STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_tunnel_state(tunnels):
+    """Write tunnel state to disk."""
+    ensure_dir(TUNNEL_STATE_FILE.parent)
+    try:
+        TUNNEL_STATE_FILE.write_text(json.dumps(tunnels, indent=2) + '\n')
+    except OSError:
+        pass
+
+
+def _is_pid_alive(pid):
+    """Check if a process is still running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def start_tunnel(host_alias, remote_port, local_port=None, label=''):
+    """Start an SSH tunnel: local_port → host:remote_port.
+
+    Args:
+        host_alias: SSH alias (e.g. 'ws', 'agx')
+        remote_port: port on the remote host
+        local_port: local port to bind (defaults to remote_port)
+        label: human-readable label for display
+
+    Returns:
+        (success: bool, local_port: int, message: str)
+    """
+    if local_port is None:
+        local_port = remote_port
+
+    # Check if tunnel already exists for this target
+    tunnels = _load_tunnel_state()
+    for t in tunnels:
+        if t['host'] == host_alias and t['remote_port'] == remote_port and _is_pid_alive(t.get('pid', 0)):
+            return True, t['local_port'], f"Already tunneled on :{t['local_port']}"
+
+    # Check if local port is already in use
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('127.0.0.1', local_port))
+        sock.close()
+    except OSError:
+        # Port in use — try to find a free one nearby
+        sock.close()
+        for offset in range(1, 100):
+            try:
+                alt = local_port + offset
+                sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock2.bind(('127.0.0.1', alt))
+                sock2.close()
+                local_port = alt
+                break
+            except OSError:
+                try:
+                    sock2.close()
+                except Exception:
+                    pass
+        else:
+            return False, 0, f"No free port near {remote_port}"
+
+    # Start SSH tunnel in background
+    try:
+        proc = subprocess.Popen(
+            ['ssh', '-fNL', f'{local_port}:localhost:{remote_port}',
+             '-o', 'ExitOnForwardFailure=yes',
+             '-o', 'ServerAliveInterval=30',
+             '-o', 'ServerAliveCountMax=3',
+             host_alias],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        proc.wait(timeout=5)
+        if proc.returncode != 0:
+            err = proc.stderr.read().decode().strip() if proc.stderr else ''
+            return False, 0, f"SSH tunnel failed: {err}"
+    except subprocess.TimeoutExpired:
+        # ssh -f forks successfully — this is expected
+        pass
+    except Exception as e:
+        return False, 0, f"Failed to start tunnel: {e}"
+
+    # Find the ssh process PID (ssh -f forks, so proc.pid is the parent that already exited)
+    # Look for the actual ssh process by matching the port forward
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', f'ssh.*{local_port}:localhost:{remote_port}.*{host_alias}'],
+            capture_output=True, text=True, timeout=3,
+        )
+        pid = int(result.stdout.strip().split('\n')[0]) if result.stdout.strip() else 0
+    except Exception:
+        pid = 0
+
+    # Record tunnel
+    tunnel = {
+        'host': host_alias,
+        'remote_port': remote_port,
+        'local_port': local_port,
+        'pid': pid,
+        'label': label,
+        'ts': time.time(),
+    }
+    tunnels.append(tunnel)
+    _save_tunnel_state(tunnels)
+
+    return True, local_port, f"Tunneled :{local_port} → {host_alias}:{remote_port}"
+
+
+def stop_tunnel(host_alias, remote_port):
+    """Stop an SSH tunnel by host + remote port.
+
+    Returns (success: bool, message: str).
+    """
+    tunnels = _load_tunnel_state()
+    remaining = []
+    stopped = False
+
+    for t in tunnels:
+        if t['host'] == host_alias and t['remote_port'] == remote_port:
+            pid = t.get('pid', 0)
+            if pid and _is_pid_alive(pid):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            stopped = True
+        else:
+            remaining.append(t)
+
+    _save_tunnel_state(remaining)
+    if stopped:
+        return True, f"Tunnel to {host_alias}:{remote_port} stopped"
+    return False, "Tunnel not found"
+
+
+def list_tunnels():
+    """Return list of active tunnels (prunes dead ones).
+
+    Returns list of tunnel dicts with keys: host, remote_port, local_port, pid, label, ts, alive.
+    """
+    tunnels = _load_tunnel_state()
+    alive = []
+    for t in tunnels:
+        t['alive'] = _is_pid_alive(t.get('pid', 0))
+        if t['alive']:
+            alive.append(t)
+
+    # Prune dead tunnels from state
+    if len(alive) != len(tunnels):
+        _save_tunnel_state(alive)
+
+    return alive
+
+
+def cleanup_tunnels():
+    """Kill all active tunnels and clear state. Returns count of tunnels stopped."""
+    tunnels = _load_tunnel_state()
+    count = 0
+    for t in tunnels:
+        pid = t.get('pid', 0)
+        if pid and _is_pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                count += 1
+            except OSError:
+                pass
+    _save_tunnel_state([])
+    return count
+
+
+def get_app_list():
+    """Build flat list of apps from all projects.
+
+    For each project, uses explicit 'apps' field if present.
+    Otherwise auto-derives apps from services and enabled dev_services.
+
+    Returns list of dicts:
+        project_key, project_name, host, app_name, type, port, cmd, source
+    """
+    apps = []
+    for pk in PROJECT_ORDER:
+        proj = PROJECTS[pk]
+        host = proj['host']
+        explicit_apps = proj.get('apps', [])
+
+        if explicit_apps:
+            for app in explicit_apps:
+                apps.append({
+                    'project_key': pk,
+                    'project_name': proj['name'],
+                    'host': host,
+                    'app_name': app['name'],
+                    'type': app.get('type', 'web'),
+                    'port': app.get('port'),
+                    'cmd': app.get('cmd', ''),
+                    'source': 'apps',
+                })
+        else:
+            # Auto-derive from services
+            for svc in proj.get('services', []):
+                if not svc.get('port'):
+                    continue
+                apps.append({
+                    'project_key': pk,
+                    'project_name': proj['name'],
+                    'host': host,
+                    'app_name': svc['name'],
+                    'type': 'web',
+                    'port': svc['port'],
+                    'cmd': svc.get('start_cmd', ''),
+                    'source': 'service',
+                })
+            # Auto-derive from enabled dev_services
+            for ds in proj.get('dev_services', []):
+                if not ds.get('enabled') or not ds.get('port'):
+                    continue
+                apps.append({
+                    'project_key': pk,
+                    'project_name': proj['name'],
+                    'host': host,
+                    'app_name': ds['name'],
+                    'type': 'web',
+                    'port': ds['port'],
+                    'cmd': ds.get('dev_cmd', ''),
+                    'source': 'dev_service',
+                })
+
+    return apps
