@@ -19,6 +19,7 @@ Usage:
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -2420,6 +2421,15 @@ def _apps_list():
 
         for app in apps:
             port = app.get('port')
+            app_type = app.get('type', 'web')
+
+            if app_type == 'tui':
+                # TUI apps: show as launchable, no port probing
+                dot = f"{GREEN}●{RESET}" if reachable else f"{RED}●{RESET}"
+                status = f"{CYAN}tui{RESET}" if reachable else f"{RED}offline{RESET}"
+                print(f"    {dot} {app['app_name']:<22} {'':7} {status}")
+                continue
+
             probe_key = f"{host}:{port}" if port else None
 
             # Status
@@ -2471,30 +2481,65 @@ def _apps_open(project_query, app_name=None):
     for app in project_apps:
         host = app['host']
         port = app.get('port')
+        app_type = app.get('type', 'web')
+
+        if app_type == 'tui':
+            _launch_tui_app(app)
+            return
+
         if not port:
             continue
 
+        # Build URL using direct IP (LAN-accessible)
         if host == LOCAL_HOST:
-            # Local app — just open
-            url = f"http://localhost:{port}"
+            host_ip = HOSTS.get(host, {}).get('ip', '127.0.0.1')
+            # Over SSH: use Nano's LAN IP so caller can reach it
+            url = f"http://{host_ip}:{port}" if os.environ.get('SSH_CONNECTION') else f"http://localhost:{port}"
         else:
-            # Remote — tunnel first
-            alias = HOSTS.get(host, {}).get('alias', host)
-            ok, local_port, msg = start_tunnel(alias, port, label=f"{pk}/{app['app_name']}")
-            if not ok:
-                print(f"  {RED}✗{RESET} {msg}")
-                continue
-            print(f"  {GREEN}✓{RESET} {msg}")
-            url = f"http://localhost:{local_port}"
+            host_ip = HOSTS.get(host, {}).get('ip', host)
+            url = f"http://{host_ip}:{port}"
 
         print(f"  {CYAN}→{RESET} {url}")
 
-        # Try to open in browser
-        try:
-            subprocess.Popen(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except FileNotFoundError:
-            pass
+        # Open in browser (local) or print URL (SSH)
+        if os.environ.get('SSH_CONNECTION'):
+            print(f"  {YELLOW}⚡{RESET} Open in your terminal: {WHITE}{url}{RESET}")
+        else:
+            try:
+                subprocess.Popen(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                pass
     print()
+
+
+def _launch_tui_app(app):
+    """Launch a TUI/CLI app via interactive SSH session."""
+    host = app['host']
+    alias = HOSTS.get(host, {}).get('alias', host)
+    proj = PROJECTS.get(app['project_key'], {})
+    project_path = proj.get('path', '.')
+    work_dir = app.get('dir', '.')
+
+    if work_dir in ('.', ''):
+        full_path = project_path
+    else:
+        full_path = f'{project_path}/{work_dir}'
+
+    cmd = app.get('cmd', '')
+    if not cmd:
+        print(f"  {RED}No cmd configured for {app['app_name']}{RESET}")
+        return
+
+    full_cmd = f'cd {full_path} && {cmd}'
+
+    if host == LOCAL_HOST:
+        # Local app — run directly
+        print(f"  {CYAN}→{RESET} Running {WHITE}{app['app_name']}{RESET}...")
+        os.system(f'bash -c {shlex.quote(full_cmd)}')
+    else:
+        # Remote app — SSH with interactive terminal
+        print(f"  {CYAN}→{RESET} Launching {WHITE}{app['app_name']}{RESET} on {CYAN}{alias}{RESET}...")
+        os.system(f'ssh -t {alias} {shlex.quote(full_cmd)}')
 
 
 def _apps_interactive():
@@ -2546,8 +2591,19 @@ def _apps_interactive():
 
         host = app['host']
         port = app.get('port')
-        probe_key = f"{host}:{port}" if port else None
+        app_type = app.get('type', 'web')
         reachable = host_reachable.get(host, False)
+
+        if app_type == 'tui':
+            dot = f"{GREEN}●{RESET}" if reachable else f"{RED}●{RESET}"
+            name = f"{app['app_name']}"
+            tag = f"{CYAN}tui{RESET}"
+            line = f"{name:<22} {tag}"
+            if highlighted:
+                return f"    {dot} {HIGHLIGHT_BG}{name:<22} tui{' ' * 16}{HIGHLIGHT_OFF}"
+            return f"    {dot} {line}"
+
+        probe_key = f"{host}:{port}" if port else None
 
         # Status dot
         if not reachable:
@@ -2572,14 +2628,14 @@ def _apps_interactive():
 
     # Actions
     actions = {
-        'o': ('open', 'tunnel + open in browser'),
+        'o': ('open', 'open / launch'),
         't': ('tunnel', 'create/remove tunnel'),
         's': ('start', 'start service'),
         'x': ('stop', 'stop service'),
     }
 
     print()
-    title = f"  {WHITE}APPS{RESET}  {GRAY}— enter/o=open  t=tunnel  s=start  x=stop  q=quit{RESET}"
+    title = f"  {WHITE}APPS{RESET}  {GRAY}— enter/o=open/launch  t=tunnel  s=start  x=stop  q=quit{RESET}"
     footer = f"  {DIM}Active tunnels: {len(tunnels)}{RESET}"
 
     while True:
@@ -2602,31 +2658,31 @@ def _apps_interactive():
         alias = HOSTS.get(host, {}).get('alias', host)
 
         if action in (KEY_ENTER, 'o'):
+            app_type = app.get('type', 'web')
+            if app_type == 'tui':
+                _launch_tui_app(app)
+                continue
             if not port:
                 print(f"  {GRAY}No port — can't open{RESET}")
                 continue
             if host == LOCAL_HOST:
-                url = f"http://localhost:{port}"
+                host_ip = HOSTS.get(host, {}).get('ip', '127.0.0.1')
+                url = f"http://{host_ip}:{port}" if os.environ.get('SSH_CONNECTION') else f"http://localhost:{port}"
             else:
-                ok, local_port, msg = start_tunnel(alias, port, label=f"{app['project_key']}/{app['app_name']}")
-                if not ok:
-                    print(f"  {RED}✗{RESET} {msg}")
-                    continue
-                print(f"  {GREEN}✓{RESET} {msg}")
-                url = f"http://localhost:{local_port}"
-                # Update tunnel state for display
-                tunnels = list_tunnels()
-                tunnel_map = {(t['host'], t['remote_port']): t for t in tunnels}
-                footer = f"  {DIM}Active tunnels: {len(tunnels)}{RESET}"
+                host_ip = HOSTS.get(host, {}).get('ip', host)
+                url = f"http://{host_ip}:{port}"
 
             print(f"  {CYAN}→{RESET} {url}")
-            try:
-                subprocess.Popen(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except FileNotFoundError:
-                pass
+            if os.environ.get('SSH_CONNECTION'):
+                print(f"  {YELLOW}⚡{RESET} Open in your terminal: {WHITE}{url}{RESET}")
+            else:
+                try:
+                    subprocess.Popen(['xdg-open', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except FileNotFoundError:
+                    pass
 
         elif action == 't':
-            if not port:
+            if app.get('type', 'web') == 'tui' or not port:
                 continue
             tun = tunnel_map.get((host, port))
             if tun:
@@ -2646,7 +2702,7 @@ def _apps_interactive():
             footer = f"  {DIM}Active tunnels: {len(tunnels)}{RESET}"
 
         elif action == 's':
-            if not port:
+            if app.get('type', 'web') == 'tui' or not port:
                 continue
             # Start the backing service/dev_service
             proj = PROJECTS.get(app['project_key'])
@@ -2676,7 +2732,7 @@ def _apps_interactive():
                         print(f"  {YELLOW}●{RESET} Starting up...")
 
         elif action == 'x':
-            if not port:
+            if app.get('type', 'web') == 'tui' or not port:
                 continue
             proj = PROJECTS.get(app['project_key'])
             if not proj:

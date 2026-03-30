@@ -2732,8 +2732,12 @@ def get_app_list():
     For each project, uses explicit 'apps' field if present.
     Otherwise auto-derives apps from services and enabled dev_services.
 
+    Supported app types:
+        'web' (default) — has a port, opens in browser / via URL
+        'tui'           — terminal app, launched via SSH into interactive session
+
     Returns list of dicts:
-        project_key, project_name, host, app_name, type, port, cmd, source
+        project_key, project_name, host, app_name, type, port, cmd, dir, source
     """
     apps = []
     for pk in PROJECT_ORDER:
@@ -2751,6 +2755,7 @@ def get_app_list():
                     'type': app.get('type', 'web'),
                     'port': app.get('port'),
                     'cmd': app.get('cmd', ''),
+                    'dir': app.get('dir', '.'),
                     'source': 'apps',
                 })
         else:
@@ -2766,6 +2771,7 @@ def get_app_list():
                     'type': 'web',
                     'port': svc['port'],
                     'cmd': svc.get('start_cmd', ''),
+                    'dir': svc.get('dir', '.'),
                     'source': 'service',
                 })
             # Auto-derive from enabled dev_services
@@ -2780,6 +2786,7 @@ def get_app_list():
                     'type': 'web',
                     'port': ds['port'],
                     'cmd': ds.get('dev_cmd', ''),
+                    'dir': ds.get('dir', '.'),
                     'source': 'dev_service',
                 })
 
