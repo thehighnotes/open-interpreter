@@ -1,0 +1,21 @@
+# MiniRAG Python Dependency Fix
+
+## Issue
+The MiniRAG feature in Open Interpreter was failing to load with aValueError: numpy.dtype size changed error. This occurred because the system-wide Python packagespandas`,numpy`,scikit-learn`) were compiled against different versions ofnumpy than the ones currently installed in the environment.
+
+Specifically, the systempandas (from `/usr/lib/python3/dist-packages/`) was binary incompatible with the newernumpy version, causing the scientific stacksentence-transformers`) to crash during initialization.
+
+## Root Cause
+- **Mixed Environments**: System Python packages were installed viaapt and mixed with user-installed packages viapip`.
+- **Binary Mismatch**:scikit-learn andpandas contain compiled C extensions that rely on specificnumpy memory layouts. Version mismatches break this contract.
+- **Missing Lock File Sync**: Thepoetry.lock file was out of sync withpyproject.toml`, preventing automatic dependency resolution.
+
+## Fix
+1.  **Install Poetry**: Used Poetry to manage dependencies in an isolated environment.
+2.  **Recreate Virtual Environment**: Deleted and recreated the Poetry virtual environment to ensure a clean slate.
+3.  **Regenerate Lock File**: Ranpoetry lock to align the lock file withpyproject.toml`.
+4.  **Install Dependencies**: Installed theos extras (includingsentence-transformers`,numpy`,transformers`) usingpoetry install --extras os`.
+5.  **Direct Import**: To avoid triggering the full Open Interpreter stack (which requires additional optional deps likepyte), MiniRAG was imported directly from its source file during testing.
+
+## Verification Test
+The following Python script successfully loads the MiniRAG class and embeds the 110 entries from~/.config/hub/rag-entries.json`:
