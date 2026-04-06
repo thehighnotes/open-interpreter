@@ -26,7 +26,7 @@ const App = {
 
     // URL-based tab routing — check path for /status, /settings, etc.
     const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
-    const validTabs = ['chat','status','projects','repo','research','notify','help','settings'];
+    const validTabs = ['chat','status','projects','apps','repo','research','notify','mail','help','settings'];
     if (path && validTabs.includes(path)) {
       this.switchTab(path, true);
     }
@@ -90,6 +90,11 @@ const App = {
       const label = document.getElementById('connection-label');
       if (dot) dot.classList.toggle('offline', !info.connected);
       if (label) label.textContent = info.connected ? `${info.model}` : 'Disconnected';
+      // Sync execution mode from server
+      if (info.exec_mode && Chat._updateExecModeUI) {
+        Chat.execMode = info.exec_mode;
+        Chat._updateExecModeUI(info.exec_mode);
+      }
     } catch {
       const dot = document.getElementById('connection-dot');
       if (dot) dot.classList.add('offline');

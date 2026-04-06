@@ -1,0 +1,64 @@
+# OI WebUI Changelog
+
+## 2026-04-05 — Terminal output pipeline fix + execution mode toggle
+
+### Terminal output pipeline (critical fix)
+
+Commands executed through OI chat were producing garbled, missing, or
+duplicated output. Five root causes identified and fixed:
+
+1. _filter_console was too aggressive — after pyte (virtual terminal
+   emulator) had already processed ANSI codes and rendered clean text,
+   the filter was dropping blank lines, whitespace-only content, and
+   lines after \r handling. Legitimate command output silently discarded.
+   Now only strips hub-specific braille spinner frames.
+
+2. snapshot chunks treated as appends — when pyte detects screen rewrites
+   (progress bars, \r overwrites), it sends {snapshot: true} meaning
+   "replace previous content." The bridge ignored this flag and the client
+   appended, causing duplicated/garbled output. Now the flag passes through
+   and the client replaces the buffer on snapshot events.
+
+3. active_line chunks leaking — OI sends {format: "active_line"} chunks
+   for tracking code execution progress. These passed through the
+   role/type check and were treated as output. Now explicitly skipped.
+
+4. Terminal width 80 in headless mode — os.get_terminal_size() fails when
+   running as a web server, falling back to 80 columns. Commands formatting
+   for wider terminals got mangled by pyte line wrapping. Now defaults to
+   120 columns (configurable via OI_COLUMNS env var).
+
+### ANSI colors in chat output (fix)
+
+Colored command output in chat appeared as unstyled white text. ANSI color
+CSS classes (.ansi-green, .ansi-red, etc.) were scoped to .terminal-block
+and .magic-output-body only — chat output uses .console-output which had
+no rules. Removed scoping; ANSI classes are now global. Added missing
+styles: ansi-black, ansi-italic, ansi-underline, ansi-strikethrough, plus
+their SGR codes in both server-side and client-side parsers.
+
+### Execution mode toggle (new feature)
+
+Three-mode toggle above the chat input:
+
+  Ask   — Confirms every command before running
+  Safe  — Auto-runs safe commands (ls, cat, grep, hub tools...),
+          confirms unsafe ones (rm, sudo, pip...) [default]
+  Auto  — Runs everything without confirmation
+
+Persisted in config.json, survives restarts. Synced from server on load.
+
+### Files modified
+
+  oi_bridge.py                  Snapshot passthrough, filter rewrite,
+                                active_line skip, exec_mode logic
+  server.py                     POST /api/session/exec-mode endpoint,
+                                expanded SGR map
+  static/js/chat.js             Snapshot replace, exec mode UI,
+                                expanded client SGR map
+  static/js/webui.js            Sync exec_mode from session on load
+  static/index.html             Exec mode toggle markup
+  static/css/shared.css         Global ANSI classes, new styles
+  static/css/webui.css          Exec mode toggle styling
+  interpreter/.../              Terminal width fallback 80 -> 120
+    subprocess_language.py

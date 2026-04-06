@@ -5,6 +5,7 @@ const Settings = {
   _oiConfig: null,
   _sessionData: null,
   _ragData: null,
+  _mailAuth: null,
   _ragPage: 0,
   _ragPageSize: 20,
   _ragSearch: '',
@@ -15,18 +16,31 @@ const Settings = {
     const container = document.getElementById('settings-content');
     container.innerHTML = '<div class="tab-loading"><div class="spinner"></div>Loading settings...</div>';
     try {
-      const [hubRes, settingsRes, oiRes] = await Promise.all([
+      const [hubRes, settingsRes, oiRes, mailRes] = await Promise.all([
         fetch('/api/settings/hub'),
         fetch('/api/settings'),
         fetch('/api/settings/oi'),
+        fetch('/api/mail/auth/status').catch(() => ({ json: () => ({}) })),
       ]);
       this._hubConfig = await hubRes.json();
       this._sessionData = await settingsRes.json();
       this._oiConfig = await oiRes.json();
+      this._mailAuth = await mailRes.json();
       this._render();
     } catch (e) {
       container.innerHTML = `<div class="text-muted">Failed to load settings: ${e.message}</div>`;
     }
+  },
+
+  // ── Collapsible section wrapper ─────────────────────────────────────��───
+  _section(title, body, {open = false, headerExtra = ''} = {}) {
+    return `<details class="settings-section"${open ? ' open' : ''}>
+      <summary>
+        <div class="settings-section-title">${title}</div>
+        ${headerExtra}
+      </summary>
+      ${body}
+    </details>`;
   },
 
   _render() {
@@ -43,11 +57,14 @@ const Settings = {
     const hasCA = Object.values(config.hosts || {}).some(h => (h.roles || []).includes('code_assistant'));
     if (hasCA) html += this.renderCodeAssistantSection(config);
     html += this.renderResearchSection(config);
+    html += this.renderMailSection();
     html += this.renderWebuiSection();
     html += this.renderSessionSection();
     container.innerHTML = html;
     // Load RAG data async
     this._loadRagData();
+    // Load mail prompt if connected
+    this._loadMailPrompt();
   },
 
   _esc(str) {
@@ -84,11 +101,7 @@ const Settings = {
   // ── Hub Name Section ─────────────────────────────────────────────────────
   renderHubSection(config) {
     const name = config.hub?.name || 'Dev Hub';
-    return `
-      <div class="settings-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">Hub Identity</div>
-        </div>
+    return this._section('Hub Identity', `
         <div class="settings-group">
           <div class="settings-label">Hub Name</div>
           <div class="settings-row">
@@ -96,8 +109,7 @@ const Settings = {
             <button class="btn btn-sm" onclick="Settings.saveHub()">Save</button>
           </div>
           <div class="text-xs text-muted">Displayed in sidebar, status, and tools.</div>
-        </div>
-      </div>`;
+        </div>`, {open: true});
   },
 
   async saveHub() {
@@ -112,11 +124,7 @@ const Settings = {
   // ── Git Section ──────────────────────────────────────────────────────────
   renderGitSection(config) {
     const git = config.git || {};
-    return `
-      <div class="settings-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">Git</div>
-        </div>
+    return this._section('Git', `
         <div class="settings-group">
           <div class="settings-label">GitHub Username</div>
           <input type="text" class="input" id="s-git-user" value="${this._esc(git.github_username || '')}" style="max-width:300px;">
@@ -127,8 +135,7 @@ const Settings = {
         </div>
         <div class="settings-group">
           <button class="btn btn-sm" onclick="Settings.saveGit(this)">Save</button>
-        </div>
-      </div>`;
+        </div>`);
   },
 
   async saveGit(btn) {
@@ -143,11 +150,7 @@ const Settings = {
   // ── Backup Section ───────────────────────────────────────────────────────
   renderBackupSection(config) {
     const dest = config.backup?.destination || '';
-    return `
-      <div class="settings-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">Backup</div>
-        </div>
+    return this._section('Backup', `
         <div class="settings-group">
           <div class="settings-label">Backup Destination</div>
           <div class="settings-row">
@@ -158,8 +161,7 @@ const Settings = {
         </div>
         <div class="settings-group">
           <button class="btn btn-sm" onclick="Settings.saveBackup(this)">Save</button>
-        </div>
-      </div>`;
+        </div>`);
   },
 
   async probeBackup() {
@@ -238,17 +240,11 @@ const Settings = {
         </div>`;
     }
 
-    return `
-      <div class="settings-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">Hosts</div>
-          <button class="btn btn-sm" onclick="Settings.addHost()">+ Add Host</button>
-        </div>
+    return this._section('Hosts', `
         <div id="hosts-list">${cards}</div>
         <div class="settings-group" style="margin-top:var(--space-md);">
           <button class="btn btn-sm" onclick="Settings.saveHosts(this)">Save All Hosts</button>
-        </div>
-      </div>`;
+        </div>`, {headerExtra: '<button class="btn btn-sm" onclick="event.stopPropagation();Settings.addHost()">+ Add Host</button>'});
   },
 
   toggleRole(chip) {
@@ -394,13 +390,7 @@ const Settings = {
       ? '<span class="badge badge-success" style="margin-left:8px;">vLLM</span>'
       : '<span class="badge badge-info" style="margin-left:8px;">Ollama</span>';
 
-    return `
-      <div class="settings-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">LLM Backend${backendBadge}</div>
-          <span class="probe-result" id="s-llm-probe"></span>
-        </div>
-
+    const body = `
         ${isVllm ? `
         <div class="settings-group" id="s-vllm-controls">
           <div class="settings-label">vLLM Server</div>
@@ -412,7 +402,6 @@ const Settings = {
           </div>
         </div>
         ` : ''}
-
         <div class="settings-group">
           <div class="settings-label">LLM Host</div>
           <div class="settings-row">
@@ -446,8 +435,8 @@ const Settings = {
             <button class="btn btn-sm" onclick="Settings.saveLLM(this)">Save</button>
             <button class="btn btn-sm" onclick="Settings.probeLLM()">Test Connection</button>
           </div>
-        </div>
-      </div>`;
+        </div>`;
+    return this._section(`LLM Backend${backendBadge}`, body, {open: true, headerExtra: '<span class="probe-result" id="s-llm-probe"></span>'});
   },
 
   async loadVllmStatus() {
@@ -566,12 +555,7 @@ const Settings = {
 
   // ── RAG Section ──────────────────────────────────────────────────────────
   renderRagSection() {
-    return `
-      <div class="settings-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">Mini-RAG Entries</div>
-          <span class="badge badge-info" id="s-rag-count">...</span>
-        </div>
+    return this._section('Mini-RAG Entries', `
         <div class="settings-row" style="margin-bottom:var(--space-md);flex-wrap:wrap;">
           <input type="text" class="input" id="s-rag-search" placeholder="Search entries..." style="max-width:250px;" oninput="Settings.filterRag()">
           <select class="input" id="s-rag-cat-filter" style="max-width:180px;" onchange="Settings.filterRag()">
@@ -580,8 +564,8 @@ const Settings = {
           <button class="btn btn-sm" onclick="Settings.addRagEntry()">+ Add Entry</button>
         </div>
         <div id="s-rag-list"></div>
-        <div id="s-rag-pagination" class="settings-row" style="justify-content:space-between;margin-top:var(--space-sm);"></div>
-      </div>`;
+        <div id="s-rag-pagination" class="settings-row" style="justify-content:space-between;margin-top:var(--space-sm);"></div>`,
+      {headerExtra: '<span class="badge badge-info" id="s-rag-count">...</span>'});
   },
 
   async _loadRagData() {
@@ -824,12 +808,7 @@ const Settings = {
       hostOptions += `<option value="${this._esc(key)}" ${sel}>${this._esc(h.name || key)}</option>`;
     }
 
-    return `
-      <div class="settings-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">Code Assistant</div>
-          <span class="probe-result" id="s-ca-probe"></span>
-        </div>
+    return this._section('Code Assistant', `
         <div class="settings-group">
           <div class="settings-label">Host</div>
           <select class="input" id="s-ca-host" style="max-width:200px;">${hostOptions}</select>
@@ -847,8 +826,7 @@ const Settings = {
         <div class="settings-group">
           <div class="settings-label">Indexed Projects</div>
           <div id="s-ca-projects"><span class="text-muted">Loading...</span></div>
-        </div>
-      </div>`;
+        </div>`, {headerExtra: '<span class="probe-result" id="s-ca-probe"></span>'});
   },
 
   async probeCA() {
@@ -953,11 +931,7 @@ const Settings = {
       </div>`
     ).join('');
 
-    return `
-      <div class="settings-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">Research</div>
-        </div>
+    return this._section('Research', `
         <div class="settings-group">
           <div class="settings-label">Relevance Threshold (1-10)</div>
           <input type="number" class="input" id="s-research-threshold" value="${threshold}" style="max-width:100px;" min="1" max="10">
@@ -989,8 +963,7 @@ const Settings = {
         </div>
         <div class="settings-group" style="margin-top:var(--space-md);">
           <button class="btn btn-sm" onclick="Settings.saveResearch(this)">Save</button>
-        </div>
-      </div>`;
+        </div>`);
   },
 
   addResearchTag(containerId, inputId) {
@@ -1049,11 +1022,7 @@ const Settings = {
 
   // ── WebUI Section ────────────────────────────────────────────────────────
   renderWebuiSection() {
-    return `
-      <div class="settings-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">WebUI</div>
-        </div>
+    return this._section('WebUI', `
         <div class="settings-group">
           <div class="settings-label">Interpreter Config</div>
           ${this._oiConfig && Object.keys(this._oiConfig).length > 0 ? `
@@ -1062,18 +1031,13 @@ const Settings = {
           <div class="settings-row"><span class="settings-label" style="min-width:130px;">Auto-run</span><span class="badge badge-info">${this._oiConfig.auto_run === 'callable' ? 'Smart' : this._oiConfig.auto_run ? 'All' : 'Off'}</span></div>
           <div class="settings-row"><span class="settings-label" style="min-width:130px;">Custom Instructions</span><span class="badge badge-info">${this._oiConfig.custom_instructions === 'callable' ? 'Dynamic (RAG)' : this._oiConfig.custom_instructions === 'set' ? 'Static' : 'None'}</span></div>
           ` : '<div class="text-muted">Interpreter not initialized yet</div>'}
-        </div>
-      </div>`;
+        </div>`);
   },
 
   // ── Session Section ──────────────────────────────────────────────────────
   renderSessionSection() {
     const msgCount = this._sessionData?.message_count || 0;
-    return `
-      <div class="settings-section">
-        <div class="settings-section-header">
-          <div class="settings-section-title">Session</div>
-        </div>
+    return this._section('Session', `
         <div class="settings-group">
           <div class="settings-label">Messages in conversation</div>
           <div class="settings-row">
@@ -1082,7 +1046,278 @@ const Settings = {
         </div>
         <div class="settings-group">
           <button class="btn btn-danger btn-sm" onclick="Tabs.resetSession()">Reset Session</button>
+        </div>`);
+  },
+
+  // ── Gmail / Mail Section ────────────────────────────────────────────────
+  renderMailSection() {
+    const auth = this._mailAuth || {};
+    const connected = auth.authenticated;
+
+    let statusBadge = '';
+    if (connected) {
+      statusBadge = '<span class="badge badge-success">Connected</span>';
+    } else if (auth.has_credentials) {
+      statusBadge = '<span class="badge badge-warning">Not authorized</span>';
+    } else {
+      statusBadge = '<span class="badge badge-error">Not configured</span>';
+    }
+
+    let body = '';
+
+    if (!auth.has_credentials) {
+      // Setup: paste credentials
+      body = `
+        <p style="color:var(--text-secondary);margin-bottom:var(--space-md);line-height:1.6">
+          Connect Gmail to enable inbox filtering. You need OAuth credentials from the Google Cloud Console.
+        </p>
+        <ol style="color:var(--text-tertiary);margin-bottom:var(--space-lg);line-height:1.8;padding-left:var(--space-lg)">
+          <li>Go to <a href="https://console.cloud.google.com/" target="_blank" style="color:var(--accent-primary)">console.cloud.google.com</a></li>
+          <li>Create a project (or select existing)</li>
+          <li>Enable the <strong>Gmail API</strong> (APIs &amp; Services &gt; Library)</li>
+          <li>Create <strong>OAuth Client ID</strong> (APIs &amp; Services &gt; Credentials)</li>
+          <li>Application type: <strong>Web application</strong></li>
+          <li>Add authorized redirect URI: <code style="background:var(--bg-tertiary);padding:2px 6px;border-radius:4px">https://oi.aiquest.info/auth/gmail/callback</code></li>
+          <li>Copy the Client ID and Client Secret below</li>
+        </ol>
+        <div style="display:flex;flex-direction:column;gap:var(--space-sm);max-width:500px">
+          <input type="text" class="input" id="s-gmail-client-id" placeholder="Client ID (xxx.apps.googleusercontent.com)">
+          <input type="text" class="input" id="s-gmail-client-secret" placeholder="Client Secret (GOCSPX-xxx)">
+          <button class="btn btn-sm" onclick="Settings.saveMailCreds()" style="align-self:flex-start">Save Credentials</button>
         </div>
-      </div>`;
+        <div id="s-mail-status" style="margin-top:var(--space-sm)"></div>`;
+    } else if (!connected) {
+      // Credentials exist but not authorized
+      body = `
+        <p style="color:var(--text-secondary);margin-bottom:var(--space-md)">
+          Credentials are configured. Click below to authorize access to your Gmail account.
+        </p>
+        <div class="settings-row">
+          <button class="btn btn-sm" onclick="Settings.startMailAuth()">Connect Gmail Account</button>
+          <button class="btn btn-sm" style="color:var(--status-error)" onclick="Settings.resetMail('all')">Reset Credentials</button>
+        </div>
+        <div id="s-mail-status" style="margin-top:var(--space-sm)"></div>`;
+    } else {
+      // Connected — show account, mode settings, prompt, and controls
+      body = `
+        <div class="settings-group">
+          <div class="settings-row">
+            <span class="settings-label" style="min-width:130px;">Account</span>
+            <span class="settings-value">${this._esc(auth.email || 'Connected')}</span>
+          </div>
+        </div>
+        <div class="settings-group">
+          <div class="settings-label">Scan Mode</div>
+          <div class="settings-row" style="gap:var(--space-md);flex-wrap:wrap">
+            <label style="color:var(--text-secondary);display:flex;align-items:center;gap:var(--space-xs)">
+              <input type="radio" name="s-mail-mode" value="manual" id="s-mail-mode-manual"> Manual (batch review)
+            </label>
+            <label style="color:var(--text-secondary);display:flex;align-items:center;gap:var(--space-xs)">
+              <input type="radio" name="s-mail-mode" value="auto" id="s-mail-mode-auto"> Auto (suggestion feed)
+            </label>
+          </div>
+        </div>
+        <div class="settings-group">
+          <div class="settings-label">Scope</div>
+          <div class="settings-row" style="gap:var(--space-md);flex-wrap:wrap">
+            <select class="input" id="s-mail-scope-read" style="width:140px">
+              <option value="unread">Unread only</option>
+              <option value="all">All</option>
+            </select>
+            <select class="input" id="s-mail-scope-label" style="width:140px">
+              <option value="inbox">Inbox only</option>
+              <option value="all">All labels</option>
+            </select>
+          </div>
+        </div>
+        <div class="settings-group">
+          <div class="settings-label">Batch Size</div>
+          <input type="number" class="input" id="s-mail-batch" style="max-width:100px" min="5" max="100" step="5">
+        </div>
+        <div class="settings-group">
+          <div class="settings-label">LLM System Prompt</div>
+          <div class="text-xs text-muted" style="margin-bottom:var(--space-xs)">Tell the LLM your preferences — what to keep, archive, or tag for deletion.</div>
+          <textarea id="s-mail-prompt" rows="6"
+                    style="width:100%;padding:var(--space-sm);background:var(--bg-primary);border:1px solid var(--border-primary);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:var(--font-size-sm);resize:vertical"
+          ></textarea>
+          <div class="settings-row" style="margin-top:var(--space-xs)">
+            <button class="btn btn-sm" onclick="Settings.saveMailConfig()">Save Settings</button>
+            <button class="btn btn-sm" onclick="Settings.resetMailPrompt()">Reset Prompt</button>
+          </div>
+        </div>
+        <div class="settings-group">
+          <div class="text-xs text-muted" style="margin-bottom:var(--space-md)">Scan and review in the <a href="/mail" style="color:var(--accent-primary)" onclick="event.preventDefault();App.switchTab('mail')">Mail tab</a>.</div>
+          <div class="settings-row">
+            <button class="btn btn-sm" onclick="Settings.resetMail('token')">Disconnect Account</button>
+            <button class="btn btn-sm" style="color:var(--status-error)" onclick="Settings.resetMail('all')">Reset Everything</button>
+          </div>
+          <div class="text-xs text-muted" style="margin-top:var(--space-xs)">Disconnect removes the token. Reset also clears credentials, prompt, and rules.</div>
+        </div>
+        <div id="s-mail-status" style="margin-top:var(--space-sm)"></div>`;
+    }
+
+    return this._section('Gmail', body, {headerExtra: statusBadge});
+  },
+
+  async saveMailCreds() {
+    const clientId = document.getElementById('s-gmail-client-id').value.trim();
+    const clientSecret = document.getElementById('s-gmail-client-secret').value.trim();
+    const status = document.getElementById('s-mail-status');
+
+    if (!clientId || !clientSecret) {
+      if (status) status.innerHTML = '<span style="color:var(--status-error)">Both fields required</span>';
+      return;
+    }
+
+    if (status) status.innerHTML = '<span class="spinner-sm"></span> Saving...';
+    try {
+      const res = await fetch('/api/mail/auth/save-creds', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({client_id: clientId, client_secret: clientSecret}),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        App.toast('Gmail credentials saved', 'success');
+        // Refresh mail auth status and re-render
+        const mailRes = await fetch('/api/mail/auth/status');
+        this._mailAuth = await mailRes.json();
+        this._render();
+        this._loadRagData();
+      } else {
+        if (status) status.innerHTML = `<span style="color:var(--status-error)">${this._esc(data.error)}</span>`;
+      }
+    } catch (e) {
+      if (status) status.innerHTML = `<span style="color:var(--status-error)">Failed: ${this._esc(e.message)}</span>`;
+    }
+  },
+
+  async startMailAuth() {
+    const status = document.getElementById('s-mail-status');
+    if (status) status.innerHTML = '<span class="spinner-sm"></span> Starting authorization...';
+    try {
+      const res = await fetch('/api/mail/auth/start');
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+
+      window.open(data.authorize_url, '_blank');
+      if (status) status.innerHTML = '<span class="spinner-sm"></span> Waiting for authorization... (complete in the new tab)';
+
+      // Poll for completion
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts++;
+        if (attempts > 60) {
+          clearInterval(poll);
+          if (status) status.innerHTML = '<span style="color:var(--status-error)">Authorization timed out. Try again.</span>';
+          return;
+        }
+        try {
+          const r = await fetch('/api/mail/auth/status');
+          const d = await r.json();
+          if (d.authenticated) {
+            clearInterval(poll);
+            App.toast('Gmail connected!', 'success');
+            this._mailAuth = d;
+            this._render();
+            this._loadRagData();
+          }
+        } catch (_) {}
+      }, 3000);
+    } catch (e) {
+      if (status) status.innerHTML = `<span style="color:var(--status-error)">Failed: ${this._esc(e.message)}</span>`;
+    }
+  },
+
+  async resetMail(scope) {
+    const label = scope === 'all' ? 'reset all Gmail settings (credentials, token, and rules)' : 'disconnect Gmail account';
+    if (!confirm(`Are you sure you want to ${label}?`)) return;
+    const status = document.getElementById('s-mail-status');
+    if (status) status.innerHTML = '<span class="spinner-sm"></span> Resetting...';
+    try {
+      const res = await fetch('/api/mail/reset', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({scope}),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        App.toast(scope === 'all' ? 'Gmail settings reset' : 'Gmail disconnected', 'success');
+        const mailRes = await fetch('/api/mail/auth/status');
+        this._mailAuth = await mailRes.json();
+        this._render();
+        this._loadRagData();
+        // Also refresh the Mail tab if it was loaded
+        Tabs.loaded.mail = false;
+      } else {
+        if (status) status.innerHTML = `<span style="color:var(--status-error)">${this._esc(data.error || 'Reset failed')}</span>`;
+      }
+    } catch (e) {
+      if (status) status.innerHTML = `<span style="color:var(--status-error)">Failed: ${this._esc(e.message)}</span>`;
+    }
+  },
+
+  async _loadMailPrompt() {
+    const prompt = document.getElementById('s-mail-prompt');
+    if (!prompt) return;
+    try {
+      const res = await fetch('/api/mail/config');
+      const data = await res.json();
+      prompt.value = data.system_prompt || '';
+      // Populate mode
+      const modeManual = document.getElementById('s-mail-mode-manual');
+      const modeAuto = document.getElementById('s-mail-mode-auto');
+      if (modeManual && modeAuto) {
+        if (data.mode === 'auto') modeAuto.checked = true;
+        else modeManual.checked = true;
+      }
+      // Populate scope
+      const scopeRead = document.getElementById('s-mail-scope-read');
+      if (scopeRead) scopeRead.value = data.scope_read || 'unread';
+      const scopeLabel = document.getElementById('s-mail-scope-label');
+      if (scopeLabel) scopeLabel.value = data.scope_label || 'inbox';
+      // Populate batch size
+      const batch = document.getElementById('s-mail-batch');
+      if (batch) batch.value = data.batch_size || 25;
+    } catch (_) {}
+  },
+
+  async saveMailConfig() {
+    const prompt = document.getElementById('s-mail-prompt')?.value || '';
+    const mode = document.querySelector('input[name="s-mail-mode"]:checked')?.value || 'manual';
+    const scopeRead = document.getElementById('s-mail-scope-read')?.value || 'unread';
+    const scopeLabel = document.getElementById('s-mail-scope-label')?.value || 'inbox';
+    const batch = parseInt(document.getElementById('s-mail-batch')?.value) || 25;
+
+    try {
+      await fetch('/api/mail/config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          system_prompt: prompt,
+          mode,
+          scope_read: scopeRead,
+          scope_label: scopeLabel,
+          batch_size: Math.max(5, Math.min(100, batch)),
+        }),
+      });
+      App.toast('Mail settings saved', 'success');
+    } catch (e) {
+      App.toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  async resetMailPrompt() {
+    try {
+      await fetch('/api/mail/config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({system_prompt: null}),
+      });
+      this._loadMailPrompt();
+      App.toast('Prompt reset to default', 'success');
+    } catch (e) {
+      App.toast('Failed: ' + e.message, 'error');
+    }
   },
 };

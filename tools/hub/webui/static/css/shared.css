@@ -171,39 +171,28 @@
   line-height: 1.6;
 }
 
-/* ANSI color classes */
-.terminal-block .ansi-green,
-.magic-output-body .ansi-green        { color: #22c55e; }
-.terminal-block .ansi-bright-green,
-.magic-output-body .ansi-bright-green  { color: #4ade80; }
-.terminal-block .ansi-yellow,
-.magic-output-body .ansi-yellow        { color: #fbbf24; }
-.terminal-block .ansi-bright-yellow,
-.magic-output-body .ansi-bright-yellow { color: #fbbf24; }
-.terminal-block .ansi-red,
-.magic-output-body .ansi-red           { color: #f87171; }
-.terminal-block .ansi-bright-red,
-.magic-output-body .ansi-bright-red    { color: #fca5a5; }
-.terminal-block .ansi-cyan,
-.magic-output-body .ansi-cyan          { color: #22d3ee; }
-.terminal-block .ansi-bright-cyan,
-.magic-output-body .ansi-bright-cyan   { color: #67e8f9; }
-.terminal-block .ansi-blue,
-.magic-output-body .ansi-blue          { color: #60a5fa; }
-.terminal-block .ansi-bright-blue,
-.magic-output-body .ansi-bright-blue   { color: #93c5fd; }
-.terminal-block .ansi-magenta,
-.magic-output-body .ansi-magenta       { color: #c084fc; }
-.terminal-block .ansi-bright-magenta,
-.magic-output-body .ansi-bright-magenta { color: #d8b4fe; }
-.terminal-block .ansi-white,
-.magic-output-body .ansi-white         { color: #e8e8f0; }
-.terminal-block .ansi-gray,
-.magic-output-body .ansi-gray          { color: #6a6a80; }
-.terminal-block .ansi-dim,
-.magic-output-body .ansi-dim           { opacity: 0.5; }
-.terminal-block .ansi-bold,
-.magic-output-body .ansi-bold          { font-weight: 700; }
+/* ANSI color classes — used in terminal-block (tabs), magic-output-body (magic
+   commands), and console-output (streamed chat command output) */
+.ansi-green        { color: #22c55e; }
+.ansi-bright-green { color: #4ade80; }
+.ansi-yellow       { color: #fbbf24; }
+.ansi-bright-yellow { color: #fbbf24; }
+.ansi-red          { color: #f87171; }
+.ansi-bright-red   { color: #fca5a5; }
+.ansi-cyan         { color: #22d3ee; }
+.ansi-bright-cyan  { color: #67e8f9; }
+.ansi-blue         { color: #60a5fa; }
+.ansi-bright-blue  { color: #93c5fd; }
+.ansi-magenta      { color: #c084fc; }
+.ansi-bright-magenta { color: #d8b4fe; }
+.ansi-white        { color: #e8e8f0; }
+.ansi-black        { color: #3a3a4a; }
+.ansi-gray         { color: #6a6a80; }
+.ansi-dim          { opacity: 0.5; }
+.ansi-bold         { font-weight: 700; }
+.ansi-italic       { font-style: italic; }
+.ansi-underline    { text-decoration: underline; }
+.ansi-strikethrough { text-decoration: line-through; }
 
 /* Loading spinner */
 .spinner {

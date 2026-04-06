@@ -84,11 +84,12 @@ class SubprocessLanguage(BaseLanguage):
             self.terminate()
 
         # Detect terminal width — match the real terminal so programs
-        # format output at the correct width. Fall back to 80 if unknown.
+        # format output at the correct width. When running headless (e.g.
+        # as a web server), fall back to 120 for reasonable formatting.
         try:
             cols = os.get_terminal_size().columns
         except (AttributeError, ValueError, OSError):
-            cols = 80
+            cols = int(os.environ.get("OI_COLUMNS", 120))
         cols = max(cols, 40)  # floor at 40 to avoid degenerate wrapping
         rows = 50
 

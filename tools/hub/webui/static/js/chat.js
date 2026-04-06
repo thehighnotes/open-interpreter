@@ -74,6 +74,41 @@ const Chat = {
         this.send();
       });
     });
+
+    // Execution mode toggle
+    this.execModeEl = document.getElementById('exec-mode-toggle');
+    if (this.execModeEl) {
+      this.execModeEl.querySelectorAll('.exec-mode-btn').forEach(btn => {
+        btn.addEventListener('click', () => this.setExecMode(btn.dataset.mode));
+      });
+    }
+  },
+
+  execMode: 'safe',
+
+  async setExecMode(mode) {
+    try {
+      const res = await fetch('/api/session/exec-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        this.execMode = mode;
+        this._updateExecModeUI(mode);
+        App.toast(`Execution: ${mode}`, 'success');
+      }
+    } catch (e) {
+      App.toast('Failed to set mode: ' + e.message, 'error');
+    }
+  },
+
+  _updateExecModeUI(mode) {
+    if (!this.execModeEl) return;
+    this.execModeEl.querySelectorAll('.exec-mode-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.mode === mode);
+    });
   },
 
   autoResize() {
@@ -404,7 +439,12 @@ const Chat = {
 
             case 'output':
               if (currentOutput) {
-                currentOutput._rawBuffer = (currentOutput._rawBuffer || '') + event.content;
+                if (event.snapshot) {
+                  // Screen was rewritten (progress bar, \r overwrite) — replace, don't append
+                  currentOutput._rawBuffer = event.content;
+                } else {
+                  currentOutput._rawBuffer = (currentOutput._rawBuffer || '') + event.content;
+                }
                 currentOutput.innerHTML = this.ansiToHtml(currentOutput._rawBuffer);
                 this.scrollToBottom();
               }
@@ -558,7 +598,8 @@ const Chat = {
   // Convert ANSI SGR codes to HTML spans
   ansiToHtml(text) {
     const SGR = {
-      '1': 'ansi-bold', '2': 'ansi-dim',
+      '1': 'ansi-bold', '2': 'ansi-dim', '3': 'ansi-italic',
+      '4': 'ansi-underline', '9': 'ansi-strikethrough',
       '30': 'ansi-black', '31': 'ansi-red', '32': 'ansi-green', '33': 'ansi-yellow',
       '34': 'ansi-blue', '35': 'ansi-magenta', '36': 'ansi-cyan', '37': 'ansi-white',
       '90': 'ansi-gray', '91': 'ansi-bright-red', '92': 'ansi-bright-green',
@@ -577,7 +618,8 @@ const Chat = {
         out += this.escapeHtml(parts[i]);
       } else {
         const codes = parts[i];
-        if (!codes || codes === '0' || codes === '00' || codes === '39') {
+        if (!codes || codes === '0' || codes === '00' || codes === '39'
+            || codes === '22' || codes === '23' || codes === '24' || codes === '29') {
           if (open) { out += '</span>'; open = false; }
         } else {
           const classes = codes.split(';').map(c => SGR[c]).filter(Boolean);

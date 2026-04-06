@@ -57,6 +57,10 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
           <span class="tab-label">Notify</span>
         </button>
+        <button class="sidebar-tab" data-tab="mail">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+          <span class="tab-label">Mail</span>
+        </button>
         <button class="sidebar-tab" data-tab="help">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
           <span class="tab-label">Help</span>
@@ -101,6 +105,13 @@
 
           <!-- Input -->
           <div class="chat-input-container">
+            <div class="chat-input-toolbar">
+              <div class="exec-mode-toggle" id="exec-mode-toggle" title="Code execution mode">
+                <button class="exec-mode-btn" data-mode="ask">Ask</button>
+                <button class="exec-mode-btn active" data-mode="safe">Safe</button>
+                <button class="exec-mode-btn" data-mode="auto">Auto</button>
+              </div>
+            </div>
             <div class="chat-input-box">
               <textarea class="chat-textarea" id="chat-input" placeholder="Ask anything, or use %commands..." rows="1"></textarea>
               <div class="chat-input-actions">
@@ -198,6 +209,22 @@
         </div>
       </div>
 
+      <!-- Mail tab -->
+      <div class="tab-content" id="tab-mail">
+        <div class="data-tab">
+          <div class="data-tab-header">
+            <div class="data-tab-title">Mail</div>
+            <div style="display:flex;gap:var(--space-xs);">
+              <button class="btn btn-sm" onclick="Mail.scan()" title="Scan inbox with LLM">Scan</button>
+              <button class="btn btn-sm btn-icon" onclick="Mail.load()" title="Refresh">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="mail-content"></div>
+        </div>
+      </div>
+
       <!-- Help tab -->
       <div class="tab-content" id="tab-help">
         <div class="data-tab">
@@ -246,6 +273,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
         Notify
       </button>
+      <button class="mobile-tab" data-tab="mail">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+        Mail
+      </button>
       <button class="mobile-tab" data-tab="help">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
         Help
@@ -265,6 +296,7 @@
   <script src="/static/js/chat.js"></script>
   <script src="/static/js/help.js"></script>
   <script src="/static/js/settings.js"></script>
+  <script src="/static/js/mail.js"></script>
   <script src="/static/js/tabs.js"></script>
 </body>
 </html>

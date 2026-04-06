@@ -75,6 +75,10 @@ _UNSAFE_PATTERNS = re.compile(
 class OIBridge:
     """Singleton wrapper around Open Interpreter for WebUI use."""
 
+    # Execution modes: "ask" = confirm everything, "safe" = auto-run safe
+    # commands only, "auto" = run everything without confirmation
+    EXEC_MODES = ("ask", "safe", "auto")
+
     def __init__(self):
         self._interpreter = None
         self._lock = threading.Lock()
@@ -87,6 +91,7 @@ class OIBridge:
         self._saved_cfg = self._load_saved_config()
         self._model_name = self._saved_cfg.get(
             "model", os.environ.get("OI_MODEL", _DEFAULT_MODEL))
+        self._exec_mode = self._saved_cfg.get("exec_mode", "safe")
 
     @staticmethod
     def _load_saved_config():
@@ -210,9 +215,12 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
         return False
 
     def _webui_auto_run(self, code):
-        """Auto-run callable: safe commands pass, unsafe ones block for approval."""
-        if self._should_auto_run(code):
+        """Auto-run callable respecting execution mode setting."""
+        if self._exec_mode == "auto":
             return True
+        if self._exec_mode == "safe" and self._should_auto_run(code):
+            return True
+        # "ask" mode confirms everything; "safe" mode confirms unsafe commands
 
         # Need approval — signal the SSE stream and wait
         self._pending_approval = True
@@ -318,6 +326,7 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
         role = chunk.get("role", "")
         msg_type = chunk.get("type", "")
         content = chunk.get("content", "")
+        fmt = chunk.get("format", "")
         start = chunk.get("start", False)
         end = chunk.get("end", False)
 
@@ -345,43 +354,40 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
 
         elif role == "computer":
             if msg_type == "console":
+                # Skip active_line tracking chunks (just line numbers)
+                if fmt == "active_line":
+                    return None
                 if start:
                     return {"type": "output_start"}
                 if end:
                     return {"type": "output_end"}
                 if content:
-                    # Filter spinner frames from console output
                     filtered = self._filter_console(content)
                     if filtered:
-                        return {"type": "output", "content": filtered}
+                        evt = {"type": "output", "content": filtered}
+                        # Preserve snapshot flag — client must replace, not append
+                        if chunk.get("snapshot"):
+                            evt["snapshot"] = True
+                        return evt
                     return None
 
         return None
 
     def _filter_console(self, content):
-        """Filter spinner frames and clean console output for web display."""
+        """Light filtering of console output for web display.
+        pyte already handles terminal emulation, so we only strip
+        hub-specific spinner frames — not blank lines or whitespace."""
         lines = content.split('\n')
         result = []
         for line in lines:
-            # Handle \r (carriage return) — keep only last segment
-            if '\r' in line:
-                segments = line.split('\r')
-                final = ''
-                for seg in segments:
-                    if seg.strip():
-                        final = seg
-                line = final
-            if not line:
-                continue
-            # Strip ANSI codes for spinner detection
-            plain = self._ANSI_RE.sub('', line).strip()
-            if not plain:
-                continue
-            # Drop lines starting with braille spinner chars
-            if plain and plain[0] in self._SPINNER_CHARS:
+            # Strip ANSI codes for spinner detection only
+            plain = self._ANSI_RE.sub('', line)
+            # Drop lines that are purely braille spinner frames
+            stripped = plain.strip()
+            if stripped and stripped[0] in self._SPINNER_CHARS and len(stripped) < 4:
                 continue
             result.append(line)
-        return '\n'.join(result) if result else ''
+        return '\n'.join(result)
 
     def approve(self, approved):
         """Respond to a pending code approval."""
@@ -413,9 +419,17 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
             "message_count": len(msgs),
             "model": self._model_name,
             "connected": self._connected,
+            "exec_mode": self._exec_mode,
             "rag_loaded": bool(self._rag and self._rag.is_loaded),
             "rag_entries": self._rag.entry_count if self._rag and self._rag.is_loaded else 0,
         }
+
+    def set_exec_mode(self, mode):
+        """Set execution mode: ask, safe, or auto."""
+        if mode not in self.EXEC_MODES:
+            return False
+        self._exec_mode = mode
+        return True
 
     def get_oi_config(self):
         """Return current OI interpreter configuration."""

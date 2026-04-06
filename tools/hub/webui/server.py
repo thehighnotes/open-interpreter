@@ -72,7 +72,13 @@ _SGR_CLASS_MAP = {
     '0': None,           # reset
     '1': 'ansi-bold',
     '2': 'ansi-dim',
+    '3': 'ansi-italic',
+    '4': 'ansi-underline',
+    '9': 'ansi-strikethrough',
     '22': None,          # normal intensity (reset bold/dim)
+    '23': None,          # reset italic
+    '24': None,          # reset underline
+    '29': None,          # reset strikethrough
     '30': 'ansi-black',
     '31': 'ansi-red',
     '32': 'ansi-green',
@@ -360,6 +366,17 @@ async def reset_session(request):
     bridge = get_bridge()
     bridge.reset()
     return JSONResponse({"ok": True})
+
+
+async def set_exec_mode(request):
+    """Set execution mode: ask, safe, or auto."""
+    data = await request.json()
+    mode = data.get("mode", "safe")
+    bridge = get_bridge()
+    if bridge.set_exec_mode(mode):
+        _save_webui_config({"exec_mode": mode})
+        return JSONResponse({"ok": True, "mode": mode})
+    return JSONResponse({"ok": False, "error": f"Invalid mode: {mode}"}, status_code=400)
 
 
 # ── Hub data endpoints ───────────────────────────────────────────────────────
@@ -1065,9 +1082,186 @@ async def research_fetch(request):
     return JSONResponse({"output": output})
 
 
+# ── Mail API ─────────────────────────────────────────────────────────────────
+
+async def get_mail_overview(request):
+    """GET /api/mail — overview stats + rules + recent actions."""
+    try:
+        from mail_api import get_overview
+        return JSONResponse(get_overview())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def get_mail_rules(request):
+    """GET /api/mail/rules — list all rules."""
+    from mail_api import load_rules
+    return JSONResponse({"rules": load_rules()})
+
+
+async def add_mail_rule(request):
+    """POST /api/mail/rules/add — add a filter rule."""
+    body = await _json_body(request)
+    rule = body.get("rule")
+    if not rule:
+        return JSONResponse({"error": "rule required"}, status_code=400)
+    from mail_api import add_rule
+    created = add_rule(rule)
+    return JSONResponse({"ok": True, "rule": created})
+
+
+async def update_mail_rule(request):
+    """POST /api/mail/rules/update — update a rule."""
+    body = await _json_body(request)
+    rule_id = body.get("id")
+    updates = body.get("updates")
+    if not rule_id or not updates:
+        return JSONResponse({"error": "id and updates required"}, status_code=400)
+    from mail_api import update_rule
+    return JSONResponse({"ok": update_rule(rule_id, updates)})
+
+
+async def delete_mail_rule(request):
+    """POST /api/mail/rules/delete — delete a rule."""
+    body = await _json_body(request)
+    rule_id = body.get("id")
+    if not rule_id:
+        return JSONResponse({"error": "id required"}, status_code=400)
+    from mail_api import delete_rule
+    return JSONResponse({"ok": delete_rule(rule_id)})
+
+
+async def mail_scan(request):
+    """POST /api/mail/scan — scan inbox with LLM (no actions taken)."""
+    try:
+        from mail_api import scan
+        result = scan()
+        return JSONResponse({"ok": True, **result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+async def mail_apply(request):
+    """POST /api/mail/apply — execute approved actions. {approvals: {msg_id: action}}"""
+    body = await _json_body(request)
+    approvals = body.get("approvals", {})
+    if not approvals:
+        return JSONResponse({"error": "approvals required"}, status_code=400)
+    try:
+        from mail_api import apply_actions
+        result = apply_actions(approvals)
+        return JSONResponse({"ok": True, **result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+async def mail_auth_status(request):
+    """GET /api/mail/auth/status — check auth state."""
+    from mail_api import get_auth_status
+    return JSONResponse(get_auth_status())
+
+
+async def mail_auth_save_creds(request):
+    """POST /api/mail/auth/save-creds — save client_id/secret to .env."""
+    body = await _json_body(request)
+    client_id = body.get("client_id", "").strip()
+    client_secret = body.get("client_secret", "").strip()
+    if not client_id or not client_secret:
+        return JSONResponse({"error": "client_id and client_secret required"}, status_code=400)
+    from mail_api import save_credentials
+    save_credentials(client_id, client_secret)
+    return JSONResponse({"ok": True})
+
+
+async def mail_auth_start(request):
+    """GET /api/mail/auth/start — begin OAuth flow, returns authorize URL."""
+    try:
+        from mail_api import start_auth_flow
+        result = start_auth_flow("https://oi.aiquest.info/auth/gmail/callback")
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def mail_auth_callback(request):
+    """GET /auth/gmail/callback — OAuth redirect handler."""
+    code = request.query_params.get("code")
+    if not code:
+        error = request.query_params.get("error", "no authorization code")
+        return HTMLResponse(f"<h3>Authorization failed: {error}</h3>")
+    state = request.query_params.get("state", "")
+    try:
+        from mail_api import complete_auth_flow
+        complete_auth_flow(code, state)
+        return HTMLResponse(
+            "<html><body style='font-family:system-ui;text-align:center;padding:60px'>"
+            "<h2>Gmail connected!</h2>"
+            "<p>You can close this tab and return to the Mail tab.</p>"
+            "<script>setTimeout(()=>window.close(),2000)</script>"
+            "</body></html>"
+        )
+    except Exception as e:
+        return HTMLResponse(f"<h3>Authorization failed: {e}</h3>")
+
+
+async def mail_reset(request):
+    """POST /api/mail/reset — reset Gmail settings. {scope: 'token'|'all'}"""
+    body = await _json_body(request)
+    scope = body.get("scope", "token")
+    try:
+        from mail_api import reset
+        reset(scope)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+async def get_mail_config(request):
+    """GET /api/mail/config — get system prompt and config."""
+    from mail_api import load_mail_config
+    return JSONResponse(load_mail_config())
+
+
+async def update_mail_config(request):
+    """POST /api/mail/config — update system prompt. null resets to default."""
+    body = await _json_body(request)
+    from mail_api import save_mail_config, load_mail_config, MAIL_CONFIG_FILE
+    if "system_prompt" in body and body["system_prompt"] is None:
+        # Reset to default by removing the config file
+        if MAIL_CONFIG_FILE.exists():
+            MAIL_CONFIG_FILE.unlink()
+        return JSONResponse({"ok": True})
+    config = load_mail_config()
+    for key in ("system_prompt", "mode", "scope_read", "scope_label", "batch_size"):
+        if key in body:
+            config[key] = body[key]
+    save_mail_config(config)
+    return JSONResponse({"ok": True})
+
+
+async def accept_suggestion(request):
+    """POST /api/mail/suggestions/accept — accept a suggestion (creates rule)."""
+    body = await _json_body(request)
+    sid = body.get("id")
+    if not sid:
+        return JSONResponse({"error": "id required"}, status_code=400)
+    from mail_api import accept_suggestion as _accept
+    return JSONResponse(_accept(sid))
+
+
+async def dismiss_suggestion_route(request):
+    """POST /api/mail/suggestions/dismiss — dismiss a suggestion."""
+    body = await _json_body(request)
+    sid = body.get("id")
+    if not sid:
+        return JSONResponse({"error": "id required"}, status_code=400)
+    from mail_api import dismiss_suggestion
+    return JSONResponse({"ok": dismiss_suggestion(sid)})
+
+
 # ── App assembly ─────────────────────────────────────────────────────────────
 
-_TAB_ROUTES = ["chat", "status", "projects", "apps", "repo", "research", "notify", "help", "settings"]
+_TAB_ROUTES = ["chat", "status", "projects", "apps", "repo", "research", "notify", "mail", "help", "settings"]
 
 routes = [
     Route("/", index),
@@ -1080,6 +1274,7 @@ routes = [
     Route("/api/session", get_session),
     Route("/api/session/messages", get_messages),
     Route("/api/session/reset", reset_session, methods=["POST"]),
+    Route("/api/session/exec-mode", set_exec_mode, methods=["POST"]),
     Route("/api/status", get_status),
     Route("/api/projects", get_projects),
     Route("/api/projects/switch", switch_project, methods=["POST"]),
@@ -1119,6 +1314,23 @@ routes = [
     Route("/api/projects/delete", delete_project, methods=["POST"]),
     # Research fetch
     Route("/api/research/fetch", research_fetch, methods=["POST"]),
+    # Mail API
+    Route("/api/mail", get_mail_overview),
+    Route("/api/mail/rules", get_mail_rules),
+    Route("/api/mail/rules/add", add_mail_rule, methods=["POST"]),
+    Route("/api/mail/rules/update", update_mail_rule, methods=["POST"]),
+    Route("/api/mail/rules/delete", delete_mail_rule, methods=["POST"]),
+    Route("/api/mail/scan", mail_scan, methods=["POST"]),
+    Route("/api/mail/apply", mail_apply, methods=["POST"]),
+    Route("/api/mail/auth/status", mail_auth_status),
+    Route("/api/mail/auth/start", mail_auth_start),
+    Route("/api/mail/auth/save-creds", mail_auth_save_creds, methods=["POST"]),
+    Route("/api/mail/reset", mail_reset, methods=["POST"]),
+    Route("/api/mail/config", get_mail_config),
+    Route("/api/mail/config", update_mail_config, methods=["POST"]),
+    Route("/api/mail/suggestions/accept", accept_suggestion, methods=["POST"]),
+    Route("/api/mail/suggestions/dismiss", dismiss_suggestion_route, methods=["POST"]),
+    Route("/auth/gmail/callback", mail_auth_callback),
     # Apps
     Route("/api/apps", get_apps),
     Route("/api/apps/tunnel", app_tunnel, methods=["POST"]),

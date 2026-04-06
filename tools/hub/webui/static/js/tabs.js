@@ -19,6 +19,7 @@ const Tabs = {
       repo: () => this.loadRepo(),
       research: () => this.loadResearch(),
       notify: () => this.loadNotifications(),
+      mail: () => Mail.load(),
       help: () => Help.render(),
       settings: () => this.loadSettings(),
     };

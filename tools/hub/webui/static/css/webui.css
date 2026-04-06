@@ -610,6 +610,52 @@ details.queue-indicator[open] .queue-summary::before {
   background: var(--bg-secondary);
 }
 
+/* Toolbar above input */
+.chat-input-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-bottom: var(--space-xs);
+}
+
+/* Execution mode toggle */
+.exec-mode-toggle {
+  display: inline-flex;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.exec-mode-btn {
+  padding: 2px 10px;
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+  font-weight: 500;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  letter-spacing: 0.3px;
+}
+.exec-mode-btn:not(:last-child) {
+  border-right: 1px solid var(--border-primary);
+}
+.exec-mode-btn:hover {
+  color: var(--text-secondary);
+  background: var(--bg-hover);
+}
+.exec-mode-btn.active {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+.exec-mode-btn.active[data-mode="auto"] {
+  color: var(--status-warning);
+}
+.exec-mode-btn.active[data-mode="ask"] {
+  color: var(--accent-primary);
+}
+
 .chat-input-box {
   display: flex;
   align-items: flex-end;
@@ -830,7 +876,7 @@ details.queue-indicator[open] .queue-summary::before {
   border-radius: var(--radius-sm);
 }
 
-/* Settings sections */
+/* Settings sections — collapsible via <details> */
 .settings-section {
   background: var(--bg-secondary);
   border: 1px solid var(--border-primary);
@@ -838,6 +884,27 @@ details.queue-indicator[open] .queue-summary::before {
   padding: var(--space-md);
   margin-bottom: var(--space-md);
 }
+.settings-section > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: var(--space-sm);
+  border-bottom: 1px solid var(--border-secondary);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.settings-section > summary::-webkit-details-marker { display: none; }
+.settings-section > summary::before {
+  content: '\25B6';
+  font-size: 0.65em;
+  margin-right: var(--space-sm);
+  transition: transform var(--transition-fast);
+  color: var(--text-tertiary);
+}
+.settings-section[open] > summary::before { transform: rotate(90deg); }
+.settings-section[open] > summary { margin-bottom: var(--space-md); }
+.settings-section > summary .settings-section-title { flex: 1; }
 .settings-section-header {
   display: flex;
   align-items: center;
