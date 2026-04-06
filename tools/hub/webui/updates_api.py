@@ -54,7 +54,9 @@ Host roles: {host_roles}. Affected projects: {projects}.
 Risk score: {risk_score} (total reverse dependencies across this cluster).
 
 For each package you are given: release notes AND actual import usage from the projects on this host. \
-If a package is NOT IMPORTED by any project, breaking changes in it are LOW risk — note this explicitly. \
+If a package is NOT IMPORTED by any project, it is safe to update — classify as "noise" and recommend "apply". \
+Only use "defer" when there is a specific reason to wait (breaking API change that affects imported code, \
+known incompatibility, or a major version bump on a package that IS actively used). \
 If a package IS imported, check whether the specific APIs/classes used are affected by the changes. \
 Reference actual API changes, removed features, new capabilities, or migration requirements.
 
@@ -133,6 +135,64 @@ DEFAULT_CLUSTER_DEFS = {
                       "mount", "libblkid*", "libfdisk*", "libmount*",
                       "libsmartcols*", "libuuid*", "eject"],
         "description": "util-linux family — same upstream",
+    },
+    "npm_azure_sdk": {
+        "name": "Azure SDK",
+        "dimension": "npm",
+        "packages": ["@azure/*", "msal-browser", "@azure/msal-browser",
+                      "msal-react", "@azure/msal-react", "@azure/cosmos",
+                      "@azure/static-web-apps-cli", "azure-functions-core-tools"],
+        "hosts": ["ws"],
+        "description": "Azure SDK + auth — coordinate MSAL + Cosmos updates",
+    },
+    "npm_atproto": {
+        "name": "AT Protocol",
+        "dimension": "npm",
+        "packages": ["@atproto/*"],
+        "hosts": ["ws"],
+        "description": "Bluesky AT Protocol SDK — lockstep versioning",
+    },
+    "npm_react": {
+        "name": "React Ecosystem",
+        "dimension": "npm",
+        "packages": ["react", "react-dom", "react-scripts", "react-router*",
+                      "@testing-library/react", "@testing-library/jest-dom",
+                      "@testing-library/user-event", "@tanstack/react-query"],
+        "hosts": ["ws"],
+        "description": "React core + testing + routing — update together",
+    },
+    "infra_certs": {
+        "name": "TLS Certificates",
+        "dimension": "infra",
+        "packages": ["cert:*"],
+        "hosts": ["vps"],
+        "description": "Let's Encrypt certs — expired or expiring soon",
+    },
+    "infra_node": {
+        "name": "Node.js Runtime",
+        "dimension": "infra",
+        "packages": ["node"],
+        "description": "Node.js version across hosts — coordinate major upgrades",
+    },
+    "devtools_azure_cli": {
+        "name": "Azure CLI Stack",
+        "dimension": "devtools",
+        "packages": ["azure-cli", "az-ext:*"],
+        "description": "Azure CLI + extensions — update CLI first, then extensions",
+    },
+    "azure_swa": {
+        "name": "Static Web Apps",
+        "dimension": "azure",
+        "packages": ["swa:*"],
+        "hosts": ["ws"],
+        "description": "Azure Static Web Apps — 5 deployed apps",
+    },
+    "azure_backend": {
+        "name": "Azure Backend Services",
+        "dimension": "azure",
+        "packages": ["func:*", "cosmos:*"],
+        "hosts": ["ws"],
+        "description": "Function Apps + Cosmos DB — API backends",
     },
 }
 
@@ -448,15 +508,609 @@ def _scan_pip(hosts):
     return items
 
 
+# ── npm scanner ──────────────────────────────────────────────────────────────
+
+def _npm_projects_on_host(host):
+    """Return list of (project_key, path) for projects with package.json on a host."""
+    results = []
+    for pkey, pdata in PROJECTS.items():
+        if pdata.get("host") != host:
+            continue
+        path = pdata.get("path", "")
+        if not path:
+            continue
+        results.append((pkey, path))
+    return results
+
+
+def _parse_npm_outdated(output, host, project_key=None, project_path=None):
+    """Parse npm outdated --json output into item list.
+    project_key=None means global packages."""
+    try:
+        pkgs = json.loads(output) if output.strip() else {}
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    items = []
+    for name, info in pkgs.items():
+        current = info.get("current", "")
+        available = info.get("latest", "")
+        if not current or not available or current == available:
+            continue
+        # Skip linked/missing packages
+        if current == "linked" or current == "MISSING":
+            continue
+
+        if project_key:
+            item_id = f"npm:{host}:{name}:{project_key}"
+            apply_cmd = f"cd {project_path} && npm install {name}@{available}"
+        else:
+            item_id = f"npm:{host}:{name}"
+            apply_cmd = f"npm -g install {name}@{available}"
+
+        items.append({
+            "id": item_id,
+            "dimension": "npm",
+            "host": host,
+            "project": project_key,
+            "package": name,
+            "current": current,
+            "available": available,
+            "source_tag": "global" if not project_key else project_key,
+            "is_security": False,
+            "deps": [],
+            "required_by": [],
+            "dep_count": 0,
+            "required_by_count": 0,
+            "cluster_id": None,
+            "classification": None,
+            "reason": None,
+            "source": None,
+            "rule_matched": None,
+            "approved": None,
+            "apply_cmd": apply_cmd,
+            "cross_refs": [],
+            "intel": None,
+            "scanned_at": int(time.time()),
+        })
+    return items
+
+
+def _scan_npm_host(host):
+    """Scan npm global + per-project outdated on a host.
+    Note: npm outdated exits 1 when packages ARE outdated — so we parse output
+    regardless of exit code, as long as it looks like JSON."""
+    items = []
+
+    # Global packages
+    ok, output = ssh_cmd(host, "npm -g outdated --json 2>/dev/null", timeout=30)
+    if output and output.strip().startswith("{"):
+        items.extend(_parse_npm_outdated(output, host))
+
+    # Per-project packages
+    projects = _npm_projects_on_host(host)
+    for pkey, path in projects:
+        # Check if package.json exists and run npm outdated
+        ok, output = ssh_cmd(
+            host,
+            f"test -f {path}/package.json && cd {path} && npm outdated --json 2>/dev/null",
+            timeout=30,
+        )
+        if output and output.strip().startswith("{"):
+            items.extend(_parse_npm_outdated(output, host, pkey, path))
+
+    return items
+
+
+def _scan_npm(hosts):
+    if not hosts:
+        return []
+    results = {}
+    def _run(h):
+        results[h] = _scan_npm_host(h)
+    threads = [threading.Thread(target=_run, args=(h,), daemon=True) for h in hosts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=90)
+    items = []
+    for h in hosts:
+        items.extend(results.get(h, []))
+    return items
+
+
+# ── Infra scanner ────────────────────────────────────────────────────────────
+
+def _github_latest_version(owner_repo):
+    """Get latest release tag from GitHub. Returns version string or None."""
+    import urllib.request
+    import urllib.error
+    try:
+        url = f"https://api.github.com/repos/{owner_repo}/releases/latest"
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "oi-webui",
+        })
+        data = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        tag = data.get("tag_name", "")
+        return tag.lstrip("v")
+    except Exception:
+        return None
+
+
+# Tools to check per host: (tool_name, version_cmd, parse_fn, github_repo, hosts, apply_hint)
+# parse_fn extracts version string from command output
+INFRA_TOOLS = [
+    {
+        "name": "nginx",
+        "cmd": "nginx -v 2>&1",
+        "parse": lambda out: re.search(r"nginx/(\S+)", out).group(1) if "nginx/" in out else None,
+        "repo": "nginx/nginx",
+        "hosts": ["vps"],
+        "apply": "Add nginx mainline PPA or build from source",
+    },
+    {
+        "name": "certbot",
+        "cmd": "certbot --version 2>&1",
+        "parse": lambda out: re.search(r"certbot (\S+)", out).group(1) if "certbot" in out else None,
+        "repo": "certbot/certbot",
+        "hosts": ["vps"],
+        "apply": "pip install --upgrade certbot certbot-nginx",
+    },
+    {
+        "name": "cloudflared",
+        "cmd": "cloudflared --version 2>&1",
+        "parse": lambda out: re.search(r"version (\S+)", out).group(1) if "version" in out else None,
+        "repo": "cloudflare/cloudflared",
+        "hosts": ["nano"],
+        "apply": "cloudflared update",
+    },
+    {
+        "name": "gh",
+        "cmd": "gh --version 2>&1 | head -1",
+        "parse": lambda out: re.search(r"version (\S+)", out).group(1).split("+")[0] if "version" in out else None,
+        "repo": "cli/cli",
+        "hosts": ["ws", "vps", "agx", "nano"],
+        "apply": "See https://github.com/cli/cli/blob/trunk/docs/install_linux.md",
+    },
+    {
+        "name": "node",
+        "cmd": "node --version 2>&1",
+        "parse": lambda out: out.strip().lstrip("v") if out.strip().startswith("v") else None,
+        "repo": "nodejs/node",
+        "hosts": ["nano", "ws", "vps", "agx"],
+        "apply": "Use nvm or nodesource to update Node.js",
+    },
+]
+
+
+def _scan_infra_host(host):
+    """Check infrastructure tools on a host against latest GitHub releases."""
+    items = []
+    for tool in INFRA_TOOLS:
+        if host not in tool["hosts"]:
+            continue
+        ok, output = ssh_cmd(host, tool["cmd"], timeout=10)
+        if not output:
+            continue
+        try:
+            current = tool["parse"](output)
+        except Exception:
+            continue
+        if not current:
+            continue
+
+        items.append({
+            "_tool": tool,
+            "host": host,
+            "package": tool["name"],
+            "current": current,
+        })
+    return items
+
+
+def _scan_infra(hosts):
+    if not hosts:
+        return []
+
+    # Step 1: Gather installed versions from all hosts in parallel
+    host_results = {}
+    def _run(h):
+        host_results[h] = _scan_infra_host(h)
+    threads = [threading.Thread(target=_run, args=(h,), daemon=True) for h in hosts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    # Step 2: Fetch latest versions from GitHub (deduplicate by repo)
+    repos_needed = {}
+    for h in hosts:
+        for entry in host_results.get(h, []):
+            repo = entry["_tool"]["repo"]
+            if repo not in repos_needed:
+                repos_needed[repo] = None
+
+    latest_results = {}
+    def _fetch_latest(repo):
+        v = _github_latest_version(repo)
+        # Strip common tag prefixes: release-, v
+        if v and v.startswith("release-"):
+            v = v[8:]
+        latest_results[repo] = v
+    lt = [threading.Thread(target=_fetch_latest, args=(r,), daemon=True) for r in repos_needed]
+    for t in lt:
+        t.start()
+    for t in lt:
+        t.join(timeout=15)
+
+    # Step 3: Build items for tools that are outdated
+    items = []
+    now = int(time.time())
+    for h in hosts:
+        for entry in host_results.get(h, []):
+            tool = entry["_tool"]
+            current = entry["current"]
+            latest = latest_results.get(tool["repo"])
+            if not latest:
+                continue
+            # Normalize for comparison: strip pre-release suffixes for rough compare
+            cur_clean = current.split("-")[0].split("+")[0]
+            lat_clean = latest.split("-")[0].split("+")[0]
+            if cur_clean == lat_clean:
+                continue
+            items.append({
+                "id": f"infra:{h}:{tool['name']}",
+                "dimension": "infra",
+                "host": h,
+                "project": None,
+                "package": tool["name"],
+                "current": current,
+                "available": latest,
+                "source_tag": tool["repo"],
+                "is_security": False,
+                "deps": [],
+                "required_by": [],
+                "dep_count": 0,
+                "required_by_count": 0,
+                "cluster_id": None,
+                "classification": None,
+                "reason": None,
+                "source": None,
+                "rule_matched": None,
+                "approved": None,
+                "apply_cmd": tool["apply"],
+                "cross_refs": [],
+                "intel": {"repo": tool["repo"]},
+                "scanned_at": now,
+            })
+
+    # Step 4: Check certbot expired certs on VPS
+    if "vps" in hosts:
+        ok, output = ssh_cmd("vps", "certbot certificates 2>&1", timeout=15)
+        if output:
+            # Parse cert blocks
+            cert_name = None
+            for line in output.split("\n"):
+                line = line.strip()
+                m = re.match(r"Certificate Name:\s+(.+)", line)
+                if m:
+                    cert_name = m.group(1)
+                if "EXPIRED" in line and cert_name:
+                    m2 = re.search(r"Expiry Date:\s+(\S+)", line)
+                    expired_date = m2.group(1) if m2 else "unknown"
+                    items.append({
+                        "id": f"infra:vps:cert-expired:{cert_name}",
+                        "dimension": "infra",
+                        "host": "vps",
+                        "project": None,
+                        "package": f"cert:{cert_name}",
+                        "current": f"expired {expired_date}",
+                        "available": "renew",
+                        "source_tag": "certbot",
+                        "is_security": True,
+                        "deps": [],
+                        "required_by": [],
+                        "dep_count": 0,
+                        "required_by_count": 0,
+                        "cluster_id": None,
+                        "classification": "urgent",
+                        "reason": "Certificate expired",
+                        "source": "scanner",
+                        "rule_matched": None,
+                        "approved": None,
+                        "apply_cmd": f"certbot renew --cert-name {cert_name}",
+                        "cross_refs": [],
+                        "intel": None,
+                        "scanned_at": now,
+                    })
+                    cert_name = None
+
+    return items
+
+
+# ── Devtools scanner ─────────────────────────────────────────────────────────
+
+def _scan_devtools_host(host):
+    """Check dev tools on a host."""
+    items = []
+    now = int(time.time())
+
+    # VS Code extensions (WS only — desktop IDE)
+    if host == "ws":
+        ok, output = ssh_cmd(host, "code --list-extensions --show-versions 2>/dev/null", timeout=15)
+        if ok and output and output.strip():
+            extensions = []
+            for line in output.strip().split("\n"):
+                line = line.strip()
+                if "@" in line:
+                    parts = line.rsplit("@", 1)
+                    if len(parts) == 2:
+                        extensions.append((parts[0], parts[1]))
+            # VS Code itself
+            ok2, vs_output = ssh_cmd(host, "code --version 2>/dev/null | head -1", timeout=10)
+            if ok2 and vs_output and vs_output.strip():
+                items.append({
+                    "id": f"devtools:{host}:vscode",
+                    "dimension": "devtools",
+                    "host": host,
+                    "project": None,
+                    "package": "vscode",
+                    "current": vs_output.strip(),
+                    "available": "check",
+                    "source_tag": "vscode",
+                    "is_security": False,
+                    "deps": [],
+                    "required_by": [],
+                    "dep_count": 0,
+                    "required_by_count": len(extensions),
+                    "cluster_id": None,
+                    "classification": None,
+                    "reason": None,
+                    "source": None,
+                    "rule_matched": None,
+                    "approved": None,
+                    "apply_cmd": "VS Code updates itself",
+                    "cross_refs": [],
+                    "intel": {"extension_count": len(extensions)},
+                    "scanned_at": now,
+                })
+
+    # .NET SDK
+    ok, output = ssh_cmd(host, "dotnet --list-sdks 2>/dev/null | tail -1", timeout=10)
+    if ok and output and output.strip():
+        m = re.match(r"(\S+)", output.strip())
+        if m:
+            items.append({
+                "id": f"devtools:{host}:dotnet-sdk",
+                "dimension": "devtools",
+                "host": host,
+                "project": None,
+                "package": "dotnet-sdk",
+                "current": m.group(1),
+                "available": "check",
+                "source_tag": "dotnet",
+                "is_security": False,
+                "deps": [], "required_by": [],
+                "dep_count": 0, "required_by_count": 0,
+                "cluster_id": None,
+                "classification": None, "reason": None, "source": None,
+                "rule_matched": None, "approved": None,
+                "apply_cmd": "See https://dotnet.microsoft.com/download",
+                "cross_refs": [], "intel": None,
+                "scanned_at": now,
+            })
+
+    # Azure CLI
+    ok, output = ssh_cmd(host, "az version --output json 2>/dev/null", timeout=15)
+    if ok and output and output.strip().startswith("{"):
+        try:
+            az_data = json.loads(output)
+            az_ver = az_data.get("azure-cli", "")
+            extensions = az_data.get("extensions", {})
+            if az_ver:
+                items.append({
+                    "id": f"devtools:{host}:azure-cli",
+                    "dimension": "devtools",
+                    "host": host,
+                    "project": None,
+                    "package": "azure-cli",
+                    "current": az_ver,
+                    "available": "check",
+                    "source_tag": "azure",
+                    "is_security": False,
+                    "deps": [], "required_by": list(extensions.keys()),
+                    "dep_count": 0, "required_by_count": len(extensions),
+                    "cluster_id": None,
+                    "classification": None, "reason": None, "source": None,
+                    "rule_matched": None, "approved": None,
+                    "apply_cmd": "az upgrade",
+                    "cross_refs": [], "intel": {"extensions": extensions},
+                    "scanned_at": now,
+                })
+                # Each extension as its own item
+                for ext_name, ext_ver in extensions.items():
+                    items.append({
+                        "id": f"devtools:{host}:az-ext:{ext_name}",
+                        "dimension": "devtools",
+                        "host": host,
+                        "project": None,
+                        "package": f"az-ext:{ext_name}",
+                        "current": ext_ver,
+                        "available": "check",
+                        "source_tag": "azure",
+                        "is_security": False,
+                        "deps": ["azure-cli"], "required_by": [],
+                        "dep_count": 1, "required_by_count": 0,
+                        "cluster_id": None,
+                        "classification": None, "reason": None, "source": None,
+                        "rule_matched": None, "approved": None,
+                        "apply_cmd": f"az extension update --name {ext_name}",
+                        "cross_refs": [], "intel": None,
+                        "scanned_at": now,
+                    })
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return items
+
+
+def _scan_devtools(hosts):
+    if not hosts:
+        return []
+    results = {}
+    def _run(h):
+        results[h] = _scan_devtools_host(h)
+    threads = [threading.Thread(target=_run, args=(h,), daemon=True) for h in hosts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=45)
+    items = []
+    for h in hosts:
+        items.extend(results.get(h, []))
+    return items
+
+
+# ── Azure services scanner ──────────────────────────────────────────────────
+
+def _scan_azure():
+    """Scan Azure service configurations: SWA runtimes, Function App bundles."""
+    items = []
+    now = int(time.time())
+
+    # Only WS has az CLI configured for our subscriptions
+    hosts_with_az = ["ws"]
+    for host in hosts_with_az:
+        # Check az login status
+        ok, output = ssh_cmd(host, "az account show --output json 2>/dev/null", timeout=10)
+        if not ok or not output or not output.strip().startswith("{"):
+            continue
+
+        # Static Web Apps
+        ok, swa_out = ssh_cmd(
+            host,
+            "az staticwebapp list --output json 2>/dev/null",
+            timeout=20,
+        )
+        if ok and swa_out and swa_out.strip().startswith("["):
+            try:
+                swas = json.loads(swa_out)
+                for swa in swas:
+                    name = swa.get("name", "")
+                    sku = swa.get("sku", {}).get("name", "")
+                    # SWA API version / build config
+                    build = swa.get("buildProperties", {}) or {}
+                    api_runtime = build.get("apiRuntime", "")
+                    app_runtime = build.get("appArtifactLocation", "")
+
+                    items.append({
+                        "id": f"azure:ws:swa:{name}",
+                        "dimension": "azure",
+                        "host": "ws",
+                        "project": None,
+                        "package": f"swa:{name}",
+                        "current": f"sku={sku}" + (f", api={api_runtime}" if api_runtime else ""),
+                        "available": "check",
+                        "source_tag": "azure-swa",
+                        "is_security": False,
+                        "deps": [], "required_by": [],
+                        "dep_count": 0, "required_by_count": 0,
+                        "cluster_id": None,
+                        "classification": None, "reason": None, "source": None,
+                        "rule_matched": None, "approved": None,
+                        "apply_cmd": f"az staticwebapp update -n {name}",
+                        "cross_refs": [], "intel": {"sku": sku, "api_runtime": api_runtime},
+                        "scanned_at": now,
+                    })
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Function Apps
+        ok, func_out = ssh_cmd(
+            host,
+            "az functionapp list --output json 2>/dev/null",
+            timeout=20,
+        )
+        if ok and func_out and func_out.strip().startswith("["):
+            try:
+                funcs = json.loads(func_out)
+                for fa in funcs:
+                    name = fa.get("name", "")
+                    runtime = fa.get("siteConfig", {}).get("linuxFxVersion", "") or ""
+                    node_ver = fa.get("siteConfig", {}).get("nodeVersion", "") or ""
+                    rg = fa.get("resourceGroup", "")
+
+                    items.append({
+                        "id": f"azure:ws:func:{name}",
+                        "dimension": "azure",
+                        "host": "ws",
+                        "project": None,
+                        "package": f"func:{name}",
+                        "current": runtime or node_ver or "unknown",
+                        "available": "check",
+                        "source_tag": "azure-func",
+                        "is_security": False,
+                        "deps": [], "required_by": [],
+                        "dep_count": 0, "required_by_count": 0,
+                        "cluster_id": None,
+                        "classification": None, "reason": None, "source": None,
+                        "rule_matched": None, "approved": None,
+                        "apply_cmd": f"az functionapp config set -n {name} -g {rg}",
+                        "cross_refs": [],
+                        "intel": {"runtime": runtime, "resource_group": rg},
+                        "scanned_at": now,
+                    })
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Cosmos DB accounts
+        ok, cosmos_out = ssh_cmd(
+            host,
+            "az cosmosdb list --output json 2>/dev/null",
+            timeout=20,
+        )
+        if ok and cosmos_out and cosmos_out.strip().startswith("["):
+            try:
+                dbs = json.loads(cosmos_out)
+                for db in dbs:
+                    name = db.get("name", "")
+                    kind = db.get("kind", "")
+                    offer = db.get("databaseAccountOfferType", "")
+                    cap = db.get("capabilities", [])
+                    cap_names = [c.get("name", "") for c in cap] if cap else []
+
+                    items.append({
+                        "id": f"azure:ws:cosmos:{name}",
+                        "dimension": "azure",
+                        "host": "ws",
+                        "project": None,
+                        "package": f"cosmos:{name}",
+                        "current": f"{kind}, {offer}" + (f", caps={','.join(cap_names)}" if cap_names else ""),
+                        "available": "check",
+                        "source_tag": "azure-cosmos",
+                        "is_security": False,
+                        "deps": [], "required_by": [],
+                        "dep_count": 0, "required_by_count": 0,
+                        "cluster_id": None,
+                        "classification": None, "reason": None, "source": None,
+                        "rule_matched": None, "approved": None,
+                        "apply_cmd": f"Review in Azure Portal",
+                        "cross_refs": [],
+                        "intel": {"kind": kind, "capabilities": cap_names},
+                        "scanned_at": now,
+                    })
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    return items
+
+
 # ── Stub scanners ────────────────────────────────────────────────────────────
 
-def _scan_npm(hosts): return []
 def _scan_cargo(hosts): return []
 def _scan_github_actions(): return []
 def _scan_docker(hosts): return []
-def _scan_azure(): return []
-def _scan_infra(hosts): return []
-def _scan_devtools(hosts): return []
 
 
 # ── Stage 2: Clustering ─────────────────────────────────────────────────────
@@ -504,9 +1158,108 @@ def _identify_hub_packages(pip_items):
     return hub_pkgs
 
 
+MAX_CLUSTER_SIZE = 30  # clusters above this get split by promoting internal hubs
+
+
+def _connected_components(group, excluded_keys):
+    """Run union-find on a group of pip items, skipping excluded package keys.
+    Returns list of lists (each sub-list is a connected component)."""
+    parent = {}
+    def find(x):
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    # Build lookup for this group only
+    pkg_to_id = {}
+    for item in group:
+        key = (item["host"], item["package"].lower())
+        if key not in excluded_keys:
+            pkg_to_id[key] = item["id"]
+
+    for item in group:
+        key = (item["host"], item["package"].lower())
+        if key in excluded_keys:
+            continue
+        for dep in item.get("deps", []):
+            dep_key = (item["host"], dep.lower())
+            if dep_key in pkg_to_id:
+                union(item["id"], pkg_to_id[dep_key])
+        for rb in item.get("required_by", []):
+            rb_key = (item["host"], rb.lower())
+            if rb_key in pkg_to_id:
+                union(item["id"], pkg_to_id[rb_key])
+
+    comps = {}
+    for item in group:
+        key = (item["host"], item["package"].lower())
+        if key in excluded_keys:
+            continue
+        root = find(item["id"])
+        if root not in comps:
+            comps[root] = []
+        comps[root].append(item)
+    return list(comps.values())
+
+
+def _split_oversized(group, hub_pkg_keys):
+    """If a component exceeds MAX_CLUSTER_SIZE, iteratively promote the
+    highest-fanout internal package as a local hub and re-split.
+    Returns (sub_groups, promoted_items) where promoted_items get their own cluster."""
+    promoted = []
+    local_hubs = set(hub_pkg_keys)  # start with global hubs
+
+    remaining = list(group)
+    for _ in range(20):  # safety cap on iterations
+        # Re-run connected components with current exclusions
+        comps = _connected_components(remaining, local_hubs)
+        # Find any oversized component
+        oversized = [c for c in comps if len(c) > MAX_CLUSTER_SIZE]
+        if not oversized:
+            return comps, promoted
+
+        # In the largest oversized component, find the top bridge node
+        biggest = max(oversized, key=len)
+        # Score by required_by_count (how many items in THIS group depend on it)
+        pkg_set = {(i["host"], i["package"].lower()) for i in biggest}
+        scores = []
+        for item in biggest:
+            key = (item["host"], item["package"].lower())
+            if key in local_hubs:
+                continue
+            # Count edges within this component
+            edges = 0
+            for dep in item.get("deps", []):
+                if (item["host"], dep.lower()) in pkg_set:
+                    edges += 1
+            for rb in item.get("required_by", []):
+                if (item["host"], rb.lower()) in pkg_set:
+                    edges += 1
+            scores.append((edges, item.get("required_by_count", 0), item))
+        if not scores:
+            break
+        scores.sort(key=lambda x: (-x[0], -x[1]))
+        # Promote the top connector
+        promote_item = scores[0][2]
+        promote_key = (promote_item["host"], promote_item["package"].lower())
+        local_hubs.add(promote_key)
+        promoted.append(promote_item)
+        remaining = [i for i in remaining if (i["host"], i["package"].lower()) != promote_key]
+
+    # Final pass
+    comps = _connected_components(remaining, local_hubs)
+    return comps, promoted
+
+
 def _build_dynamic_clusters(items, hub_pkg_keys):
     """Group unmatched pip items by connected components, skipping hub packages
-    as edge nodes (they get their own cluster). This prevents mega-clusters."""
+    as edge nodes (they get their own cluster). This prevents mega-clusters.
+    Oversized components are split by promoting internal bridge nodes."""
     if not items:
         return {}, []
 
@@ -520,45 +1273,26 @@ def _build_dynamic_clusters(items, hub_pkg_keys):
         if key not in hub_pkg_keys:
             pkg_to_item[key] = item
 
-    # Union-Find
-    parent = {}
-    def find(x):
-        while parent.get(x, x) != x:
-            parent[x] = parent.get(parent[x], parent[x])
-            x = parent[x]
-        return x
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
+    # Initial connected components
+    initial_comps = _connected_components(
+        [pkg_to_item[k] for k in pkg_to_item], hub_pkg_keys
+    )
 
-    # Connect items that share deps (but skip hub package edges)
-    for (host, pkg), item in pkg_to_item.items():
-        item_key = item["id"]
-        for dep in item.get("deps", []):
-            dep_key = (host, dep.lower())
-            if dep_key in pkg_to_item:  # only connect to non-hub items
-                union(item_key, pkg_to_item[dep_key]["id"])
-        for rb in item.get("required_by", []):
-            rb_key = (host, rb.lower())
-            if rb_key in pkg_to_item:
-                union(item_key, pkg_to_item[rb_key]["id"])
-
-    # Group by component
-    components = {}
-    for item in pip_items:
-        key = (item["host"], item["package"].lower())
-        if key in hub_pkg_keys:
-            continue  # hub packages handled separately
-        root = find(item["id"])
-        if root not in components:
-            components[root] = []
-        components[root].append(item)
+    # Split any oversized components
+    all_groups = []
+    promoted_items = []
+    for comp in initial_comps:
+        if len(comp) > MAX_CLUSTER_SIZE:
+            sub_groups, promoted = _split_oversized(comp, hub_pkg_keys)
+            all_groups.extend(sub_groups)
+            promoted_items.extend(promoted)
+        else:
+            all_groups.append(comp)
 
     # Create clusters for multi-item components
     clusters = {}
     solo_items = list(non_pip)
-    for root, group in components.items():
+    for group in all_groups:
         if len(group) >= 2:
             host = group[0]["host"]
             names = sorted(i["package"] for i in group)
@@ -576,6 +1310,23 @@ def _build_dynamic_clusters(items, hub_pkg_keys):
                 item["cluster_id"] = cid
         else:
             solo_items.extend(group)
+
+    # Promoted items become their own single-item clusters (local hubs)
+    for item in promoted_items:
+        host = item["host"]
+        pkg = item["package"].lower().replace(" ", "_")
+        cid = f"promoted__{host}__{pkg}"
+        clusters[cid] = {
+            "id": cid,
+            "name": f"{item['package']} (bridge)",
+            "hosts": [host],
+            "dimension": "pip",
+            "item_ids": [item["id"]],
+            "item_count": 1,
+            "static": False,
+            "tier": "bridge",
+        }
+        item["cluster_id"] = cid
 
     return clusters, solo_items
 
@@ -790,6 +1541,27 @@ def _get_github_repo_from_pypi(package_name):
     return None
 
 
+def _get_github_repo_from_npm(package_name):
+    """Get GitHub owner/repo from npm registry metadata. Returns 'owner/repo' or None."""
+    import urllib.request
+    import urllib.error
+    try:
+        url = f"https://registry.npmjs.org/{package_name}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "oi-webui",
+            "Accept": "application/vnd.npm.install-v1+json",
+        })
+        data = json.loads(urllib.request.urlopen(req, timeout=8).read())
+        repo = data.get("repository") or {}
+        repo_url = repo.get("url", "") if isinstance(repo, dict) else str(repo)
+        m = re.match(r"(?:git\+)?https?://github\.com/([^/]+/[^/]+?)(?:\.git)?(?:/.*)?$", repo_url)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
 def _fetch_release_notes(github_repo, current_version, available_version):
     """Fetch release notes for all versions between current and available.
     Returns list of {version, date, notes} dicts, newest first."""
@@ -826,7 +1598,7 @@ def _fetch_release_notes(github_repo, current_version, available_version):
         if not (current_v < v <= available_v):
             continue
 
-        body = r.get("body", "")
+        body = r.get("body") or ""
         # Clean: strip images, code blocks, HTML tags
         lines = []
         in_code = False
@@ -851,17 +1623,29 @@ def _fetch_release_notes(github_repo, current_version, available_version):
 
 
 def _gather_cluster_release_notes(items):
-    """For each pip item in a cluster, fetch release notes for intermediate versions.
+    """For each pip/npm item in a cluster, fetch release notes for intermediate versions.
     Returns {package_name: [release_notes]} dict. Runs in parallel threads."""
-    pip_items = [i for i in items if i.get("dimension") == "pip"]
-    if not pip_items:
+    eligible = [i for i in items if i.get("dimension") in ("pip", "npm")]
+    if not eligible:
         return {}
+
+    # Deduplicate by package name (same package may appear in multiple projects)
+    seen = set()
+    unique = []
+    for i in eligible:
+        if i["package"] not in seen:
+            seen.add(i["package"])
+            unique.append(i)
 
     results = {}
 
     def _fetch_one(item):
         pkg = item["package"]
-        repo = _get_github_repo_from_pypi(pkg)
+        dim = item.get("dimension")
+        if dim == "pip":
+            repo = _get_github_repo_from_pypi(pkg)
+        else:
+            repo = _get_github_repo_from_npm(pkg)
         if not repo:
             return
         notes = _fetch_release_notes(repo, item.get("current", ""), item.get("available", ""))
@@ -872,7 +1656,7 @@ def _gather_cluster_release_notes(items):
                 "releases_skipped": len(notes),
             }
 
-    threads = [threading.Thread(target=_fetch_one, args=(i,), daemon=True) for i in pip_items]
+    threads = [threading.Thread(target=_fetch_one, args=(i,), daemon=True) for i in unique]
     for t in threads:
         t.start()
     for t in threads:
@@ -933,57 +1717,136 @@ def _parse_cluster_analysis(raw_text):
 
 def _scan_actual_usage(cluster, items):
     """Grep affected projects for actual imports of each package in the cluster.
-    Returns {package_name: {project_key: [import_lines]}} dict."""
-    pip_items = [i for i in items if i.get("dimension") == "pip"]
-    if not pip_items:
-        return {}
-
-    # Build package names to search for (normalize: trl, peft, accelerate, etc.)
-    # Python import names often differ from pip names (e.g., scikit-learn → sklearn)
-    # but for most packages they match or are close enough
-    pkg_names = [i["package"].lower().replace("-", "_").replace(".", "_") for i in pip_items]
-    pkg_display = {i["package"].lower().replace("-", "_").replace(".", "_"): i["package"] for i in pip_items}
-
-    # Build grep pattern: "from pkg|import pkg" for all packages
-    patterns = "|".join(f"from {p}|import {p}" for p in pkg_names)
-
-    # Get affected projects on each host
+    Returns {package_name: {project_key: [import_lines]}} dict.
+    Handles pip (Python imports) and npm (JS/TS imports) items."""
     usage = {}
-    for proj in cluster.get("projects", []):
-        pkey = proj.get("key", "")
-        pdata = PROJECTS.get(pkey, {})
-        host = pdata.get("host", "")
-        path = pdata.get("path", "")
-        if not host or not path:
-            continue
 
-        ok, output = ssh_cmd(
-            host,
-            f"grep -rh --include='*.py' -E '{patterns}' {path}/ 2>/dev/null | sort -u | head -30",
-            timeout=10,
-        )
-        if not ok or not output.strip():
-            continue
+    # ── pip items: grep Python imports ──
+    pip_items = [i for i in items if i.get("dimension") == "pip"]
+    if pip_items:
+        pkg_names = [i["package"].lower().replace("-", "_").replace(".", "_") for i in pip_items]
+        pkg_display = {i["package"].lower().replace("-", "_").replace(".", "_"): i["package"] for i in pip_items}
+        patterns = "|".join(f"from {p}|import {p}" for p in pkg_names)
 
-        for line in output.strip().split("\n"):
-            line = line.strip()
-            if not line:
+        for proj in cluster.get("projects", []):
+            pkey = proj.get("key", "")
+            pdata = PROJECTS.get(pkey, {})
+            host = pdata.get("host", "")
+            path = pdata.get("path", "")
+            if not host or not path:
                 continue
-            # Match which package this import belongs to
-            for pkg_norm, pkg_orig in pkg_display.items():
-                if f"from {pkg_norm}" in line or f"import {pkg_norm}" in line:
-                    if pkg_orig not in usage:
-                        usage[pkg_orig] = {}
-                    if pkey not in usage[pkg_orig]:
-                        usage[pkg_orig][pkey] = []
-                    usage[pkg_orig][pkey].append(line)
-                    break
+
+            ok, output = ssh_cmd(
+                host,
+                f"grep -rh --include='*.py' -E '{patterns}' {path}/ 2>/dev/null | sort -u | head -30",
+                timeout=10,
+            )
+            if not ok or not output.strip():
+                continue
+
+            for line in output.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                for pkg_norm, pkg_orig in pkg_display.items():
+                    if f"from {pkg_norm}" in line or f"import {pkg_norm}" in line:
+                        if pkg_orig not in usage:
+                            usage[pkg_orig] = {}
+                        if pkey not in usage[pkg_orig]:
+                            usage[pkg_orig][pkey] = []
+                        usage[pkg_orig][pkey].append(line)
+                        break
+
+    # ── npm items: grep JS/TS require/import ──
+    npm_items = [i for i in items if i.get("dimension") == "npm"]
+    if npm_items:
+        # Build package names — npm names used as-is (e.g., @azure/cosmos, react-router-dom)
+        npm_pkgs = list({i["package"] for i in npm_items})
+        # Grep pattern: require('pkg') or from 'pkg' or from "pkg"
+        # Escape @ and / for grep
+        escaped = [p.replace("/", "\\/").replace("@", "\\@") for p in npm_pkgs]
+        patterns = "|".join(
+            f"require\\(['\"]({e})" + f"|from ['\"]({e})" for e in escaped
+        )
+
+        for proj in cluster.get("projects", []):
+            pkey = proj.get("key", "")
+            pdata = PROJECTS.get(pkey, {})
+            host = pdata.get("host", "")
+            path = pdata.get("path", "")
+            if not host or not path:
+                continue
+
+            ok, output = ssh_cmd(
+                host,
+                f"grep -rh --include='*.js' --include='*.ts' --include='*.tsx' --include='*.jsx' "
+                f"-E '{patterns}' {path}/src/ {path}/lib/ {path}/backend/ 2>/dev/null | sort -u | head -30",
+                timeout=10,
+            )
+            if not ok or not output.strip():
+                continue
+
+            for line in output.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                for pkg in npm_pkgs:
+                    if pkg in line:
+                        if pkg not in usage:
+                            usage[pkg] = {}
+                        if pkey not in usage[pkg]:
+                            usage[pkg][pkey] = []
+                        usage[pkg][pkey].append(line)
+                        break
 
     return usage
 
 
 _analysis_lock = threading.Lock()
 _analysis_state = {}  # {cluster_id: "pending"|"running"|"done"|"error"}
+
+
+REGROUP_PROMPT = """\
+You are grouping {count} Python/npm packages into logical clusters for update analysis.
+Each group should contain packages that belong together — same ecosystem, same purpose, \
+or packages that depend on each other. Aim for groups of 5-25 packages.
+
+Package list (name: current → available, deps):
+{package_list}
+
+Respond with ONLY a JSON object — no markdown, no explanation:
+{{"groups": [{{"name": "short group name", "packages": ["pkg1", "pkg2"]}}, ...]}}
+
+Every package must appear in exactly one group. Use descriptive names like \
+"NVIDIA CUDA", "Google Cloud", "LLM Clients", "Web Framework", "Testing", etc."""
+
+
+def _llm_regroup_cluster(items):
+    """Ask LLM to group a large set of packages into logical sub-clusters.
+    Returns list of {"name": str, "packages": [str]} or None on failure."""
+    pkg_lines = []
+    for item in items:
+        deps = item.get("required_by", [])[:5]
+        dep_str = f" (needed by: {', '.join(deps)})" if deps else ""
+        pkg_lines.append(
+            f"  {item['package']}: {item.get('current', '?')} → {item.get('available', '?')}{dep_str}"
+        )
+
+    user_msg = REGROUP_PROMPT.format(
+        count=len(items),
+        package_list="\n".join(pkg_lines),
+    )
+
+    result = llm_query(
+        DEFAULT_MODEL,
+        "You are a package management expert. Respond with ONLY JSON.",
+        user_msg,
+        timeout=60, temperature=0.3, num_predict=4096,
+    )
+
+    if result and isinstance(result, dict) and "groups" in result:
+        return result["groups"]
+    return None
 
 
 def _analyze_single_cluster(cluster, items, config):
@@ -1038,8 +1901,9 @@ def _analyze_single_cluster(cluster, items, config):
             if item.get("required_by"):
                 deps_str = f"\n  Required by: {', '.join(item['required_by'][:5])}"
             semver = ""
-            if item.get("intel", {}).get("semver_change"):
-                semver = f" [{item['intel']['semver_change']}]"
+            intel = item.get("intel") or {}
+            if intel.get("semver_change"):
+                semver = f" [{intel['semver_change']}]"
 
             section = (
                 f"=== {pkg} {item.get('current', '?')} → "
@@ -1083,15 +1947,20 @@ def _analyze_single_cluster(cluster, items, config):
             if raw:
                 result = _parse_cluster_analysis(raw)
 
-        if result:
-            cluster["analysis"] = result
-            cluster["analyzed_at"] = int(time.time())
+        if not result:
+            cluster["analysis"] = {"error": "LLM returned no result"}
+            with _analysis_lock:
+                _analysis_state[cluster_id] = "error"
+            return
 
-            # Apply per-item classifications (tag-based: keyed by package name)
-            item_decisions = result.get("items", {}) if isinstance(result, dict) else {}
+        cluster["analysis"] = result
+        cluster["analyzed_at"] = int(time.time())
+
+        # Apply per-item classifications (tag-based: keyed by package name)
+        item_decisions = result.get("items", {}) if isinstance(result, dict) else {}
+        if isinstance(item_decisions, dict):
             for item in items:
                 pkg = item.get("package", "")
-                # Try exact match, then case-insensitive
                 d = item_decisions.get(pkg) or item_decisions.get(pkg.lower())
                 if isinstance(d, dict):
                     item["classification"] = d.get("classification", "review")
@@ -1107,8 +1976,112 @@ def _analyze_single_cluster(cluster, items, config):
             _analysis_state[cluster_id] = "error"
 
 
+def _regroup_oversized(cluster_id, clusters, item_map, results):
+    """Split an oversized cluster into LLM-determined sub-clusters.
+    Modifies clusters dict in place: removes parent, adds children.
+    Returns list of new cluster IDs, or empty list on failure."""
+    cluster = clusters.get(cluster_id)
+    if not cluster:
+        return []
+
+    cluster_items = [item_map[iid] for iid in cluster.get("item_ids", []) if iid in item_map]
+    if len(cluster_items) <= MAX_CLUSTER_SIZE:
+        return []
+
+    with _analysis_lock:
+        _analysis_state[cluster_id] = "regrouping"
+
+    groups = _llm_regroup_cluster(cluster_items)
+    if not groups:
+        return []
+
+    # Build package→item lookup
+    pkg_map = {i["package"].lower(): i for i in cluster_items}
+    # Also try exact case
+    pkg_map_exact = {i["package"]: i for i in cluster_items}
+
+    new_cids = []
+    assigned = set()
+
+    for g in groups:
+        gname = g.get("name", "Unnamed")
+        gpkgs = g.get("packages", [])
+        if not gpkgs:
+            continue
+
+        gitems = []
+        for p in gpkgs:
+            item = pkg_map_exact.get(p) or pkg_map.get(p.lower())
+            if item and item["id"] not in assigned:
+                gitems.append(item)
+                assigned.add(item["id"])
+
+        if not gitems:
+            continue
+
+        host = cluster.get("hosts", ["unknown"])[0]
+        safe = re.sub(r'[^a-z0-9_]', '_', gname.lower())[:30].strip("_")
+        safe = re.sub(r'_+', '_', safe)
+        cid = f"regrouped__{host}__{safe}"
+        # Ensure unique
+        if cid in clusters:
+            cid = f"{cid}_{len(new_cids)}"
+
+        clusters[cid] = {
+            "id": cid,
+            "name": gname,
+            "hosts": cluster.get("hosts", []),
+            "dimension": cluster.get("dimension", "pip"),
+            "item_ids": [i["id"] for i in gitems],
+            "item_count": len(gitems),
+            "static": False,
+            "tier": "regrouped",
+            "parent_cluster": cluster_id,
+            "projects": cluster.get("projects", []),
+            "host_roles": cluster.get("host_roles", []),
+            "risk_score": sum(i.get("required_by_count", 0) for i in gitems),
+        }
+        for item in gitems:
+            item["cluster_id"] = cid
+        new_cids.append(cid)
+
+    # Any unassigned items stay in a remainder cluster
+    unassigned = [i for i in cluster_items if i["id"] not in assigned]
+    if unassigned:
+        host = cluster.get("hosts", ["unknown"])[0]
+        rem_cid = f"regrouped__{host}__other"
+        if rem_cid in clusters:
+            rem_cid = f"{rem_cid}_{len(new_cids)}"
+        clusters[rem_cid] = {
+            "id": rem_cid,
+            "name": f"Other ({host.upper()})",
+            "hosts": cluster.get("hosts", []),
+            "dimension": cluster.get("dimension", "pip"),
+            "item_ids": [i["id"] for i in unassigned],
+            "item_count": len(unassigned),
+            "static": False,
+            "tier": "regrouped",
+            "parent_cluster": cluster_id,
+            "projects": cluster.get("projects", []),
+            "host_roles": cluster.get("host_roles", []),
+            "risk_score": sum(i.get("required_by_count", 0) for i in unassigned),
+        }
+        for item in unassigned:
+            item["cluster_id"] = rem_cid
+        new_cids.append(rem_cid)
+
+    # Remove the parent cluster
+    if new_cids:
+        del clusters[cluster_id]
+        with _analysis_lock:
+            _analysis_state[cluster_id] = "regrouped"
+
+    return new_cids
+
+
 def analyze_clusters(cluster_ids=None):
-    """Run LLM analysis on clusters. Runs in background threads (max 3 concurrent)."""
+    """Run LLM analysis on clusters. Runs in background threads (max 3 concurrent).
+    Oversized clusters get LLM-regrouped first, then each sub-cluster is analyzed."""
     scan_data = load_scan()
     results = scan_data.get("results", [])
     clusters = scan_data.get("clusters", {})
@@ -1116,24 +2089,47 @@ def analyze_clusters(cluster_ids=None):
     config = load_updates_config()
 
     targets = cluster_ids or list(clusters.keys())
-    # Filter to clusters that have items and aren't already analyzed
+    # Filter: explicit cluster_ids always re-analyze; bulk analyze skips already-done
     to_analyze = []
     for cid in targets:
         cluster = clusters.get(cid)
         if cluster and cluster.get("item_count", 0) > 0:
-            if not cluster_ids or not cluster.get("analysis"):
+            if cluster_ids or not cluster.get("analysis"):
                 to_analyze.append(cid)
 
     if not to_analyze:
         return {"status": "nothing_to_analyze", "clusters": 0}
 
-    # Initialize state
+    # Phase 1: Regroup oversized clusters (sequential, modifies clusters dict)
+    regrouped = []
+    still_to_analyze = []
+    for cid in to_analyze:
+        cluster = clusters.get(cid)
+        if not cluster:
+            continue
+        if cluster.get("item_count", 0) > MAX_CLUSTER_SIZE:
+            new_cids = _regroup_oversized(cid, clusters, item_map, results)
+            if new_cids:
+                regrouped.extend(new_cids)
+                _save_scan(results, clusters)
+                continue
+        still_to_analyze.append(cid)
+
+    # Add regrouped sub-clusters to the analysis queue
+    still_to_analyze.extend(regrouped)
+
+    if not still_to_analyze:
+        return {"status": "nothing_to_analyze", "clusters": 0, "regrouped": len(regrouped)}
+
+    # Phase 2: Initialize state and run analysis
     with _analysis_lock:
-        for cid in to_analyze:
+        for cid in still_to_analyze:
             _analysis_state[cid] = "pending"
 
     def _worker(cid):
-        cluster = clusters[cid]
+        cluster = clusters.get(cid)
+        if not cluster:
+            return
         cluster_items = [item_map[iid] for iid in cluster.get("item_ids", []) if iid in item_map]
         _analyze_single_cluster(cluster, cluster_items, config)
         # Save after each cluster completes
@@ -1146,7 +2142,7 @@ def analyze_clusters(cluster_ids=None):
             _worker(cid)
 
     threads = []
-    for cid in to_analyze:
+    for cid in still_to_analyze:
         t = threading.Thread(target=_throttled, args=(cid,), daemon=True)
         t.start()
         threads.append(t)
@@ -1154,8 +2150,9 @@ def analyze_clusters(cluster_ids=None):
     # Don't block — return immediately, frontend polls status
     return {
         "status": "started",
-        "clusters": len(to_analyze),
-        "cluster_ids": to_analyze,
+        "clusters": len(still_to_analyze),
+        "cluster_ids": still_to_analyze,
+        "regrouped": len(regrouped),
     }
 
 
@@ -1369,12 +2366,16 @@ def scan(dimensions=None, hosts=None):
 
 # ── Scan persistence ─────────────────────────────────────────────────────────
 
+_save_lock = threading.Lock()
+
+
 def _save_scan(results, clusters=None):
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    data = {"ts": int(time.time()), "results": results}
-    if clusters is not None:
-        data["clusters"] = clusters
-    SCAN_FILE.write_text(json.dumps(data, indent=2) + "\n")
+    with _save_lock:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        data = {"ts": int(time.time()), "results": results}
+        if clusters is not None:
+            data["clusters"] = clusters
+        SCAN_FILE.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def load_scan():
@@ -1426,7 +2427,7 @@ def _generate_commands(items):
     for item in items:
         host = item.get("host", "unknown")
         if host not in by_host:
-            by_host[host] = {"apt": [], "pip": [], "other": []}
+            by_host[host] = {"apt": [], "pip": [], "npm": [], "other": []}
         dim = item.get("dimension", "other")
         if dim in by_host[host]:
             by_host[host][dim].append(item)
@@ -1442,15 +2443,35 @@ def _generate_commands(items):
         pip_specs = [f"{i['package']}=={i['available']}" for i in groups.get("pip", [])]
         if pip_specs:
             host_cmds.append(f"pip install --upgrade {' '.join(pip_specs)}")
+        # npm: group global installs, per-project installs grouped by project path
+        npm_items = groups.get("npm", [])
+        npm_global = [i for i in npm_items if not i.get("project")]
+        npm_project = [i for i in npm_items if i.get("project")]
+        if npm_global:
+            specs = [f"{i['package']}@{i['available']}" for i in npm_global]
+            host_cmds.append(f"npm -g install {' '.join(specs)}")
+        # Group project npm items by project path (from apply_cmd)
+        proj_groups = {}
+        for i in npm_project:
+            pkey = i.get("project", "")
+            pdata = PROJECTS.get(pkey, {})
+            path = pdata.get("path", "")
+            if path not in proj_groups:
+                proj_groups[path] = []
+            proj_groups[path].append(i)
+        for path, pitems in proj_groups.items():
+            specs = [f"{i['package']}@{i['available']}" for i in pitems]
+            host_cmds.append(f"cd {path} && npm install {' '.join(specs)}")
         for item in groups.get("other", []):
             cmd = item.get("apply_cmd")
             if cmd:
                 host_cmds.append(cmd)
+        total = len(apt_pkgs) + len(groups.get("pip", [])) + len(npm_items) + len(groups.get("other", []))
         if host_cmds:
             host_name = HOSTS.get(host, {}).get("name", host)
             commands[host] = {
                 "host_name": host_name, "commands": host_cmds,
-                "count": len(apt_pkgs) + len(groups.get("pip", [])) + len(groups.get("other", [])),
+                "count": total,
             }
     return commands
 
@@ -1589,9 +2610,118 @@ def deploy_cluster_script(cluster_id, excluded=None):
                 "error": f"Deploy failed: {output[:200]}",
             })
 
+    # Track deployment
+    cluster["deployed_at"] = int(time.time())
+    _save_scan(results, clusters)
+
     return {
         "ok": True,
         "cluster_name": cluster.get("name", cluster_id),
+        "deployed": deployed,
+    }
+
+
+def deploy_bulk(cluster_ids, excluded=None):
+    """Deploy multiple clusters as one script per host.
+    Combines all items from selected clusters, grouped by dimension."""
+    scan_data = load_scan()
+    results = scan_data.get("results", [])
+    clusters = scan_data.get("clusters", {})
+    item_map = {i["id"]: i for i in results}
+    excluded_set = set(excluded or [])
+
+    # Gather all items from selected clusters
+    all_items = []
+    deployed_cids = []
+    for cid in cluster_ids:
+        cluster = clusters.get(cid)
+        if not cluster:
+            continue
+        cluster_items = [item_map[iid] for iid in cluster.get("item_ids", []) if iid in item_map]
+        approved = [i for i in cluster_items
+                    if i.get("classification") != "blocked" and i["id"] not in excluded_set]
+        all_items.extend(approved)
+        deployed_cids.append(cid)
+
+    if not all_items:
+        return {"ok": False, "error": "No items to deploy"}
+
+    # Group by host
+    by_host = {}
+    for item in all_items:
+        h = item.get("host", "unknown")
+        by_host.setdefault(h, []).append(item)
+
+    date_str = time.strftime("%Y-%m-%d")
+    deployed = []
+
+    for host, items in by_host.items():
+        commands = _generate_commands(items)
+        host_data = commands.get(host, {"commands": []})
+        if not host_data.get("commands"):
+            continue
+
+        host_name = HOSTS.get(host, {}).get("name", host)
+        script_dir = "~/oi-scripts/bulk"
+        script_path = f"{script_dir}/update-{date_str}.sh"
+
+        # Build script with cluster sections
+        lines = [
+            "#!/bin/bash",
+            f"# Bulk update — {len(deployed_cids)} clusters, {len(items)} items",
+            f"# Host: {host_name}",
+            f"# Generated: {time.strftime('%Y-%m-%d %H:%M')} by OI WebUI",
+            "",
+        ]
+
+        # List included clusters
+        for cid in deployed_cids:
+            c = clusters.get(cid, {})
+            if host in c.get("hosts", []):
+                a = c.get("analysis", {})
+                rec = a.get("recommendation", "?") if isinstance(a, dict) else "?"
+                lines.append(f"# - {c.get('name', cid)} ({rec})")
+        lines.append("")
+        lines.append("set -euo pipefail")
+        lines.append("")
+
+        for cmd in host_data["commands"]:
+            lines.append(f'echo "=== {cmd.split()[0]} ==="')
+            lines.append(cmd)
+            lines.append("")
+
+        lines.append('echo "Done."')
+        script_content = "\n".join(lines)
+
+        deploy_cmd = (
+            f"mkdir -p {script_dir} && "
+            f"cat > {script_path} << 'OISCRIPT'\n{script_content}\nOISCRIPT\n"
+            f"chmod +x {script_path} && echo 'OK'"
+        )
+
+        ok, output = ssh_cmd(host, deploy_cmd, timeout=15)
+        if ok and "OK" in output:
+            deployed.append({
+                "host": host, "host_name": host_name,
+                "path": script_path, "items": len(items),
+                "commands": len(host_data["commands"]),
+            })
+        else:
+            deployed.append({
+                "host": host, "host_name": host_name,
+                "error": f"Deploy failed: {output[:200]}",
+            })
+
+    # Track deployment on all clusters
+    now = int(time.time())
+    for cid in deployed_cids:
+        if cid in clusters:
+            clusters[cid]["deployed_at"] = now
+    _save_scan(results, clusters)
+
+    return {
+        "ok": True,
+        "clusters": len(deployed_cids),
         "deployed": deployed,
     }
 
@@ -1767,6 +2897,7 @@ def get_overview():
             "influenced_clusters": c.get("influenced_clusters", []),
             "analysis": {k: v for k, v in c["analysis"].items() if k != "raw"} if isinstance(c.get("analysis"), dict) else c.get("analysis"),
             "analyzed_at": c.get("analyzed_at"),
+            "deployed_at": c.get("deployed_at"),
             "description": c.get("description", ""),
         })
 

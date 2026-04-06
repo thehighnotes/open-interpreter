@@ -3,8 +3,9 @@
 const Updates = {
   _data: null,
   _approvals: {},
-  _filter: { host: null, dimension: null },
+  _filter: { host: null, dimension: null, text: '', analyzed: false },
   _expandedClusters: {},
+  _selectedClusters: {},
   _analyzeTimer: null,
 
   _esc(str) {
@@ -67,13 +68,20 @@ const Updates = {
         const active = f[key] === value ? 'badge-info' : '';
         return `<span class="badge ${active}" style="cursor:pointer" onclick="Updates.setFilter('${key}',${value === null ? 'null' : `'${value}'`})">${label}</span>`;
       };
+      const dims = [...new Set(clusters.map(c => c.dimension).filter(Boolean))].sort();
+      const analyzedActive = f.analyzed ? 'badge-info' : '';
       html += `<div style="display:flex;gap:var(--space-xs);margin-bottom:var(--space-md);flex-wrap:wrap;align-items:center">
+        <input type="text" class="input" placeholder="Search clusters..." value="${this._esc(f.text || '')}"
+          style="width:160px;font-size:var(--font-size-xs);padding:2px 8px;height:24px"
+          oninput="Updates.setFilter('text', this.value)">
+        <span style="color:var(--border-secondary);margin:0 2px">|</span>
         ${filterBtn('All Hosts', 'host', null)}
         ${Object.entries(hosts).map(([k, name]) => filterBtn(name, 'host', k)).join('')}
-        <span style="color:var(--border-secondary);margin:0 var(--space-xs)">|</span>
+        <span style="color:var(--border-secondary);margin:0 2px">|</span>
         ${filterBtn('All Types', 'dimension', null)}
-        ${filterBtn('apt', 'dimension', 'apt')}
-        ${filterBtn('pip', 'dimension', 'pip')}
+        ${dims.map(d => filterBtn(d, 'dimension', d)).join('')}
+        <span style="color:var(--border-secondary);margin:0 2px">|</span>
+        <span class="badge ${analyzedActive}" style="cursor:pointer" onclick="Updates.toggleAnalyzed()">Analyzed</span>
       </div>`;
     }
 
@@ -97,6 +105,19 @@ const Updates = {
           <button class="btn btn-sm" onclick="Updates.refreshInsights()">Refresh</button>
         </div>
       `, { open: false });
+    }
+
+    // ── Selection action bar ──────────────────────────────────────────
+    const selectedCount = Object.values(this._selectedClusters).filter(Boolean).length;
+    const analyzedClusters = clusters.filter(c => c.analysis && !c.analysis.error);
+    if (analyzedClusters.length > 0) {
+      html += `<div style="display:flex;gap:var(--space-xs);margin-bottom:var(--space-sm);align-items:center;flex-wrap:wrap">
+        <button class="btn btn-sm" onclick="Updates.selectAllAnalyzed()">Select All Analyzed</button>
+        ${selectedCount > 0 ? `
+          <button class="btn btn-sm" onclick="Updates.clearSelection()">Clear (${selectedCount})</button>
+          <button class="btn btn-sm" style="background:var(--accent-primary);color:#fff" onclick="Updates.deploySelected()">Deploy ${selectedCount} Selected</button>
+        ` : ''}
+      </div>`;
     }
 
     // ── Render clusters by tier ────────────────────────────────────────
@@ -152,6 +173,12 @@ const Updates = {
     }
 
     container.innerHTML = html;
+
+    // Restore search input focus if it was active
+    if (this._filter.text) {
+      const input = container.querySelector('input[placeholder="Search clusters..."]');
+      if (input) { input.focus(); input.selectionStart = input.selectionEnd = input.value.length; }
+    }
   },
 
   // ── Cluster rendering ───────────────────────────────────────────────────
@@ -159,7 +186,8 @@ const Updates = {
   _renderCluster(cluster, results) {
     const cid = cluster.id;
     const expanded = this._expandedClusters[cid];
-    const hosts = cluster.hosts ? cluster.hosts.join(', ') : '';
+    const hostNames = {'nano': 'Nano', 'agx': 'AGX', 'ws': 'WS', 'vps': 'VPS'};
+    const hosts = cluster.hosts ? cluster.hosts.map(h => hostNames[h] || h).join(', ') : '';
     const a = (cluster.analysis && typeof cluster.analysis === 'object' && !cluster.analysis.error) ? cluster.analysis : null;
 
     // ── Traffic light badge ──────────────────────────────────────────
@@ -181,9 +209,13 @@ const Updates = {
     if (breakingCount) summaryChips += `<span style="color:var(--status-error);font-size:var(--font-size-xs)">${breakingCount} breaking</span>`;
     if (newCount) summaryChips += `<span style="color:var(--status-success);font-size:var(--font-size-xs)">${newCount} new</span>`;
 
+    const deployedBadge = cluster.deployed_at
+      ? `<span style="font-size:0.6rem;font-weight:600;color:var(--status-success);background:rgba(50,200,50,0.12);padding:1px 6px;border-radius:3px">DEPLOYED</span>`
+      : '';
     const typeBadges = [
       cluster.tier === 'hub' ? '<span class="badge badge-info" style="font-size:0.6rem">HUB</span>' : '',
       cluster.is_security ? '<span class="badge badge-warning" style="font-size:0.6rem">SEC</span>' : '',
+      deployedBadge,
     ].filter(Boolean).join('');
 
     // ── Influenced clusters (hub tier, collapsed) ────────────────────
@@ -273,14 +305,19 @@ const Updates = {
     const borderColor = cluster.tier === 'hub' ? 'var(--accent-primary)' : cluster.is_security ? 'var(--status-warning)' : cluster.static ? 'var(--border-secondary)' : 'transparent';
 
     // ── Assemble ─────────────────────────────────────────────────────
-    return `<div style="margin-bottom:var(--space-xs);border:1px solid var(--border-secondary);border-left:3px solid ${borderColor};border-radius:var(--radius-md);background:var(--bg-primary)">
+    const isSelected = this._selectedClusters[cid];
+    const selectedBorder = isSelected ? 'outline:2px solid var(--accent-primary);outline-offset:-2px;' : '';
+    const checkbox = a ? `<input type="checkbox" ${isSelected ? 'checked' : ''} onclick="event.stopPropagation();Updates.toggleSelect('${this._esc(cid)}')" style="flex-shrink:0;cursor:pointer;accent-color:var(--accent-primary)">` : '';
+
+    return `<div style="margin-bottom:var(--space-xs);border:1px solid var(--border-secondary);border-left:3px solid ${borderColor};border-radius:var(--radius-md);background:var(--bg-primary);${selectedBorder}">
       <div style="display:flex;align-items:center;gap:var(--space-sm);padding:var(--space-sm) var(--space-sm);cursor:pointer;user-select:none" onclick="Updates.toggleCluster('${this._esc(cid)}')">
+        ${checkbox}
         <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${trafficColor};flex-shrink:0" title="${trafficLabel}"></span>
         <span style="color:var(--text-tertiary);font-size:0.7em;flex-shrink:0">${expanded ? '\u25BC' : '\u25B6'}</span>
         <div style="flex:1;min-width:0;display:flex;align-items:center;gap:var(--space-xs);flex-wrap:wrap">
           <strong style="color:var(--text-primary);font-size:var(--font-size-sm)">${this._esc(cluster.name)}</strong>
           ${typeBadges}
-          <span class="text-xs text-muted">${hosts}</span>
+          ${hosts ? `<span style="font-size:0.65rem;font-weight:600;color:var(--accent-primary);background:rgba(100,149,237,0.12);padding:1px 6px;border-radius:3px">${hosts}</span>` : ''}
           <span style="font-size:var(--font-size-xs);color:${riskColor};font-weight:600">${cluster.risk_score}</span>
           <span class="text-xs text-muted">${cluster.item_count} pkg${cluster.item_count !== 1 ? 's' : ''}</span>
           ${summaryChips}
@@ -339,6 +376,7 @@ const Updates = {
             <strong style="color:var(--text-primary);font-size:var(--font-size-sm)">${this._esc(item.package)}</strong>
             <span class="text-xs text-muted">${this._esc(item.current)} &rarr; ${this._esc(item.available)}</span>
             ${rbStr}${clsBadge}${srcBadge}${intelHtml}
+            ${item.project ? `<span class="text-xs" style="color:var(--accent-secondary)">${this._esc(item.project)}</span>` : ''}
           </div>
           ${rbDetail}
           ${item.reason ? `<div class="text-xs text-muted">${this._esc(item.reason)}</div>` : ''}
@@ -371,19 +409,101 @@ const Updates = {
     this._render();
   },
 
+  // ── Selection ──────────────────────────────────────────────────────────
+
+  toggleSelect(cid) {
+    this._selectedClusters[cid] = !this._selectedClusters[cid];
+    this._render();
+  },
+
+  selectAllAnalyzed() {
+    const clusters = (this._data && this._data.clusters) || [];
+    const filtered = this._filterClusters(clusters);
+    for (const c of filtered) {
+      if (c.analysis && !c.analysis.error && !c.deployed_at) {
+        this._selectedClusters[c.id] = true;
+      }
+    }
+    this._render();
+  },
+
+  clearSelection() {
+    this._selectedClusters = {};
+    this._render();
+  },
+
+  async deploySelected() {
+    const ids = Object.entries(this._selectedClusters).filter(([_, v]) => v).map(([k]) => k);
+    if (!ids.length) return;
+    if (!confirm(`Deploy ${ids.length} cluster(s) to host? This generates update scripts via SSH.`)) return;
+
+    this._showBanner(`Deploying ${ids.length} clusters...`);
+    try {
+      const res = await fetch('/api/updates/deploy/bulk', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ cluster_ids: ids }),
+      });
+      const data = await res.json();
+      this._hideBanner();
+      if (data.ok) {
+        const items = data.deployed || [];
+        const ok = items.filter(d => !d.error);
+        const paths = ok.map(d => `${d.host_name}: ${d.path} (${d.items} items)`).join('\n');
+        App.toast(`Deployed to ${ok.length} host(s)`, 'success');
+        if (paths) alert(`Scripts deployed:\n\n${paths}`);
+        this._selectedClusters = {};
+        this.load();
+      } else {
+        App.toast(data.error || 'Deploy failed', 'error');
+      }
+    } catch (e) {
+      this._hideBanner();
+      App.toast('Deploy failed: ' + e.message, 'error');
+    }
+  },
+
   // ── Filtering ───────────────────────────────────────────────────────────
 
   setFilter(key, value) {
+    if (key === 'text') {
+      this._filter.text = value;
+      clearTimeout(this._textTimer);
+      this._textTimer = setTimeout(() => this._render(), 200);
+      return;
+    }
     if (this._filter[key] === value) value = null;
     this._filter[key] = value;
     this._render();
   },
 
+  toggleAnalyzed() {
+    this._filter.analyzed = !this._filter.analyzed;
+    this._render();
+  },
+
   _filterClusters(clusters) {
     const f = this._filter;
+    const q = (f.text || '').toLowerCase();
+    const results = (this._data && this._data.scan_results) || [];
+    const itemMap = {};
+    if (q) for (const r of results) itemMap[r.id] = r;
+
     return clusters.filter(c => {
       if (f.host && !(c.hosts || []).includes(f.host)) return false;
       if (f.dimension && c.dimension !== f.dimension && c.dimension !== 'mixed') return false;
+      if (f.analyzed && !c.analysis) return false;
+      if (q) {
+        // Match cluster name, host names, or any package name in the cluster
+        const nameMatch = (c.name || '').toLowerCase().includes(q);
+        const hostMatch = (c.hosts || []).some(h => h.includes(q));
+        const dimMatch = (c.dimension || '').includes(q);
+        const pkgMatch = (c.item_ids || []).some(id => {
+          const item = itemMap[id];
+          return item && (item.package || '').toLowerCase().includes(q);
+        });
+        if (!nameMatch && !hostMatch && !dimMatch && !pkgMatch) return false;
+      }
       return true;
     });
   },

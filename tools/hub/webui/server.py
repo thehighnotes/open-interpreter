@@ -1430,6 +1430,21 @@ async def updates_deploy(request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
+async def updates_deploy_bulk(request):
+    """POST /api/updates/deploy/bulk — deploy multiple clusters as one script per host."""
+    try:
+        body = await _json_body(request)
+        cluster_ids = body.get("cluster_ids", [])
+        if not cluster_ids:
+            return JSONResponse({"ok": False, "error": "cluster_ids required"}, status_code=400)
+        from updates_api import deploy_bulk
+        excluded = body.get("excluded", [])
+        result = deploy_bulk(cluster_ids, excluded=excluded)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 async def updates_ask(request):
     """POST /api/updates/ask — ask a question about a cluster."""
     try:
@@ -1534,6 +1549,7 @@ routes = [
     Route("/api/updates/analyze/status", updates_analyze_status),
     Route("/api/updates/enrich", updates_enrich, methods=["POST"]),
     Route("/api/updates/deploy", updates_deploy, methods=["POST"]),
+    Route("/api/updates/deploy/bulk", updates_deploy_bulk, methods=["POST"]),
     Route("/api/updates/ask", updates_ask, methods=["POST"]),
     # Apps
     Route("/api/apps", get_apps),
