@@ -1267,9 +1267,157 @@ async def mail_refresh_advice(request):
     return JSONResponse({"ok": True, **get_advice()})
 
 
+# ── Updates API ──────────────────────────────────────────────────────────────
+
+
+async def get_updates_overview(request):
+    """GET /api/updates — overview stats + scan results + rules."""
+    try:
+        from updates_api import get_overview
+        return JSONResponse(get_overview())
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def updates_scan(request):
+    """POST /api/updates/scan — scan for updates across dimensions."""
+    try:
+        body = await _json_body(request)
+        dimensions = body.get("dimensions") if body else None
+        hosts = body.get("hosts") if body else None
+        from updates_api import scan
+        result = scan(dimensions=dimensions, hosts=hosts)
+        return JSONResponse({"ok": True, **result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def updates_apply(request):
+    """POST /api/updates/apply — generate commands for approved updates."""
+    try:
+        body = await _json_body(request)
+        approvals = body.get("approvals", {})
+        from updates_api import apply_actions
+        result = apply_actions(approvals)
+        return JSONResponse({"ok": True, **result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def get_updates_rules(request):
+    """GET /api/updates/rules — list all rules."""
+    from updates_api import load_rules
+    return JSONResponse({"rules": load_rules()})
+
+
+async def add_updates_rule(request):
+    """POST /api/updates/rules/add — add a rule."""
+    try:
+        body = await _json_body(request)
+        from updates_api import add_rule
+        rule = add_rule(body.get("rule", {}))
+        return JSONResponse({"ok": True, "rule": rule})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def update_updates_rule(request):
+    """POST /api/updates/rules/update — update a rule."""
+    try:
+        body = await _json_body(request)
+        from updates_api import update_rule
+        ok = update_rule(body.get("id"), body.get("updates", {}))
+        return JSONResponse({"ok": ok})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def delete_updates_rule(request):
+    """POST /api/updates/rules/delete — delete a rule."""
+    try:
+        body = await _json_body(request)
+        from updates_api import delete_rule
+        ok = delete_rule(body.get("id"))
+        return JSONResponse({"ok": ok})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def get_updates_config(request):
+    """GET /api/updates/config — get update config."""
+    from updates_api import load_updates_config
+    return JSONResponse(load_updates_config())
+
+
+async def update_updates_config(request):
+    """POST /api/updates/config — update config."""
+    try:
+        body = await _json_body(request)
+        from updates_api import load_updates_config, save_updates_config
+        config = load_updates_config()
+        config.update(body)
+        save_updates_config(config)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def updates_export(request):
+    """POST /api/updates/export — export approved updates as shell script."""
+    try:
+        body = await _json_body(request)
+        from updates_api import export_script
+        result = export_script(body.get("host"), body.get("item_ids"))
+        return JSONResponse({"ok": True, **result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def updates_refresh_insights(request):
+    """POST /api/updates/insights/refresh — re-run cross-reference analysis."""
+    try:
+        from updates_api import refresh_insights
+        result = refresh_insights()
+        return JSONResponse({"ok": True, **result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def updates_analyze(request):
+    """POST /api/updates/analyze — trigger LLM analysis per cluster."""
+    try:
+        body = await _json_body(request)
+        cluster_ids = body.get("cluster_ids") if body else None
+        from updates_api import analyze_clusters
+        result = analyze_clusters(cluster_ids=cluster_ids)
+        return JSONResponse({"ok": True, **result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def updates_analyze_status(request):
+    """GET /api/updates/analyze/status — poll analysis progress."""
+    from updates_api import get_analyze_status
+    return JSONResponse(get_analyze_status())
+
+
+async def updates_enrich(request):
+    """POST /api/updates/enrich — on-demand intelligence for a cluster."""
+    try:
+        body = await _json_body(request)
+        cluster_id = body.get("cluster_id")
+        if not cluster_id:
+            return JSONResponse({"ok": False, "error": "cluster_id required"}, status_code=400)
+        from updates_api import enrich_cluster
+        result = enrich_cluster(cluster_id)
+        return JSONResponse({"ok": True, **result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 # ── App assembly ─────────────────────────────────────────────────────────────
 
-_TAB_ROUTES = ["chat", "status", "projects", "apps", "repo", "research", "notify", "mail", "help", "settings"]
+_TAB_ROUTES = ["chat", "status", "projects", "apps", "repo", "research", "notify", "mail", "updates", "help", "settings"]
 
 routes = [
     Route("/", index),
@@ -1340,6 +1488,21 @@ routes = [
     Route("/api/mail/sender", mail_sender_stats),
     Route("/api/mail/advice/refresh", mail_refresh_advice, methods=["POST"]),
     Route("/auth/gmail/callback", mail_auth_callback),
+    # Updates API
+    Route("/api/updates", get_updates_overview),
+    Route("/api/updates/scan", updates_scan, methods=["POST"]),
+    Route("/api/updates/apply", updates_apply, methods=["POST"]),
+    Route("/api/updates/rules", get_updates_rules),
+    Route("/api/updates/rules/add", add_updates_rule, methods=["POST"]),
+    Route("/api/updates/rules/update", update_updates_rule, methods=["POST"]),
+    Route("/api/updates/rules/delete", delete_updates_rule, methods=["POST"]),
+    Route("/api/updates/config", get_updates_config),
+    Route("/api/updates/config", update_updates_config, methods=["POST"]),
+    Route("/api/updates/export", updates_export, methods=["POST"]),
+    Route("/api/updates/insights/refresh", updates_refresh_insights, methods=["POST"]),
+    Route("/api/updates/analyze", updates_analyze, methods=["POST"]),
+    Route("/api/updates/analyze/status", updates_analyze_status),
+    Route("/api/updates/enrich", updates_enrich, methods=["POST"]),
     # Apps
     Route("/api/apps", get_apps),
     Route("/api/apps/tunnel", app_tunnel, methods=["POST"]),

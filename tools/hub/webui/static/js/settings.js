@@ -58,6 +58,7 @@ const Settings = {
     if (hasCA) html += this.renderCodeAssistantSection(config);
     html += this.renderResearchSection(config);
     html += this.renderMailSection();
+    html += this.renderUpdatesSection();
     html += this.renderWebuiSection();
     html += this.renderSessionSection();
     container.innerHTML = html;
@@ -1319,6 +1320,166 @@ const Settings = {
       });
       this._loadMailPrompt();
       App.toast(`${which === 'suggestion' ? 'Suggestion' : 'Classification'} prompt reset`, 'success');
+    } catch (e) {
+      App.toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  // ── Updates Section ──────────────────────────────────────────────────────
+
+  _updatesConfig: null,
+
+  renderUpdatesSection() {
+    const allDims = ['apt', 'pip', 'npm', 'cargo', 'gha', 'docker', 'azure', 'infra', 'devtools'];
+    const allHosts = ['nano', 'agx', 'ws', 'vps'];
+
+    let html = `
+      <div class="settings-group" id="s-updates-section">
+        <div class="text-muted text-xs" style="margin-bottom:var(--space-sm)">Loading updates config...</div>
+      </div>`;
+
+    // Trigger async load
+    setTimeout(() => this._loadUpdatesConfig(), 0);
+
+    return `<details class="settings-section"><summary>
+      <div class="settings-section-title">Updates</div>
+    </summary>${html}</details>`;
+  },
+
+  async _loadUpdatesConfig() {
+    try {
+      const res = await fetch('/api/updates/config');
+      const config = await res.json();
+      this._updatesConfig = config;
+      this._renderUpdatesForm(config);
+    } catch (e) {
+      const el = document.getElementById('s-updates-section');
+      if (el) el.innerHTML = `<div class="text-muted">Failed to load: ${e.message}</div>`;
+    }
+  },
+
+  _renderUpdatesForm(config) {
+    const el = document.getElementById('s-updates-section');
+    if (!el) return;
+
+    const allDims = ['apt', 'pip', 'npm', 'cargo', 'gha', 'docker', 'azure', 'infra', 'devtools'];
+    const allHosts = ['nano', 'agx', 'ws', 'vps'];
+    const enabledDims = config.enabled_dimensions || [];
+    const enabledHosts = config.enabled_hosts || [];
+    const blocklists = config.blocklists || {};
+
+    let html = '';
+
+    // Dimensions
+    html += '<div class="settings-label">Scan Dimensions</div>';
+    html += '<div style="display:flex;gap:var(--space-md);flex-wrap:wrap;margin-bottom:var(--space-md)">';
+    for (const dim of allDims) {
+      const checked = enabledDims.includes(dim) ? 'checked' : '';
+      html += `<label style="display:flex;align-items:center;gap:4px;font-size:var(--font-size-sm)">
+        <input type="checkbox" class="s-updates-dim" value="${dim}" ${checked}> ${dim}
+      </label>`;
+    }
+    html += '</div>';
+
+    // Hosts
+    html += '<div class="settings-label">Scan Hosts</div>';
+    html += '<div style="display:flex;gap:var(--space-md);flex-wrap:wrap;margin-bottom:var(--space-md)">';
+    for (const host of allHosts) {
+      const checked = enabledHosts.includes(host) ? 'checked' : '';
+      html += `<label style="display:flex;align-items:center;gap:4px;font-size:var(--font-size-sm)">
+        <input type="checkbox" class="s-updates-host" value="${host}" ${checked}> ${host}
+      </label>`;
+    }
+    html += '</div>';
+
+    // Blocklists
+    html += '<div class="settings-label">Blocklists</div>';
+    html += '<div class="text-xs text-muted" style="margin-bottom:var(--space-xs)">Glob patterns per dimension/host. One pattern per line.</div>';
+    for (const dim of ['apt', 'pip']) {
+      const dimBl = blocklists[dim] || {};
+      for (const host of allHosts) {
+        const patterns = (dimBl[host] || []).join('\n');
+        if (!patterns && !dimBl[host]) continue;
+        html += `<div style="margin-bottom:var(--space-sm)">
+          <div class="text-xs" style="color:var(--text-secondary);margin-bottom:2px">${dim} / ${host}</div>
+          <textarea class="input s-updates-blocklist" data-dim="${dim}" data-host="${host}" rows="2"
+            style="width:100%;font-family:var(--font-mono);font-size:var(--font-size-xs)">${patterns}</textarea>
+        </div>`;
+      }
+    }
+
+    // Prompts
+    html += `<div class="settings-label" style="margin-top:var(--space-md)">Classification Prompt</div>
+      <div class="text-xs text-muted" style="margin-bottom:var(--space-xs)">Instructions for the LLM to classify updates</div>
+      <textarea id="s-updates-system-prompt" rows="5" class="input"
+        style="width:100%;font-family:var(--font-mono);font-size:var(--font-size-xs);margin-bottom:var(--space-xs)">${this._esc(config.system_prompt || '')}</textarea>
+      <button class="btn btn-sm" onclick="Settings.resetUpdatesPrompt('system')">Reset to Default</button>`;
+
+    html += `<div class="settings-label" style="margin-top:var(--space-md)">Cross-Reference Prompt</div>
+      <div class="text-xs text-muted" style="margin-bottom:var(--space-xs)">Instructions for cross-reference analysis</div>
+      <textarea id="s-updates-crossref-prompt" rows="4" class="input"
+        style="width:100%;font-family:var(--font-mono);font-size:var(--font-size-xs);margin-bottom:var(--space-xs)">${this._esc(config.cross_ref_prompt || '')}</textarea>
+      <button class="btn btn-sm" onclick="Settings.resetUpdatesPrompt('cross_ref')">Reset to Default</button>`;
+
+    // Save button
+    html += `<div style="margin-top:var(--space-md)">
+      <button class="btn btn-sm" onclick="Settings.saveUpdatesConfig()">Save Updates Settings</button>
+    </div>`;
+
+    el.innerHTML = html;
+  },
+
+  async saveUpdatesConfig() {
+    const dims = [...document.querySelectorAll('.s-updates-dim:checked')].map(c => c.value);
+    const hosts = [...document.querySelectorAll('.s-updates-host:checked')].map(c => c.value);
+
+    // Collect blocklists
+    const blocklists = {};
+    document.querySelectorAll('.s-updates-blocklist').forEach(ta => {
+      const dim = ta.dataset.dim;
+      const host = ta.dataset.host;
+      if (!blocklists[dim]) blocklists[dim] = {};
+      blocklists[dim][host] = ta.value.split('\n').map(l => l.trim()).filter(Boolean);
+    });
+
+    const systemPrompt = document.getElementById('s-updates-system-prompt')?.value || null;
+    const crossRefPrompt = document.getElementById('s-updates-crossref-prompt')?.value || null;
+
+    const config = {
+      enabled_dimensions: dims,
+      enabled_hosts: hosts,
+      blocklists: blocklists,
+      system_prompt: systemPrompt || null,
+      cross_ref_prompt: crossRefPrompt || null,
+    };
+
+    try {
+      const res = await fetch('/api/updates/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(config),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        App.toast('Updates settings saved', 'success');
+      } else {
+        App.toast(data.error || 'Save failed', 'error');
+      }
+    } catch (e) {
+      App.toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  async resetUpdatesPrompt(which) {
+    const key = which === 'system' ? 'system_prompt' : 'cross_ref_prompt';
+    try {
+      await fetch('/api/updates/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [key]: null }),
+      });
+      this._loadUpdatesConfig();
+      App.toast('Prompt reset to default', 'success');
     } catch (e) {
       App.toast('Failed: ' + e.message, 'error');
     }

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="theme-color" content="#0a0a0f">
-  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>OI WebUI</title>
   <link rel="stylesheet" href="/static/css/design-system.css">
@@ -60,6 +60,10 @@
         <button class="sidebar-tab" data-tab="mail">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
           <span class="tab-label">Mail</span>
+        </button>
+        <button class="sidebar-tab" data-tab="updates">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          <span class="tab-label">Updates</span>
         </button>
         <button class="sidebar-tab" data-tab="help">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
@@ -225,6 +229,23 @@
         </div>
       </div>
 
+      <!-- Updates tab -->
+      <div class="tab-content" id="tab-updates">
+        <div class="data-tab">
+          <div class="data-tab-header">
+            <div class="data-tab-title">Updates</div>
+            <div style="display:flex;gap:var(--space-xs);">
+              <button class="btn btn-sm" onclick="Updates.scan()" title="Scan for updates">Scan</button>
+              <button class="btn btn-sm" onclick="Updates.analyze()" title="Run LLM analysis on clusters">Analyze</button>
+              <button class="btn btn-sm btn-icon" onclick="Updates.load()" title="Refresh">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="updates-content"></div>
+        </div>
+      </div>
+
       <!-- Help tab -->
       <div class="tab-content" id="tab-help">
         <div class="data-tab">
@@ -277,6 +298,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
         Mail
       </button>
+      <button class="mobile-tab" data-tab="updates">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Updates
+      </button>
       <button class="mobile-tab" data-tab="help">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
         Help
@@ -297,6 +322,7 @@
   <script src="/static/js/help.js"></script>
   <script src="/static/js/settings.js"></script>
   <script src="/static/js/mail.js"></script>
+  <script src="/static/js/updates.js"></script>
   <script src="/static/js/tabs.js"></script>
 </body>
 </html>

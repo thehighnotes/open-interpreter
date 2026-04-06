@@ -20,6 +20,7 @@ const Tabs = {
       research: () => this.loadResearch(),
       notify: () => this.loadNotifications(),
       mail: () => Mail.load(),
+      updates: () => Updates.load(),
       help: () => Help.render(),
       settings: () => this.loadSettings(),
     };
