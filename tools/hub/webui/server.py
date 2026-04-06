@@ -1237,6 +1237,36 @@ async def update_mail_config(request):
     return JSONResponse({"ok": True})
 
 
+async def mail_unsubscribe(request):
+    """POST /api/mail/unsubscribe — get unsubscribe link for a sender."""
+    body = await _json_body(request)
+    email = body.get("email")
+    if not email:
+        return JSONResponse({"error": "email required"}, status_code=400)
+    from mail_api import get_unsubscribe_link
+    return JSONResponse(get_unsubscribe_link(email))
+
+
+async def mail_sender_stats(request):
+    """GET /api/mail/sender?email=x — get triage stats for a sender."""
+    email = request.query_params.get("email")
+    if not email:
+        return JSONResponse({"error": "email required"}, status_code=400)
+    from mail_api import get_sender_summary
+    return JSONResponse(get_sender_summary(email))
+
+
+async def mail_refresh_advice(request):
+    """POST /api/mail/advice/refresh — re-run insights analysis."""
+    from mail_api import _load_sender_stats, _refresh_suggestions
+    stats = _load_sender_stats()
+    if not stats:
+        return JSONResponse({"ok": False, "error": "No sender history yet"})
+    _refresh_suggestions(stats, [], {})
+    from mail_api import get_advice
+    return JSONResponse({"ok": True, **get_advice()})
+
+
 # ── App assembly ─────────────────────────────────────────────────────────────
 
 _TAB_ROUTES = ["chat", "status", "projects", "apps", "repo", "research", "notify", "mail", "help", "settings"]
@@ -1306,6 +1336,9 @@ routes = [
     Route("/api/mail/reset", mail_reset, methods=["POST"]),
     Route("/api/mail/config", get_mail_config),
     Route("/api/mail/config", update_mail_config, methods=["POST"]),
+    Route("/api/mail/unsubscribe", mail_unsubscribe, methods=["POST"]),
+    Route("/api/mail/sender", mail_sender_stats),
+    Route("/api/mail/advice/refresh", mail_refresh_advice, methods=["POST"]),
     Route("/auth/gmail/callback", mail_auth_callback),
     # Apps
     Route("/api/apps", get_apps),

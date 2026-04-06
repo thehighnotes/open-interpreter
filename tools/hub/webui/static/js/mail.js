@@ -63,13 +63,27 @@ const Mail = {
     const advice = d.advice || {};
     if (advice.advice) {
       const age = advice.ts ? new Date(advice.ts * 1000).toLocaleString() : '';
-      const rendered = typeof marked !== 'undefined'
+      let rendered = typeof marked !== 'undefined'
         ? marked.parse(advice.advice, {breaks: true, gfm: true})
         : `<pre style="white-space:pre-wrap">${this._esc(advice.advice)}</pre>`;
+      // Make email addresses in inline code clickable
+      rendered = rendered.replace(/<code>([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})<\/code>/g,
+        '<code class="mail-email-action" data-email="$1" style="cursor:pointer;text-decoration:underline;text-decoration-style:dotted" title="Click for actions">$1</code>');
       html += this._foldable('Insights', `
         <div class="msg-bubble markdown-content" style="padding:var(--space-sm);color:var(--text-secondary);font-size:var(--font-size-sm);line-height:1.6;background:transparent;border:none;max-width:none">${rendered}</div>
-        ${age ? `<div style="padding:0 var(--space-sm) var(--space-sm);font-size:var(--font-size-xs);color:var(--text-tertiary)">Updated ${age}</div>` : ''}
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:0 var(--space-sm) var(--space-sm)">
+          ${age ? `<span style="font-size:var(--font-size-xs);color:var(--text-tertiary)">Updated ${age}</span>` : '<span></span>'}
+          <button class="btn btn-sm" onclick="Mail.refreshInsights()">Refresh</button>
+        </div>
       `, {open: true});
+    }
+
+    // Filter rules
+    const rules = d.rules || [];
+    if (rules.length > 0) {
+      html += this._foldable('Filter Rules', this._renderRules(rules), {
+        open: false, count: rules.length,
+      });
     }
 
     // Scan results (pending review)
@@ -95,6 +109,7 @@ const Mail = {
     }
 
     container.innerHTML = html;
+    this._initEmailActions();
   },
 
   _foldable(title, body, {open = true, count = null, accent = false} = {}) {
@@ -287,6 +302,159 @@ const Mail = {
     } catch (e) {
       App.toast('Failed: ' + e.message, 'error');
     }
+  },
+
+  // ── Insights actions ──────────────────────────────────────────────────────
+
+  async refreshInsights() {
+    App.toast('Refreshing insights...', 'info');
+    try {
+      const res = await fetch('/api/mail/advice/refresh', {method: 'POST'});
+      const data = await res.json();
+      if (data.ok) {
+        this._data.advice = {advice: data.advice, ts: data.ts};
+        this._render();
+        App.toast('Insights updated', 'success');
+      } else {
+        App.toast(data.error || 'Failed', 'error');
+      }
+    } catch (e) {
+      App.toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  _initEmailActions() {
+    const container = document.getElementById('mail-content');
+    if (!container) return;
+    container.addEventListener('click', (e) => {
+      const el = e.target.closest('.mail-email-action');
+      if (!el) return;
+      e.preventDefault();
+      const email = el.dataset.email;
+      if (email) this._showEmailPopup(el, email);
+    });
+  },
+
+  _showEmailPopup(anchor, email) {
+    // Remove any existing popup
+    document.querySelectorAll('.mail-email-popup').forEach(p => p.remove());
+
+    const popup = document.createElement('div');
+    popup.className = 'mail-email-popup';
+    popup.style.cssText = 'position:absolute;z-index:100;background:var(--bg-elevated);border:1px solid var(--border-primary);border-radius:var(--radius-sm);padding:var(--space-sm);box-shadow:0 4px 12px rgba(0,0,0,0.3);min-width:200px;font-size:var(--font-size-sm)';
+
+    popup.innerHTML = `
+      <div style="font-weight:600;color:var(--text-primary);margin-bottom:var(--space-xs);word-break:break-all">${this._esc(email)}</div>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <button class="btn btn-sm" onclick="Mail.createRuleFor('${this._esc(email)}','archive')">Auto-archive</button>
+        <button class="btn btn-sm" onclick="Mail.createRuleFor('${this._esc(email)}','delete')">Auto-delete</button>
+        <button class="btn btn-sm" onclick="Mail.unsubscribe('${this._esc(email)}')">Unsubscribe</button>
+      </div>`;
+
+    // Position near anchor
+    const rect = anchor.getBoundingClientRect();
+    const container = document.getElementById('mail-content');
+    const cRect = container.getBoundingClientRect();
+    popup.style.left = (rect.left - cRect.left) + 'px';
+    popup.style.top = (rect.bottom - cRect.top + 4) + 'px';
+    container.style.position = 'relative';
+    container.appendChild(popup);
+
+    // Close on click outside
+    const close = (e) => { if (!popup.contains(e.target) && e.target !== anchor) { popup.remove(); document.removeEventListener('click', close); } };
+    setTimeout(() => document.addEventListener('click', close), 0);
+  },
+
+  async createRuleFor(email, action) {
+    document.querySelectorAll('.mail-email-popup').forEach(p => p.remove());
+    try {
+      const res = await fetch('/api/mail/rules/add', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({rule: {name: `Auto-${action} ${email}`, match: {from: email}, action}}),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        App.toast(`Rule added: auto-${action} from ${email}`, 'success');
+        Tabs.loaded.mail = false;
+        Mail.load();
+      } else {
+        App.toast(data.error || 'Failed', 'error');
+      }
+    } catch (e) {
+      App.toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  async unsubscribe(email) {
+    document.querySelectorAll('.mail-email-popup').forEach(p => p.remove());
+    App.toast('Looking up unsubscribe link...', 'info');
+    try {
+      const res = await fetch('/api/mail/unsubscribe', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({email}),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        if (data.type === 'url') {
+          window.open(data.link, '_blank');
+          App.toast('Unsubscribe page opened', 'success');
+        } else {
+          // mailto link
+          window.location.href = data.link;
+          App.toast('Unsubscribe email opened', 'success');
+        }
+      } else {
+        App.toast(data.error || 'No unsubscribe link found', 'error');
+      }
+    } catch (e) {
+      App.toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  async deleteRule(ruleId) {
+    try {
+      const res = await fetch('/api/mail/rules/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id: ruleId}),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        App.toast('Rule deleted', 'success');
+        Tabs.loaded.mail = false;
+        Mail.load();
+      }
+    } catch (e) {
+      App.toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  // ── Filter rules ─────────────────────────────────────────────────────────
+
+  _renderRules(rules) {
+    let html = '';
+    for (const r of rules) {
+      const enabled = r.enabled !== false;
+      const from = r.match?.from || '';
+      const subject = r.match?.subject || '';
+      const matched = r.stats?.total_matched || 0;
+      const actionColor = r.action === 'delete' ? 'var(--status-error)' : 'var(--status-success)';
+
+      html += `
+        <div style="display:flex;align-items:center;gap:var(--space-sm);padding:var(--space-xs) var(--space-sm);border-bottom:1px solid var(--border-secondary);${enabled ? '' : 'opacity:0.5'}">
+          <div style="flex:1;min-width:0">
+            <span style="color:var(--text-primary)">${this._esc(r.name || from)}</span>
+            ${from ? `<span style="color:var(--text-tertiary);font-size:var(--font-size-xs)"> ${this._esc(from)}</span>` : ''}
+            ${subject ? `<span style="color:var(--text-tertiary);font-size:var(--font-size-xs)"> subj: ${this._esc(subject)}</span>` : ''}
+          </div>
+          <span style="color:${actionColor};font-size:var(--font-size-xs);font-weight:600">${r.action || 'archive'}</span>
+          <span style="color:var(--text-tertiary);font-size:var(--font-size-xs)">${matched}x</span>
+          <button class="btn btn-sm" style="color:var(--status-error);padding:2px 6px" onclick="Mail.deleteRule('${r.id}')">x</button>
+        </div>`;
+    }
+    return html;
   },
 
   // ── Activity log ──────────────────────────────────────────────────────────

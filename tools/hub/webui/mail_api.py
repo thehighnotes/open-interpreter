@@ -736,6 +736,55 @@ def reset(scope: str = "token"):
                 f.unlink()
 
 
+# ── Unsubscribe ─────────────────────────────────────────────────────────────
+
+def get_unsubscribe_link(sender_email: str) -> dict:
+    """Find the List-Unsubscribe header from the most recent message by this sender."""
+    try:
+        service = get_gmail_service()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    # Find most recent message from this sender
+    result = service.users().messages().list(
+        userId="me", q=f"from:{sender_email}", maxResults=1,
+    ).execute()
+    messages = result.get("messages", [])
+    if not messages:
+        return {"ok": False, "error": "No messages found from this sender"}
+
+    msg = service.users().messages().get(
+        userId="me", id=messages[0]["id"], format="metadata",
+        metadataHeaders=["List-Unsubscribe", "List-Unsubscribe-Post"],
+    ).execute()
+    headers = msg.get("payload", {}).get("headers", [])
+    unsub = _get_header(headers, "List-Unsubscribe")
+
+    if not unsub:
+        return {"ok": False, "error": "No unsubscribe link found for this sender"}
+
+    # Extract URL (prefer https over mailto)
+    import re
+    urls = re.findall(r'<(https?://[^>]+)>', unsub)
+    mailtos = re.findall(r'<(mailto:[^>]+)>', unsub)
+
+    link = urls[0] if urls else (mailtos[0] if mailtos else unsub.strip('<> '))
+    return {"ok": True, "link": link, "type": "url" if urls else "mailto"}
+
+
+# ── Sender stats for UI ────────────────────────────────────────────────────
+
+def get_sender_summary(email: str) -> dict:
+    """Get triage stats for a specific sender."""
+    stats = _load_sender_stats()
+    s = stats.get(email.lower(), {})
+    return {
+        "archive": s.get("archive", 0),
+        "delete": s.get("delete", 0),
+        "keep": s.get("keep", 0),
+    }
+
+
 # ── Overview ─────────────────────────────────────────────────────────────────
 
 def get_overview() -> dict:
@@ -751,6 +800,7 @@ def get_overview() -> dict:
     return {
         **auth,
         "config": config,
+        "rules": rules,
         "rules_count": len(rules),
         "rules_enabled": sum(1 for r in rules if r.get("enabled", True)),
         "scan_ts": scan_data.get("ts"),
