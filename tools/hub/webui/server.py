@@ -1223,40 +1223,18 @@ async def get_mail_config(request):
 
 
 async def update_mail_config(request):
-    """POST /api/mail/config — update system prompt. null resets to default."""
+    """POST /api/mail/config — update settings. null on a prompt resets it to default."""
     body = await _json_body(request)
-    from mail_api import save_mail_config, load_mail_config, MAIL_CONFIG_FILE
-    if "system_prompt" in body and body["system_prompt"] is None:
-        # Reset to default by removing the config file
-        if MAIL_CONFIG_FILE.exists():
-            MAIL_CONFIG_FILE.unlink()
-        return JSONResponse({"ok": True})
+    from mail_api import save_mail_config, load_mail_config, DEFAULT_CONFIG
     config = load_mail_config()
-    for key in ("system_prompt", "mode", "scope_read", "scope_label", "batch_size"):
+    for key in ("system_prompt", "suggestion_prompt", "mode", "scope_read", "scope_label", "batch_size"):
         if key in body:
-            config[key] = body[key]
+            if body[key] is None and key in DEFAULT_CONFIG:
+                config[key] = DEFAULT_CONFIG[key]
+            else:
+                config[key] = body[key]
     save_mail_config(config)
     return JSONResponse({"ok": True})
-
-
-async def accept_suggestion(request):
-    """POST /api/mail/suggestions/accept — accept a suggestion (creates rule)."""
-    body = await _json_body(request)
-    sid = body.get("id")
-    if not sid:
-        return JSONResponse({"error": "id required"}, status_code=400)
-    from mail_api import accept_suggestion as _accept
-    return JSONResponse(_accept(sid))
-
-
-async def dismiss_suggestion_route(request):
-    """POST /api/mail/suggestions/dismiss — dismiss a suggestion."""
-    body = await _json_body(request)
-    sid = body.get("id")
-    if not sid:
-        return JSONResponse({"error": "id required"}, status_code=400)
-    from mail_api import dismiss_suggestion
-    return JSONResponse({"ok": dismiss_suggestion(sid)})
 
 
 # ── App assembly ─────────────────────────────────────────────────────────────
@@ -1328,8 +1306,6 @@ routes = [
     Route("/api/mail/reset", mail_reset, methods=["POST"]),
     Route("/api/mail/config", get_mail_config),
     Route("/api/mail/config", update_mail_config, methods=["POST"]),
-    Route("/api/mail/suggestions/accept", accept_suggestion, methods=["POST"]),
-    Route("/api/mail/suggestions/dismiss", dismiss_suggestion_route, methods=["POST"]),
     Route("/auth/gmail/callback", mail_auth_callback),
     # Apps
     Route("/api/apps", get_apps),

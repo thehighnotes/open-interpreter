@@ -23,9 +23,10 @@ from googleapiclient.discovery import build
 
 sys.path.insert(0, str(Path.home()))
 try:
-    from hub_common import llm_query, DEFAULT_MODEL
+    from hub_common import llm_query, llm_query_text, DEFAULT_MODEL
 except ImportError:
     llm_query = None
+    llm_query_text = None
     DEFAULT_MODEL = None
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -56,8 +57,19 @@ Respond with a JSON array. Each element: {"id": <index>, "action": "keep"|"archi
 
 Be conservative — when in doubt, recommend "keep"."""
 
+DEFAULT_SUGGESTION_PROMPT = """You're an email assistant reviewing the user's triage patterns. Based on their history — which senders they archive, delete, or keep — give brief, actionable advice.
+
+Examples of useful advice:
+- "You always archive X newsletters — consider unsubscribing or adding a filter rule for `news@x.com`."
+- "Receipts from Y get deleted every time — a filter on `noreply@y.com` would save you the effort."
+- "You're keeping everything from Z, no action needed there."
+
+Always reference the specific email address (e.g. `user@domain.com`) when suggesting a filter or unsubscribe action, so the user knows exactly which sender to target.
+Use markdown formatting. Keep it short and practical — a few bullet points. If there aren't enough patterns yet, say so briefly."""
+
 DEFAULT_CONFIG = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
+    "suggestion_prompt": DEFAULT_SUGGESTION_PROMPT,
     "mode": "manual",        # "auto" or "manual"
     "scope_read": "unread",  # "unread" or "all"
     "scope_label": "inbox",  # "inbox" or "all"
@@ -619,184 +631,77 @@ def _track_senders(results: list, approvals: dict):
     _refresh_suggestions(stats, results, approvals)
 
 
-def _load_suggestions() -> list:
+def _save_advice(text: str):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    SUGGESTIONS_FILE.write_text(json.dumps({
+        "advice": text, "ts": int(time.time()),
+    }, indent=2) + "\n")
+
+
+def get_advice() -> dict:
+    """Get latest LLM advice on triage patterns."""
     if SUGGESTIONS_FILE.exists():
         try:
             data = json.loads(SUGGESTIONS_FILE.read_text())
-            return data if isinstance(data, list) else []
+            if isinstance(data, dict) and "advice" in data:
+                return data
         except (json.JSONDecodeError, OSError):
             pass
-    return []
-
-
-def _save_suggestions(suggestions: list):
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    SUGGESTIONS_FILE.write_text(json.dumps(suggestions, indent=2) + "\n")
+    return {"advice": "", "ts": None}
 
 
 def _refresh_suggestions(stats: dict, results: list, approvals: dict):
-    """Ask the LLM to analyze sender patterns and propose smart suggestions."""
-    if not llm_query or not DEFAULT_MODEL:
+    """Ask the LLM to review sender patterns and give plain-text advice."""
+    if not llm_query_text or not DEFAULT_MODEL:
+        _save_advice("No LLM available.")
         return
 
-    # Only run every 5+ apply cycles to avoid spamming LLM
-    existing = _load_suggestions()
     total_actions = sum(
         s.get("archive", 0) + s.get("delete", 0) + s.get("keep", 0)
         for s in stats.values()
     )
-    if total_actions < 5:
-        return  # not enough data yet
+    if total_actions < 3:
+        _save_advice(f"Need more data — {total_actions} action(s) so far.")
+        return
 
-    # Build context for the LLM
-    existing_rules = load_rules()
-    existing_froms = {
-        r["match"].get("from", "").lower()
-        for r in existing_rules
-        if r.get("match", {}).get("from")
-    }
-    already_suggested = {s.get("sender") for s in existing if not s.get("dismissed")}
-
-    # Filter to senders with enough history, no existing rule/suggestion
-    candidates = []
+    # Build sender summary
+    senders = []
     for sender, s in stats.items():
-        if any(ef and ef in sender for ef in existing_froms if ef):
-            continue
-        if sender in already_suggested:
-            continue
         total = s.get("archive", 0) + s.get("delete", 0) + s.get("keep", 0)
         if total < 2:
             continue
-        candidates.append({
-            "sender": sender,
-            "display_name": s.get("display_name", sender),
-            "archived": s.get("archive", 0),
-            "deleted": s.get("delete", 0),
-            "kept": s.get("keep", 0),
-            "first_seen": s.get("first_seen"),
-            "last_seen": s.get("last_seen"),
-        })
+        display = s.get('display_name', sender)
+        # Ensure email address is always visible
+        addr_part = f" ({sender})" if sender not in display.lower() else ""
+        senders.append(
+            f"- {display}{addr_part}: "
+            f"archived {s.get('archive', 0)}, deleted {s.get('delete', 0)}, kept {s.get('keep', 0)}"
+        )
 
-    if not candidates:
+    if not senders:
+        _save_advice("Not enough repeat senders yet to spot patterns.")
         return
 
-    # Also include what was just actioned for context
-    recent_actions = []
-    for item in results:
-        decision = approvals.get(item["msg_id"])
-        if decision and decision not in ("keep", "reject"):
-            recent_actions.append({
-                "from": item["from"],
-                "subject": item["subject"],
-                "action": decision,
-            })
+    # Include existing rules for context
+    existing_rules = load_rules()
+    rules_ctx = ""
+    if existing_rules:
+        rule_lines = [f"- {r.get('name', r['id'])}: {r['match']} → {r.get('action', 'archive')}"
+                      for r in existing_rules if r.get("enabled", True)]
+        if rule_lines:
+            rules_ctx = f"\n\nExisting filter rules:\n" + "\n".join(rule_lines)
 
     config = load_mail_config()
-    user_prompt = config.get("system_prompt", "")
+    system_msg = config.get("suggestion_prompt") or DEFAULT_SUGGESTION_PROMPT
 
-    sender_summary = json.dumps(candidates, indent=2)
-    recent_summary = json.dumps(recent_actions[:10], indent=2) if recent_actions else "None"
+    user_msg = f"Sender patterns:\n" + "\n".join(senders) + rules_ctx
 
-    system_msg = """You analyze email sender patterns to suggest automation rules.
-The user has been manually triaging their inbox. Based on their history with each sender, decide which senders deserve an auto-filter rule.
-
-IMPORTANT:
-- Only suggest rules for ONGOING patterns, not one-time cleanup (e.g. old orders being deleted doesn't mean auto-delete all from that sender)
-- Consider recency — if a sender was only seen long ago, it's not a pattern
-- Consider the ratio — if the user keeps some and archives/deletes others from the same sender, DON'T suggest a rule
-- Be conservative — only suggest when you're confident
-
-Respond with a JSON array of suggestions (can be empty []):
-[{"sender": "email@example.com", "action": "archive"|"delete", "reason": "brief explanation"}]"""
-
-    user_msg = f"""User's mail preferences: {user_prompt[:500] if user_prompt else 'Not specified'}
-
-Sender history:
-{sender_summary}
-
-Recent actions this session:
-{recent_summary}
-
-Which senders, if any, should get an auto-filter rule?"""
-
-    llm_result = llm_query(
+    advice = llm_query_text(
         DEFAULT_MODEL, system_msg, user_msg,
-        timeout=60, temperature=0.2, num_predict=2048,
+        timeout=30, temperature=0.3, num_predict=512,
     )
 
-    if not llm_result:
-        return
-
-    suggestions_list = llm_result if isinstance(llm_result, list) else []
-    if isinstance(llm_result, dict):
-        for key in ("suggestions", "rules", "results"):
-            if key in llm_result and isinstance(llm_result[key], list):
-                suggestions_list = llm_result[key]
-                break
-
-    for s in suggestions_list:
-        sender = s.get("sender", "").lower()
-        action = s.get("action", "archive")
-        reason = s.get("reason", "")
-
-        if not sender or action not in ("archive", "delete"):
-            continue
-        if sender in already_suggested:
-            continue
-
-        # Find display name from stats
-        display = stats.get(sender, {}).get("display_name", sender)
-        sender_stats = stats.get(sender, {})
-
-        existing.append({
-            "id": f"s_{uuid.uuid4().hex[:8]}",
-            "ts": int(time.time()),
-            "type": "rule_proposal",
-            "sender": sender,
-            "display_name": display,
-            "title": f"Auto-{action} from {sender}",
-            "description": reason,
-            "action": action,
-            "stats": {
-                "archive": sender_stats.get("archive", 0),
-                "delete": sender_stats.get("delete", 0),
-                "keep": sender_stats.get("keep", 0),
-            },
-            "dismissed": False,
-        })
-
-    _save_suggestions(existing)
-
-
-def get_suggestions() -> list:
-    """Get active (non-dismissed) suggestions."""
-    return [s for s in _load_suggestions() if not s.get("dismissed")]
-
-
-def accept_suggestion(suggestion_id: str) -> dict:
-    """Accept a suggestion — creates a fast-filter rule."""
-    suggestions = _load_suggestions()
-    for s in suggestions:
-        if s["id"] == suggestion_id and not s.get("dismissed"):
-            rule = add_rule({
-                "name": s["title"],
-                "match": {"from": s["sender"]},
-                "action": s["action"],
-            })
-            s["dismissed"] = True
-            _save_suggestions(suggestions)
-            return {"ok": True, "rule": rule}
-    return {"ok": False, "error": "Suggestion not found"}
-
-
-def dismiss_suggestion(suggestion_id: str) -> bool:
-    suggestions = _load_suggestions()
-    for s in suggestions:
-        if s["id"] == suggestion_id:
-            s["dismissed"] = True
-            _save_suggestions(suggestions)
-            return True
-    return False
+    _save_advice(advice or "LLM returned an empty response.")
 
 
 # ── Activity log ─────────────────────────────────────────────────────────────
@@ -839,7 +744,7 @@ def get_overview() -> dict:
     scan_data = load_scan()
     recent = get_recent_actions(20)
     rules = load_rules()
-    suggestions = get_suggestions()
+    advice = get_advice()
 
     pending = [r for r in scan_data.get("results", []) if r.get("approved") is None]
 
@@ -852,6 +757,6 @@ def get_overview() -> dict:
         "scan_results": scan_data.get("results", []),
         "pending_count": len(pending),
         "recent_actions": recent,
-        "suggestions": suggestions,
+        "advice": advice,
         "llm_available": llm_query is not None and DEFAULT_MODEL is not None,
     }

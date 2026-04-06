@@ -59,12 +59,17 @@ const Mail = {
         ${llmBadge}
       </div>`;
 
-    // Smart suggestions (from accumulated patterns)
-    const suggestions = d.suggestions || [];
-    if (suggestions.length > 0) {
-      html += this._foldable('Smart Suggestions', this._renderSuggestions(suggestions), {
-        open: true, count: suggestions.length, accent: true,
-      });
+    // LLM advice (from accumulated triage patterns)
+    const advice = d.advice || {};
+    if (advice.advice) {
+      const age = advice.ts ? new Date(advice.ts * 1000).toLocaleString() : '';
+      const rendered = typeof marked !== 'undefined'
+        ? marked.parse(advice.advice, {breaks: true, gfm: true})
+        : `<pre style="white-space:pre-wrap">${this._esc(advice.advice)}</pre>`;
+      html += this._foldable('Insights', `
+        <div class="msg-bubble markdown-content" style="padding:var(--space-sm);color:var(--text-secondary);font-size:var(--font-size-sm);line-height:1.6;background:transparent;border:none;max-width:none">${rendered}</div>
+        ${age ? `<div style="padding:0 var(--space-sm) var(--space-sm);font-size:var(--font-size-xs);color:var(--text-tertiary)">Updated ${age}</div>` : ''}
+      `, {open: true});
     }
 
     // Scan results (pending review)
@@ -187,66 +192,6 @@ const Mail = {
     }
 
     return html;
-  },
-
-  // ── Smart suggestions ─────────────────────────────────────────────────────
-
-  _renderSuggestions(suggestions) {
-    let html = '';
-    for (const s of suggestions) {
-      const icon = s.action === 'archive' ? '&#x1f4cb;' : '&#x1f5d1;';
-      const stats = s.stats || {};
-      const statsText = `archived ${stats.archive || 0}, deleted ${stats.delete || 0}, kept ${stats.keep || 0}`;
-
-      html += `
-        <div style="display:flex;align-items:flex-start;gap:var(--space-md);padding:var(--space-sm);border-bottom:1px solid var(--border-secondary)">
-          <div style="flex-shrink:0;font-size:1.2em">${icon}</div>
-          <div style="flex:1;min-width:0">
-            <div style="font-weight:600;color:var(--text-primary)">${this._esc(s.title)}</div>
-            <div style="font-size:var(--font-size-sm);color:var(--text-tertiary)">${this._esc(s.description)}</div>
-            <div style="font-size:var(--font-size-xs);color:var(--text-tertiary);margin-top:2px">Pattern: ${statsText}</div>
-          </div>
-          <div style="display:flex;gap:var(--space-xs);flex-shrink:0">
-            <button class="btn btn-sm" onclick="Mail.acceptSuggestion('${s.id}')">Add Rule</button>
-            <button class="btn btn-sm" onclick="Mail.dismissSuggestion('${s.id}')">Dismiss</button>
-          </div>
-        </div>`;
-    }
-    return html;
-  },
-
-  async acceptSuggestion(id) {
-    try {
-      const res = await fetch('/api/mail/suggestions/accept', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({id}),
-      });
-      const data = await res.json();
-      if (data.ok) {
-        App.toast('Fast-filter rule added!', 'success');
-        Tabs.loaded.mail = false;
-        Mail.load();
-      } else {
-        App.toast(data.error || 'Failed', 'error');
-      }
-    } catch (e) {
-      App.toast('Failed: ' + e.message, 'error');
-    }
-  },
-
-  async dismissSuggestion(id) {
-    try {
-      await fetch('/api/mail/suggestions/dismiss', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({id}),
-      });
-      Tabs.loaded.mail = false;
-      Mail.load();
-    } catch (e) {
-      App.toast('Failed: ' + e.message, 'error');
-    }
   },
 
   // ── Actions ───────────────────────────────────────────────────────────────

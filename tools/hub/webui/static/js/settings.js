@@ -1098,61 +1098,59 @@ const Settings = {
         </div>
         <div id="s-mail-status" style="margin-top:var(--space-sm)"></div>`;
     } else {
-      // Connected — show account, mode settings, prompt, and controls
+      // Connected — compact settings layout
+      const ta = 'style="width:100%;padding:var(--space-sm);background:var(--bg-primary);border:1px solid var(--border-primary);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:var(--font-size-sm);resize:vertical"';
       body = `
-        <div class="settings-group">
-          <div class="settings-row">
-            <span class="settings-label" style="min-width:130px;">Account</span>
-            <span class="settings-value">${this._esc(auth.email || 'Connected')}</span>
-          </div>
-        </div>
-        <div class="settings-group">
-          <div class="settings-label">Scan Mode</div>
-          <div class="settings-row" style="gap:var(--space-md);flex-wrap:wrap">
+        <div class="settings-group" style="display:grid;grid-template-columns:auto 1fr;gap:var(--space-xs) var(--space-md);align-items:center">
+          <span class="settings-label" style="margin:0">Account</span>
+          <span class="settings-value">${this._esc(auth.email || 'Connected')}</span>
+          <span class="settings-label" style="margin:0">Mode</span>
+          <div style="display:flex;gap:var(--space-md)">
             <label style="color:var(--text-secondary);display:flex;align-items:center;gap:var(--space-xs)">
-              <input type="radio" name="s-mail-mode" value="manual" id="s-mail-mode-manual"> Manual (batch review)
+              <input type="radio" name="s-mail-mode" value="manual" id="s-mail-mode-manual"> Manual
             </label>
             <label style="color:var(--text-secondary);display:flex;align-items:center;gap:var(--space-xs)">
-              <input type="radio" name="s-mail-mode" value="auto" id="s-mail-mode-auto"> Auto (suggestion feed)
+              <input type="radio" name="s-mail-mode" value="auto" id="s-mail-mode-auto"> Auto
             </label>
           </div>
-        </div>
-        <div class="settings-group">
-          <div class="settings-label">Scope</div>
-          <div class="settings-row" style="gap:var(--space-md);flex-wrap:wrap">
-            <select class="input" id="s-mail-scope-read" style="width:140px">
-              <option value="unread">Unread only</option>
+          <span class="settings-label" style="margin:0">Scope</span>
+          <div style="display:flex;gap:var(--space-sm)">
+            <select class="input" id="s-mail-scope-read" style="width:120px">
+              <option value="unread">Unread</option>
               <option value="all">All</option>
             </select>
-            <select class="input" id="s-mail-scope-label" style="width:140px">
-              <option value="inbox">Inbox only</option>
+            <select class="input" id="s-mail-scope-label" style="width:120px">
+              <option value="inbox">Inbox</option>
               <option value="all">All labels</option>
             </select>
           </div>
+          <span class="settings-label" style="margin:0">Batch</span>
+          <input type="number" class="input" id="s-mail-batch" style="width:80px" min="5" max="100" step="5">
         </div>
         <div class="settings-group">
-          <div class="settings-label">Batch Size</div>
-          <input type="number" class="input" id="s-mail-batch" style="max-width:100px" min="5" max="100" step="5">
-        </div>
-        <div class="settings-group">
-          <div class="settings-label">LLM System Prompt</div>
-          <div class="text-xs text-muted" style="margin-bottom:var(--space-xs)">Tell the LLM your preferences — what to keep, archive, or tag for deletion.</div>
-          <textarea id="s-mail-prompt" rows="6"
-                    style="width:100%;padding:var(--space-sm);background:var(--bg-primary);border:1px solid var(--border-primary);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:var(--font-size-sm);resize:vertical"
-          ></textarea>
-          <div class="settings-row" style="margin-top:var(--space-xs)">
-            <button class="btn btn-sm" onclick="Settings.saveMailConfig()">Save Settings</button>
-            <button class="btn btn-sm" onclick="Settings.resetMailPrompt()">Reset Prompt</button>
+          <div class="settings-label">Classification Prompt</div>
+          <div class="text-xs text-muted" style="margin-bottom:var(--space-xs)">Instructions for triaging individual emails — what to keep, archive, or delete.</div>
+          <textarea id="s-mail-prompt" rows="5" ${ta}></textarea>
+          <div style="text-align:right;margin-top:var(--space-xs)">
+            <button class="btn btn-sm" onclick="Settings.resetMailPrompt('system')">Reset</button>
           </div>
         </div>
         <div class="settings-group">
-          <div class="text-xs text-muted" style="margin-bottom:var(--space-md)">Scan and review in the <a href="/mail" style="color:var(--accent-primary)" onclick="event.preventDefault();App.switchTab('mail')">Mail tab</a>.</div>
-          <div class="settings-row">
-            <button class="btn btn-sm" onclick="Settings.resetMail('token')">Disconnect Account</button>
-            <button class="btn btn-sm" style="color:var(--status-error)" onclick="Settings.resetMail('all')">Reset Everything</button>
+          <div class="settings-label">Suggestion Prompt</div>
+          <div class="text-xs text-muted" style="margin-bottom:var(--space-xs)">Instructions for analyzing sender patterns and proposing auto-filter rules.</div>
+          <textarea id="s-mail-suggestion-prompt" rows="5" ${ta}></textarea>
+          <div style="text-align:right;margin-top:var(--space-xs)">
+            <button class="btn btn-sm" onclick="Settings.resetMailPrompt('suggestion')">Reset</button>
           </div>
-          <div class="text-xs text-muted" style="margin-top:var(--space-xs)">Disconnect removes the token. Reset also clears credentials, prompt, and rules.</div>
         </div>
+        <div class="settings-row" style="justify-content:space-between;margin-top:var(--space-sm)">
+          <button class="btn btn-sm" onclick="Settings.saveMailConfig()">Save Settings</button>
+          <div style="display:flex;gap:var(--space-sm)">
+            <button class="btn btn-sm" onclick="Settings.resetMail('token')">Disconnect</button>
+            <button class="btn btn-sm" style="color:var(--status-error)" onclick="Settings.resetMail('all')">Reset All</button>
+          </div>
+        </div>
+        <div class="text-xs text-muted" style="margin-top:var(--space-xs)">Scan and review in the <a href="#" style="color:var(--accent-primary)" onclick="event.preventDefault();App.switchTab('mail')">Mail tab</a>.</div>
         <div id="s-mail-status" style="margin-top:var(--space-sm)"></div>`;
     }
 
@@ -1264,6 +1262,8 @@ const Settings = {
       const res = await fetch('/api/mail/config');
       const data = await res.json();
       prompt.value = data.system_prompt || '';
+      const sugPrompt = document.getElementById('s-mail-suggestion-prompt');
+      if (sugPrompt) sugPrompt.value = data.suggestion_prompt || '';
       // Populate mode
       const modeManual = document.getElementById('s-mail-mode-manual');
       const modeAuto = document.getElementById('s-mail-mode-auto');
@@ -1284,6 +1284,7 @@ const Settings = {
 
   async saveMailConfig() {
     const prompt = document.getElementById('s-mail-prompt')?.value || '';
+    const sugPrompt = document.getElementById('s-mail-suggestion-prompt')?.value || '';
     const mode = document.querySelector('input[name="s-mail-mode"]:checked')?.value || 'manual';
     const scopeRead = document.getElementById('s-mail-scope-read')?.value || 'unread';
     const scopeLabel = document.getElementById('s-mail-scope-label')?.value || 'inbox';
@@ -1295,6 +1296,7 @@ const Settings = {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
           system_prompt: prompt,
+          suggestion_prompt: sugPrompt,
           mode,
           scope_read: scopeRead,
           scope_label: scopeLabel,
@@ -1307,15 +1309,16 @@ const Settings = {
     }
   },
 
-  async resetMailPrompt() {
+  async resetMailPrompt(which) {
+    const key = which === 'suggestion' ? 'suggestion_prompt' : 'system_prompt';
     try {
       await fetch('/api/mail/config', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({system_prompt: null}),
+        body: JSON.stringify({[key]: null}),
       });
       this._loadMailPrompt();
-      App.toast('Prompt reset to default', 'success');
+      App.toast(`${which === 'suggestion' ? 'Suggestion' : 'Classification'} prompt reset`, 'success');
     } catch (e) {
       App.toast('Failed: ' + e.message, 'error');
     }
