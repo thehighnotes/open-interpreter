@@ -3,7 +3,7 @@
 const Updates = {
   _data: null,
   _approvals: {},
-  _filter: { host: null, dimension: null, text: '', analyzed: false },
+  _filter: { host: null, dimension: null, text: '', analyzed: false, hideDeployed: true },
   _expandedClusters: {},
   _selectedClusters: {},
   _analyzeTimer: null,
@@ -82,6 +82,7 @@ const Updates = {
         ${dims.map(d => filterBtn(d, 'dimension', d)).join('')}
         <span style="color:var(--border-secondary);margin:0 2px">|</span>
         <span class="badge ${analyzedActive}" style="cursor:pointer" onclick="Updates.toggleAnalyzed()">Analyzed</span>
+        <span class="badge ${f.hideDeployed ? 'badge-info' : ''}" style="cursor:pointer" onclick="Updates.toggleHideDeployed()">Hide Deployed</span>
       </div>`;
     }
 
@@ -482,6 +483,11 @@ const Updates = {
     this._render();
   },
 
+  toggleHideDeployed() {
+    this._filter.hideDeployed = !this._filter.hideDeployed;
+    this._render();
+  },
+
   _filterClusters(clusters) {
     const f = this._filter;
     const q = (f.text || '').toLowerCase();
@@ -493,6 +499,7 @@ const Updates = {
       if (f.host && !(c.hosts || []).includes(f.host)) return false;
       if (f.dimension && c.dimension !== f.dimension && c.dimension !== 'mixed') return false;
       if (f.analyzed && !c.analysis) return false;
+      if (f.hideDeployed && c.deployed_at) return false;
       if (q) {
         // Match cluster name, host names, or any package name in the cluster
         const nameMatch = (c.name || '').toLowerCase().includes(q);
