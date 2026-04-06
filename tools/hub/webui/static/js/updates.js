@@ -137,8 +137,7 @@ const Updates = {
       for (const c of catchalls) html += this._renderCluster(c, results);
     }
 
-    // ── Apply commands area ────────────────────────────────────────────
-    html += '<div id="updates-apply-area"></div>';
+
 
     // ── Rules ──────────────────────────────────────────────────────────
     const rules = d.rules || [];
@@ -254,8 +253,19 @@ const Updates = {
       clusterItems.sort((a, b) => (b.required_by_count || 0) - (a.required_by_count || 0));
       const itemsHtml = this._renderClusterItems(clusterItems, cid);
 
+      // Q&A input
+      const qaHtml = `<div style="margin-top:var(--space-sm);padding-top:var(--space-sm);border-top:1px solid var(--border-primary)">
+        <div style="display:flex;gap:var(--space-xs);align-items:center">
+          <input type="text" class="input" id="qa-input-${this._esc(cid)}" placeholder="Ask about this cluster..." style="flex:1;font-size:var(--font-size-sm)" onkeydown="if(event.key==='Enter')Updates.askCluster('${this._esc(cid)}')">
+          <button class="btn btn-sm" onclick="Updates.askCluster('${this._esc(cid)}')">Ask</button>
+          <button class="btn btn-sm" onclick="Updates.deployCluster('${this._esc(cid)}')" title="Deploy script to host">Deploy</button>
+        </div>
+        <div id="qa-result-${this._esc(cid)}"></div>
+        <div id="deploy-result-${this._esc(cid)}"></div>
+      </div>`;
+
       expandedHtml = `<div style="padding:var(--space-sm);border-top:1px solid var(--border-secondary)">
-        ${projDetail}${influenceDetail}${analysisCard}${itemsHtml}
+        ${projDetail}${influenceDetail}${analysisCard}${itemsHtml}${qaHtml}
       </div>`;
     }
 
@@ -278,8 +288,7 @@ const Updates = {
         </div>
         <div style="display:flex;gap:var(--space-xs);flex-shrink:0" onclick="event.stopPropagation()">
           <button class="btn btn-sm" onclick="Updates.analyzeCluster('${this._esc(cid)}')" title="${a ? 'Re-analyze' : 'Analyze'}">${a ? 'Re-analyze' : 'Analyze'}</button>
-          <button class="btn btn-sm" onclick="Updates.approveCluster('${this._esc(cid)}')">${expanded ? 'Approve All' : 'Approve'}</button>
-          <button class="btn btn-sm" onclick="Updates.skipCluster('${this._esc(cid)}')">${expanded ? 'Skip All' : 'Skip'}</button>
+          <button class="btn btn-sm" onclick="Updates.deployCluster('${this._esc(cid)}')" title="Deploy update script to host">Deploy</button>
         </div>
       </div>
       ${expandedHtml}
@@ -322,9 +331,8 @@ const Updates = {
 
       html += `<div style="display:flex;align-items:flex-start;gap:var(--space-sm);padding:var(--space-xs) 0;border-bottom:1px solid var(--border-primary)">
         <select class="input update-action-select" data-id="${this._esc(id)}" style="width:80px;flex-shrink:0;font-size:var(--font-size-xs)" onchange="Updates.onSelect('${this._esc(id)}', this.value)">
-          <option value="" ${!current ? 'selected' : ''}>--</option>
-          <option value="approve" ${current === 'approve' ? 'selected' : ''}>Approve</option>
-          <option value="skip" ${current === 'skip' ? 'selected' : ''}>Skip</option>
+          <option value="" ${!current ? 'selected' : ''}>Include</option>
+          <option value="skip" ${current === 'skip' ? 'selected' : ''}>Exclude</option>
         </select>
         <div style="flex:1;min-width:0">
           <div style="display:flex;align-items:center;gap:var(--space-xs);flex-wrap:wrap">
@@ -338,7 +346,8 @@ const Updates = {
       </div>`;
     }
     html += `<div style="display:flex;gap:var(--space-sm);margin-top:var(--space-sm)">
-      <button class="btn btn-sm" onclick="Updates.applySelected()">Apply Selected</button>
+      <button class="btn btn-sm" onclick="Updates.includeAllInCluster('${this._esc(clusterId)}')">Include All</button>
+      <button class="btn btn-sm" onclick="Updates.excludeAllInCluster('${this._esc(clusterId)}')">Exclude All</button>
       <button class="btn btn-sm" onclick="Updates.enrichCluster('${this._esc(clusterId)}')">Load Intelligence</button>
     </div></div>`;
     return html;
@@ -379,11 +388,33 @@ const Updates = {
     });
   },
 
+  // ── Activity banner ──────────────────────────────────────────────────
+
+  _showBanner(msg) {
+    this._hideBanner();
+    const container = document.getElementById('updates-content');
+    if (!container) return;
+    const banner = document.createElement('div');
+    banner.id = 'updates-banner';
+    banner.style.cssText = 'position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:var(--space-sm);padding:var(--space-sm);margin-bottom:var(--space-sm);background:var(--bg-secondary);border:1px solid var(--accent-primary);border-radius:var(--radius-md);font-size:var(--font-size-sm)';
+    banner.innerHTML = `<div class="spinner" style="width:16px;height:16px;flex-shrink:0"></div><span id="updates-banner-text">${msg}</span>`;
+    container.prepend(banner);
+  },
+
+  _updateBanner(msg) {
+    const el = document.getElementById('updates-banner-text');
+    if (el) el.innerHTML = msg;
+  },
+
+  _hideBanner() {
+    const el = document.getElementById('updates-banner');
+    if (el) el.remove();
+  },
+
   // ── Scan ────────────────────────────────────────────────────────────────
 
   async scan(options) {
-    const container = document.getElementById('updates-content');
-    container.innerHTML = '<div class="tab-loading"><div class="spinner"></div>Scanning for updates across all hosts...<br><span class="text-xs text-muted">Gathering packages, dependencies, and building clusters (~50s)</span></div>';
+    this._showBanner('Scanning all hosts for updates... <span class="text-xs text-muted">(~50s)</span>');
     try {
       const res = await fetch('/api/updates/scan', {
         method: 'POST',
@@ -391,24 +422,24 @@ const Updates = {
         body: JSON.stringify(options || {}),
       });
       const data = await res.json();
+      this._hideBanner();
       if (data.ok) {
         App.toast(`Scan complete: ${data.scanned} items in ${data.cluster_count} clusters`, 'success');
         Tabs.loaded.updates = false;
         this.load();
       } else {
         App.toast(data.error || 'Scan failed', 'error');
-        this.load();
       }
     } catch (e) {
+      this._hideBanner();
       App.toast('Scan failed: ' + e.message, 'error');
-      this.load();
     }
   },
 
   // ── Analysis ────────────────────────────────────────────────────────────
 
   async analyze(clusterIds) {
-    App.toast('Starting LLM analysis on clusters...', 'info');
+    this._showBanner('Running LLM analysis on clusters... <span class="text-xs text-muted">0 done</span>');
     try {
       const body = clusterIds ? { cluster_ids: clusterIds } : {};
       const res = await fetch('/api/updates/analyze', {
@@ -418,12 +449,13 @@ const Updates = {
       });
       const data = await res.json();
       if (data.ok) {
-        App.toast(`Analyzing ${data.clusters} clusters...`, 'info');
-        this._pollAnalysis();
+        this._pollAnalysis(data.clusters);
       } else {
+        this._hideBanner();
         App.toast(data.error || 'Analysis failed', 'error');
       }
     } catch (e) {
+      this._hideBanner();
       App.toast('Analysis failed: ' + e.message, 'error');
     }
   },
@@ -432,26 +464,28 @@ const Updates = {
     this.analyze([cid]);
   },
 
-  _pollAnalysis() {
+  _pollAnalysis(total) {
     if (this._analyzeTimer) clearInterval(this._analyzeTimer);
     this._analyzeTimer = setInterval(async () => {
       try {
         const res = await fetch('/api/updates/analyze/status');
         const data = await res.json();
+        this._updateBanner(`Running LLM analysis... <span class="text-xs text-muted">${data.done}/${data.total} clusters done</span>`);
         if (data.complete) {
           clearInterval(this._analyzeTimer);
           this._analyzeTimer = null;
+          this._hideBanner();
           App.toast(`Analysis complete: ${data.done} clusters analyzed`, 'success');
           Tabs.loaded.updates = false;
           this.load();
         } else if (data.done > 0) {
-          // Partial results — reload to show completed analyses
           Tabs.loaded.updates = false;
           this.load();
         }
       } catch (e) {
         clearInterval(this._analyzeTimer);
         this._analyzeTimer = null;
+        this._hideBanner();
       }
     }, 5000);
   },
@@ -479,123 +513,110 @@ const Updates = {
     }
   },
 
-  // ── Selection & Approval ────────────────────────────────────────────────
+  // ── Deploy & Q&A ────────────────────────────────────────────────────────
+
+  async deployCluster(cid) {
+    const resultEl = document.getElementById(`deploy-result-${cid}`);
+    if (resultEl) resultEl.innerHTML = '<div class="text-xs text-muted" style="padding:var(--space-xs)">Deploying script to host...</div>';
+    try {
+      const res = await fetch('/api/updates/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cluster_id: cid, excluded: this._getExcluded(cid) }),
+      });
+      const data = await res.json();
+      if (data.ok && resultEl) {
+        const items = data.deployed || [];
+        let html = '';
+        for (const d of items) {
+          if (d.error) {
+            html += `<div style="padding:var(--space-xs);color:var(--status-error);font-size:var(--font-size-sm)">${this._esc(d.host_name)}: ${this._esc(d.error)}</div>`;
+          } else {
+            html += `<div style="padding:var(--space-xs);font-size:var(--font-size-sm)">
+              <span style="color:var(--status-success)">&#10003;</span>
+              <strong>${this._esc(d.host_name)}</strong>:
+              <code style="color:var(--accent-primary);font-size:var(--font-size-xs)">${this._esc(d.path)}</code>
+              <span class="text-xs text-muted">(${d.items} items, ${d.commands} commands)</span>
+            </div>`;
+          }
+        }
+        resultEl.innerHTML = html;
+        App.toast(`Script deployed to ${items.filter(d => !d.error).length} host(s)`, 'success');
+      } else if (resultEl) {
+        resultEl.innerHTML = `<div class="text-xs" style="color:var(--status-error);padding:var(--space-xs)">${this._esc(data.error || 'Deploy failed')}</div>`;
+      }
+    } catch (e) {
+      if (resultEl) resultEl.innerHTML = `<div class="text-xs" style="color:var(--status-error);padding:var(--space-xs)">Failed: ${this._esc(e.message)}</div>`;
+    }
+  },
+
+  async askCluster(cid) {
+    const input = document.getElementById(`qa-input-${cid}`);
+    const resultEl = document.getElementById(`qa-result-${cid}`);
+    if (!input || !input.value.trim()) return;
+    const question = input.value.trim();
+    if (resultEl) resultEl.innerHTML = '<div class="text-xs text-muted" style="padding:var(--space-xs)">Thinking...</div>';
+    try {
+      const res = await fetch('/api/updates/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cluster_id: cid, question }),
+      });
+      const data = await res.json();
+      if (data.ok && resultEl) {
+        const rendered = typeof marked !== 'undefined' ? marked.parse(data.answer) : `<pre>${this._esc(data.answer)}</pre>`;
+        resultEl.innerHTML = `<div style="margin-top:var(--space-xs);padding:var(--space-sm);background:var(--bg-secondary);border-radius:var(--radius-sm);border-left:3px solid var(--accent-primary)">
+          <div class="text-xs text-muted" style="margin-bottom:4px">Q: ${this._esc(question)}</div>
+          <div class="msg-bubble markdown-content" style="font-size:var(--font-size-sm)">${rendered}</div>
+        </div>`;
+      } else if (resultEl) {
+        resultEl.innerHTML = `<div class="text-xs" style="color:var(--status-error);padding:var(--space-xs)">${this._esc(data.error || 'No answer')}</div>`;
+      }
+    } catch (e) {
+      if (resultEl) resultEl.innerHTML = `<div class="text-xs" style="color:var(--status-error);padding:var(--space-xs)">Failed: ${this._esc(e.message)}</div>`;
+    }
+    input.value = '';
+  },
+
+  // ── Item selection (Include/Exclude for deploy) ─────────────────────────
 
   onSelect(id, value) {
-    if (value) this._approvals[id] = value;
-    else delete this._approvals[id];
+    if (value === 'skip') this._approvals[id] = 'skip';
+    else delete this._approvals[id];  // default = included
   },
 
-  approveCluster(cid) {
+  _getExcluded(cid) {
+    // Get item IDs explicitly excluded for this cluster
+    const clusters = (this._data && this._data.clusters) || [];
+    const cluster = clusters.find(c => c.id === cid);
+    if (!cluster) return [];
+    return (cluster.item_ids || []).filter(id => this._approvals[id] === 'skip');
+  },
+
+  includeAllInCluster(cid) {
     const clusters = (this._data && this._data.clusters) || [];
     const cluster = clusters.find(c => c.id === cid);
     if (!cluster) return;
-    const itemIds = cluster.item_ids || [];
-    const results = (this._data && this._data.scan_results) || [];
-    let count = 0;
-    for (const r of results) {
-      if (itemIds.includes(r.id) && r.classification !== 'blocked') {
-        this._approvals[r.id] = 'approve';
-        count++;
-      }
+    for (const id of (cluster.item_ids || [])) {
+      delete this._approvals[id];
     }
-    // Update visible selects
     document.querySelectorAll('.update-action-select').forEach(sel => {
-      if (this._approvals[sel.dataset.id]) sel.value = this._approvals[sel.dataset.id];
+      if ((cluster.item_ids || []).includes(sel.dataset.id)) sel.value = '';
     });
-    App.toast(`Approved ${count} items in ${cluster.name}`, 'success');
+    App.toast(`All ${cluster.item_count} items included`, 'info');
   },
 
-  skipCluster(cid) {
+  excludeAllInCluster(cid) {
     const clusters = (this._data && this._data.clusters) || [];
     const cluster = clusters.find(c => c.id === cid);
     if (!cluster) return;
-    const itemIds = cluster.item_ids || [];
-    const results = (this._data && this._data.scan_results) || [];
-    let count = 0;
-    for (const r of results) {
-      if (itemIds.includes(r.id) && r.classification !== 'blocked') {
-        this._approvals[r.id] = 'skip';
-        count++;
-      }
+    for (const id of (cluster.item_ids || [])) {
+      this._approvals[id] = 'skip';
     }
     document.querySelectorAll('.update-action-select').forEach(sel => {
-      if (this._approvals[sel.dataset.id]) sel.value = this._approvals[sel.dataset.id];
+      if ((cluster.item_ids || []).includes(sel.dataset.id)) sel.value = 'skip';
     });
-    App.toast(`Skipped ${count} items in ${cluster.name}`, 'info');
-  },
-
-  async applySelected() {
-    const toApply = Object.entries(this._approvals).filter(([_, v]) => v);
-    if (!toApply.length) { App.toast('No items selected', 'error'); return; }
-    try {
-      const res = await fetch('/api/updates/apply', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ approvals: this._approvals }),
-      });
-      const data = await res.json();
-      if (data.ok) {
-        App.toast(`Applied: ${data.approved} approved, ${data.skipped} skipped`, 'success');
-        this._renderApplyCommands(data.commands || {});
-      } else {
-        App.toast(data.error || 'Apply failed', 'error');
-      }
-    } catch (e) {
-      App.toast('Apply failed: ' + e.message, 'error');
-    }
-  },
-
-  _renderApplyCommands(commands) {
-    const area = document.getElementById('updates-apply-area');
-    if (!area || !Object.keys(commands).length) return;
-    let html = '';
-    for (const [host, data] of Object.entries(commands)) {
-      const cmdText = data.commands.join('\n');
-      html += `<div style="margin-bottom:var(--space-md);padding:var(--space-sm);border:1px solid var(--border-secondary);border-radius:var(--radius-md);background:var(--bg-secondary)">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--space-xs)">
-          <strong>${this._esc(data.host_name)} (${data.count} updates)</strong>
-          <div style="display:flex;gap:var(--space-xs)">
-            <button class="btn btn-sm" onclick="Updates.copyCommands('${this._esc(host)}')">Copy</button>
-            <button class="btn btn-sm" onclick="Updates.exportScript('${this._esc(host)}')">Export .sh</button>
-          </div>
-        </div>
-        <pre id="updates-cmds-${this._esc(host)}" style="margin:0;padding:var(--space-sm);background:var(--bg-primary);border-radius:var(--radius-sm);font-size:var(--font-size-sm);overflow-x:auto;white-space:pre-wrap;word-break:break-all">${this._esc(cmdText)}</pre>
-      </div>`;
-    }
-    area.innerHTML = this._foldable('Apply Commands', html, { open: true });
-  },
-
-  copyCommands(host) {
-    const pre = document.getElementById(`updates-cmds-${host}`);
-    if (!pre) return;
-    navigator.clipboard.writeText(pre.textContent).then(
-      () => App.toast('Copied to clipboard', 'success'),
-      () => App.toast('Copy failed', 'error')
-    );
-  },
-
-  async exportScript(host) {
-    try {
-      const res = await fetch('/api/updates/export', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ host }),
-      });
-      const data = await res.json();
-      if (data.ok && data.script) {
-        const blob = new Blob([data.script], { type: 'text/x-shellscript' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `update-${host}.sh`;
-        a.click();
-        URL.revokeObjectURL(url);
-        App.toast(`Exported update-${host}.sh`, 'success');
-      }
-    } catch (e) {
-      App.toast('Export failed: ' + e.message, 'error');
-    }
+    App.toast(`All ${cluster.item_count} items excluded`, 'info');
   },
 
   // ── Rules ───────────────────────────────────────────────────────────────

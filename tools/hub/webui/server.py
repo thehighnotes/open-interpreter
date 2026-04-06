@@ -1415,6 +1415,36 @@ async def updates_enrich(request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
+async def updates_deploy(request):
+    """POST /api/updates/deploy — deploy update script to target host."""
+    try:
+        body = await _json_body(request)
+        cluster_id = body.get("cluster_id")
+        if not cluster_id:
+            return JSONResponse({"ok": False, "error": "cluster_id required"}, status_code=400)
+        from updates_api import deploy_cluster_script
+        excluded = body.get("excluded", [])
+        result = deploy_cluster_script(cluster_id, excluded=excluded)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def updates_ask(request):
+    """POST /api/updates/ask — ask a question about a cluster."""
+    try:
+        body = await _json_body(request)
+        cluster_id = body.get("cluster_id")
+        question = body.get("question")
+        if not cluster_id or not question:
+            return JSONResponse({"ok": False, "error": "cluster_id and question required"}, status_code=400)
+        from updates_api import ask_cluster
+        result = ask_cluster(cluster_id, question)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 # ── App assembly ─────────────────────────────────────────────────────────────
 
 _TAB_ROUTES = ["chat", "status", "projects", "apps", "repo", "research", "notify", "mail", "updates", "help", "settings"]
@@ -1503,6 +1533,8 @@ routes = [
     Route("/api/updates/analyze", updates_analyze, methods=["POST"]),
     Route("/api/updates/analyze/status", updates_analyze_status),
     Route("/api/updates/enrich", updates_enrich, methods=["POST"]),
+    Route("/api/updates/deploy", updates_deploy, methods=["POST"]),
+    Route("/api/updates/ask", updates_ask, methods=["POST"]),
     # Apps
     Route("/api/apps", get_apps),
     Route("/api/apps/tunnel", app_tunnel, methods=["POST"]),

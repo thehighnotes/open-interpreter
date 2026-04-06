@@ -53,8 +53,9 @@ You are analyzing the "{cluster_name}" update cluster on {host_names}.
 Host roles: {host_roles}. Affected projects: {projects}.
 Risk score: {risk_score} (total reverse dependencies across this cluster).
 
-Release notes for each package are provided below the package list. \
-Use them to identify SPECIFIC changes that break, improve, or disrupt this environment. \
+For each package you are given: release notes AND actual import usage from the projects on this host. \
+If a package is NOT IMPORTED by any project, breaking changes in it are LOW risk — note this explicitly. \
+If a package IS imported, check whether the specific APIs/classes used are affected by the changes. \
 Reference actual API changes, removed features, new capabilities, or migration requirements.
 
 Respond with ONLY a JSON object — no markdown, no explanation, no code fences:
@@ -930,17 +931,71 @@ def _parse_cluster_analysis(raw_text):
     return analysis
 
 
+def _scan_actual_usage(cluster, items):
+    """Grep affected projects for actual imports of each package in the cluster.
+    Returns {package_name: {project_key: [import_lines]}} dict."""
+    pip_items = [i for i in items if i.get("dimension") == "pip"]
+    if not pip_items:
+        return {}
+
+    # Build package names to search for (normalize: trl, peft, accelerate, etc.)
+    # Python import names often differ from pip names (e.g., scikit-learn → sklearn)
+    # but for most packages they match or are close enough
+    pkg_names = [i["package"].lower().replace("-", "_").replace(".", "_") for i in pip_items]
+    pkg_display = {i["package"].lower().replace("-", "_").replace(".", "_"): i["package"] for i in pip_items}
+
+    # Build grep pattern: "from pkg|import pkg" for all packages
+    patterns = "|".join(f"from {p}|import {p}" for p in pkg_names)
+
+    # Get affected projects on each host
+    usage = {}
+    for proj in cluster.get("projects", []):
+        pkey = proj.get("key", "")
+        pdata = PROJECTS.get(pkey, {})
+        host = pdata.get("host", "")
+        path = pdata.get("path", "")
+        if not host or not path:
+            continue
+
+        ok, output = ssh_cmd(
+            host,
+            f"grep -rh --include='*.py' -E '{patterns}' {path}/ 2>/dev/null | sort -u | head -30",
+            timeout=10,
+        )
+        if not ok or not output.strip():
+            continue
+
+        for line in output.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # Match which package this import belongs to
+            for pkg_norm, pkg_orig in pkg_display.items():
+                if f"from {pkg_norm}" in line or f"import {pkg_norm}" in line:
+                    if pkg_orig not in usage:
+                        usage[pkg_orig] = {}
+                    if pkey not in usage[pkg_orig]:
+                        usage[pkg_orig][pkey] = []
+                    usage[pkg_orig][pkey].append(line)
+                    break
+
+    return usage
+
+
 _analysis_lock = threading.Lock()
 _analysis_state = {}  # {cluster_id: "pending"|"running"|"done"|"error"}
 
 
 def _analyze_single_cluster(cluster, items, config):
-    """Run LLM analysis for one cluster with release notes context."""
+    """Run LLM analysis for one cluster with release notes + actual usage context."""
     cluster_id = cluster["id"]
     with _analysis_lock:
         _analysis_state[cluster_id] = "running"
 
     try:
+        # Step 0: Scan actual usage of packages in affected projects
+        usage_data = _scan_actual_usage(cluster, items)
+
         # Step 1: Fetch release notes for all packages in parallel
         release_data = _gather_cluster_release_notes(items)
 
@@ -991,6 +1046,15 @@ def _analyze_single_cluster(cluster, items, config):
                 f"{item.get('available', '?')}{rb_str}{semver} ==="
                 f"{deps_str}"
             )
+
+            # Actual usage in projects (from grep)
+            pkg_usage = usage_data.get(pkg, {})
+            if pkg_usage:
+                section += "\n  ACTUAL USAGE IN PROJECTS:"
+                for proj_key, imports in pkg_usage.items():
+                    section += f"\n    {proj_key}: {'; '.join(imports[:5])}"
+            else:
+                section += "\n  NOT IMPORTED by any project on this host"
 
             # Inline release notes for this package
             if pkg in release_data:
@@ -1413,6 +1477,191 @@ def export_script(host, item_ids=None):
         lines.append("")
     lines.append("echo 'Done.'")
     return {"script": "\n".join(lines), "host": host, "host_name": host_name}
+
+
+def deploy_cluster_script(cluster_id, excluded=None):
+    """Generate and deploy update script to target host via SSH.
+    Writes to ~/oi-scripts/{cluster-name}/update-{date}.sh on each host.
+    excluded: list of item IDs to exclude from the script."""
+    scan_data = load_scan()
+    results = scan_data.get("results", [])
+    clusters = scan_data.get("clusters", {})
+    cluster = clusters.get(cluster_id)
+    if not cluster:
+        return {"ok": False, "error": "Cluster not found"}
+
+    excluded_set = set(excluded or [])
+    item_map = {i["id"]: i for i in results}
+    cluster_items = [item_map[iid] for iid in cluster.get("item_ids", []) if iid in item_map]
+
+    # Include all non-blocked items except explicitly excluded ones
+    approved = [i for i in cluster_items
+                if i.get("classification") != "blocked" and i.get("id") not in excluded_set]
+
+    if not approved:
+        return {"ok": False, "error": "No items to deploy"}
+
+    # Group by host (a cluster can span multiple hosts)
+    by_host = {}
+    for item in approved:
+        h = item.get("host", "unknown")
+        if h not in by_host:
+            by_host[h] = []
+        by_host[h].append(item)
+
+    # Sanitize cluster name for filesystem
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', cluster.get("name", cluster_id)).strip("_").lower()
+    safe_name = re.sub(r'_+', '_', safe_name)[:50]
+    date_str = time.strftime("%Y-%m-%d")
+    deployed = []
+
+    for host, items in by_host.items():
+        commands = _generate_commands(items)
+        host_data = commands.get(host, {"commands": []})
+        if not host_data.get("commands"):
+            continue
+
+        host_name = HOSTS.get(host, {}).get("name", host)
+        script_dir = f"~/oi-scripts/{safe_name}"
+        script_name = f"update-{date_str}.sh"
+        script_path = f"{script_dir}/{script_name}"
+
+        # Build script content
+        lines = [
+            "#!/bin/bash",
+            f"# Cluster: {cluster.get('name', cluster_id)}",
+            f"# Host: {host_name}",
+            f"# Generated: {time.strftime('%Y-%m-%d %H:%M')} by OI WebUI",
+            f"# Items: {len(items)}",
+            "",
+        ]
+
+        # Add analysis context as comments if available
+        a = cluster.get("analysis")
+        if isinstance(a, dict):
+            if a.get("recommendation"):
+                lines.append(f"# Recommendation: {a['recommendation'].upper()}")
+            if a.get("reasoning"):
+                for rline in a["reasoning"][:200].split(". "):
+                    lines.append(f"#   {rline.strip()}")
+            if a.get("update_order"):
+                lines.append(f"# Update order: {' -> '.join(a['update_order'])}")
+            if a.get("breaking_changes"):
+                lines.append("#")
+                lines.append("# BREAKING CHANGES:")
+                for bc in a["breaking_changes"]:
+                    lines.append(f"#   - {bc[:120]}")
+            lines.append("")
+
+        lines.append("set -euo pipefail")
+        lines.append("")
+
+        for cmd in host_data["commands"]:
+            lines.append(f'echo "=== {cmd.split()[0]} ==="')
+            lines.append(cmd)
+            lines.append("")
+
+        lines.append('echo "Done."')
+        script_content = "\n".join(lines)
+
+        # Deploy via SSH: mkdir + write file
+        # Escape single quotes in script content for the heredoc
+        escaped = script_content.replace("'", "'\\''")
+        deploy_cmd = (
+            f"mkdir -p {script_dir} && "
+            f"cat > {script_path} << 'OISCRIPT'\n{script_content}\nOISCRIPT\n"
+            f"chmod +x {script_path} && echo 'OK'"
+        )
+
+        ok, output = ssh_cmd(host, deploy_cmd, timeout=15)
+        if ok and "OK" in output:
+            deployed.append({
+                "host": host,
+                "host_name": host_name,
+                "path": script_path,
+                "items": len(items),
+                "commands": len(host_data["commands"]),
+            })
+        else:
+            deployed.append({
+                "host": host,
+                "host_name": host_name,
+                "error": f"Deploy failed: {output[:200]}",
+            })
+
+    return {
+        "ok": True,
+        "cluster_name": cluster.get("name", cluster_id),
+        "deployed": deployed,
+    }
+
+
+# ── Cluster Q&A ──────────────────────────────────────────────────────────────
+
+def ask_cluster(cluster_id, question):
+    """Ask a follow-up question about a cluster with full context."""
+    if not llm_query_text or not DEFAULT_MODEL:
+        return {"ok": False, "error": "LLM not available"}
+
+    scan_data = load_scan()
+    results = scan_data.get("results", [])
+    clusters = scan_data.get("clusters", {})
+    cluster = clusters.get(cluster_id)
+    if not cluster:
+        return {"ok": False, "error": "Cluster not found"}
+
+    item_map = {i["id"]: i for i in results}
+    items = [item_map[iid] for iid in cluster.get("item_ids", []) if iid in item_map]
+
+    # Build rich context
+    host_names = ", ".join(HOSTS.get(h, {}).get("name", h) for h in cluster.get("hosts", []))
+    projects_str = ", ".join(
+        f"{p['name']} ({p['tagline']})" for p in cluster.get("projects", [])[:5]
+    ) or "none identified"
+
+    # Package details
+    pkg_lines = []
+    for item in items:
+        rb = item.get("required_by", [])
+        rb_str = f" (needed by: {', '.join(rb[:5])})" if rb else ""
+        reason = f" — LLM: {item['reason']}" if item.get("reason") else ""
+        intel = item.get("intel", {})
+        semver = f" [{intel.get('semver_change', '?')}]" if intel else ""
+        pkg_lines.append(
+            f"  {item['package']} {item.get('current', '?')} → {item.get('available', '?')}"
+            f"{semver}{rb_str}{reason}"
+        )
+
+    # Include analysis if available
+    analysis_ctx = ""
+    a = cluster.get("analysis")
+    if isinstance(a, dict) and not a.get("error"):
+        analysis_ctx = f"\nPrevious analysis:\n"
+        analysis_ctx += f"  Recommendation: {a.get('recommendation', '?')}\n"
+        analysis_ctx += f"  Reasoning: {a.get('reasoning', '')}\n"
+        if a.get("breaking_changes"):
+            analysis_ctx += "  Breaking: " + "; ".join(a["breaking_changes"]) + "\n"
+        if a.get("new_features"):
+            analysis_ctx += "  New: " + "; ".join(a["new_features"]) + "\n"
+
+    system_prompt = (
+        f"You are answering questions about the \"{cluster.get('name', '?')}\" update cluster.\n"
+        f"Hosts: {host_names}. Projects: {projects_str}.\n"
+        f"Packages:\n" + "\n".join(pkg_lines) + "\n"
+        f"{analysis_ctx}\n"
+        f"Answer concisely and specifically. Reference package names and versions."
+    )
+
+    answer = llm_query_text(
+        DEFAULT_MODEL, system_prompt, question,
+        timeout=60, temperature=0.3, num_predict=1024,
+    )
+
+    return {
+        "ok": True,
+        "answer": answer or "No response from LLM",
+        "cluster_name": cluster.get("name", cluster_id),
+    }
 
 
 # ── Action log ───────────────────────────────────────────────────────────────
