@@ -271,6 +271,28 @@ def add_rule(rule: dict):
     rule["match"] = match
     rules.append(rule)
     save_rules(rules)
+
+    # Apply retroactively to current scan results
+    scan_data = load_scan()
+    results = scan_data.get("results", [])
+    retroactive = 0
+    for item in results:
+        if item.get("source") == "rule":
+            continue  # already classified by a rule
+        headers = item.get("headers", [])
+        if not headers:
+            continue
+        action = _match_fast_filter(headers, [rule])
+        if action:
+            item["action"] = action
+            item["reason"] = f"Rule: {rule.get('name', rule['id'])}"
+            item["source"] = "rule"
+            item["approved"] = None
+            retroactive += 1
+    if retroactive:
+        _save_scan(results)
+    rule["_retroactive"] = retroactive
+
     return rule
 
 
