@@ -59,12 +59,18 @@ Be conservative — when in doubt, recommend "keep"."""
 
 DEFAULT_SUGGESTION_PROMPT = """You're an email assistant reviewing the user's triage patterns. Based on their history — which senders they archive, delete, or keep — give brief, actionable advice.
 
-Examples of useful advice:
-- "You always archive X newsletters — consider unsubscribing or adding a filter rule for `news@x.com`."
-- "Receipts from Y get deleted every time — a filter on `noreply@y.com` would save you the effort."
-- "You're keeping everything from Z, no action needed there."
+You also see the age of emails currently in the inbox. Use this to spot stale mail that piles up.
 
-Always reference the specific email address (e.g. `user@domain.com`) when suggesting a filter or unsubscribe action, so the user knows exactly which sender to target.
+Examples of useful advice:
+- "You always archive X newsletters — consider a filter rule for `news@x.com`."
+- "Receipts from Y get deleted every time — a filter on `noreply@y.com` would save you the effort."
+- "You have 5 emails from Z, oldest 3 weeks ago — consider a rule to auto-archive emails from `z@example.com` older than 7 days."
+- "You're keeping everything from W, no action needed there."
+
+Filter rules can match on `from` (sender), `subject`, and optionally `older_than` (days). \
+Use `older_than` when emails are fine to keep short-term but become clutter after a while.
+
+Always reference the specific email address (e.g. `user@domain.com`) when suggesting a filter or unsubscribe action.
 Use markdown formatting. Keep it short and practical — a few bullet points. If there aren't enough patterns yet, say so briefly."""
 
 DEFAULT_CONFIG = {
@@ -338,6 +344,11 @@ def _match_fast_filter(headers: list, rules: list) -> str | None:
             if match["subject"].lower() not in _get_header(headers, "Subject").lower():
                 matched = False
 
+        if match.get("older_than") and matched:
+            age = _parse_email_age_days(_get_header(headers, "Date"))
+            if age is None or age < match["older_than"]:
+                matched = False
+
         if has_criteria and matched:
             rule["stats"]["total_matched"] = rule["stats"].get("total_matched", 0) + 1
             rule["stats"]["last_matched"] = int(time.time())
@@ -345,14 +356,49 @@ def _match_fast_filter(headers: list, rules: list) -> str | None:
     return None
 
 
+# ── Age helpers ───────────────────────────────────────────────────────────────
+
+def _parse_email_age_days(date_str: str) -> int | None:
+    """Parse email Date header into age in days. Returns None on failure."""
+    if not date_str:
+        return None
+    try:
+        dt = parsedate_to_datetime(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - dt
+        return max(0, delta.days)
+    except Exception:
+        return None
+
+
+def _age_label(days: int | None) -> str:
+    """Human-readable age string."""
+    if days is None:
+        return ""
+    if days == 0:
+        return "today"
+    if days == 1:
+        return "1 day ago"
+    if days < 7:
+        return f"{days} days ago"
+    if days < 30:
+        weeks = days // 7
+        return f"{weeks} week{'s' if weeks > 1 else ''} ago"
+    months = days // 30
+    return f"{months} month{'s' if months > 1 else ''} ago"
+
+
 # ── Scan (fetch + classify, no action taken) ────────────────────────────────
 
 def _build_email_summary(emails: list) -> str:
     lines = []
     for i, e in enumerate(emails):
+        age_days = _parse_email_age_days(e.get("date", ""))
+        age_str = f" ({_age_label(age_days)})" if age_days is not None else ""
         lines.append(f"[{i}] From: {e['from']}")
         lines.append(f"    Subject: {e['subject']}")
-        lines.append(f"    Date: {e['date']}")
+        lines.append(f"    Date: {e['date']}{age_str}")
         if e.get("snippet"):
             lines.append(f"    Preview: {e['snippet'][:150]}")
         lines.append("")
@@ -686,6 +732,15 @@ def _refresh_suggestions(stats: dict, results: list, approvals: dict):
         _save_advice(f"Need more data — {total_actions} action(s) so far.")
         return
 
+    # Build age info per sender from current scan results
+    sender_ages = {}  # sender_lower → list of age_days
+    for item in results:
+        from_addr = item.get("from", "")
+        age = _parse_email_age_days(item.get("date", ""))
+        if age is not None:
+            key = from_addr.lower().split("<")[-1].rstrip(">").strip() if "<" in from_addr else from_addr.lower()
+            sender_ages.setdefault(key, []).append(age)
+
     # Build sender summary
     senders = []
     for sender, s in stats.items():
@@ -695,9 +750,18 @@ def _refresh_suggestions(stats: dict, results: list, approvals: dict):
         display = s.get('display_name', sender)
         # Ensure email address is always visible
         addr_part = f" ({sender})" if sender not in display.lower() else ""
+        # Add age context
+        ages = sender_ages.get(sender.lower(), [])
+        age_ctx = ""
+        if ages:
+            oldest = max(ages)
+            newest = min(ages)
+            count = len(ages)
+            age_ctx = f", {count} emails in inbox (oldest: {_age_label(oldest)}, newest: {_age_label(newest)})"
         senders.append(
             f"- {display}{addr_part}: "
             f"archived {s.get('archive', 0)}, deleted {s.get('delete', 0)}, kept {s.get('keep', 0)}"
+            f"{age_ctx}"
         )
 
     if not senders:
