@@ -59,19 +59,20 @@ Be conservative — when in doubt, recommend "keep"."""
 
 DEFAULT_SUGGESTION_PROMPT = """You're an email assistant reviewing the user's triage patterns. Based on their history — which senders they archive, delete, or keep — give brief, actionable advice.
 
-You also see the age of emails currently in the inbox. Use this to spot stale mail that piles up.
+You also see the age of emails currently in the inbox. Pay attention to stale mail that piles up.
 
-Examples of useful advice:
-- "You always archive X newsletters — consider a filter rule for `news@x.com`."
-- "Receipts from Y get deleted every time — a filter on `noreply@y.com` would save you the effort."
-- "You have 5 emails from Z, oldest 3 weeks ago — consider a rule to auto-archive emails from `z@example.com` older than 7 days."
-- "You're keeping everything from W, no action needed there."
+Available filter rule types:
+1. **Immediate**: `from: "sender@example.com"` → archive/delete (for senders that are always noise)
+2. **Time-based**: `from: "sender@example.com", older_than: 7` → archive (for emails that are useful short-term but become clutter — e.g. order confirmations, newsletters you read within a week, notifications)
 
-Filter rules can match on `from` (sender), `subject`, and optionally `older_than` (days). \
-Use `older_than` when emails are fine to keep short-term but become clutter after a while.
+When you see emails from a sender sitting in the inbox for weeks/months, recommend a time-based rule \
+with a specific `older_than` value in days. For example:
+- "GitHub notifications: useful when fresh, but you have 27 sitting there for months. \
+Suggest rule: `from: notifications@github.com, older_than: 7` → archive"
+- "PayPal receipts: 4 emails from 4 months ago still in inbox. \
+Suggest rule: `from: service@paypal.nl, older_than: 14` → archive"
 
-Always reference the specific email address (e.g. `user@domain.com`) when suggesting a filter or unsubscribe action.
-Use markdown formatting. Keep it short and practical — a few bullet points. If there aren't enough patterns yet, say so briefly."""
+Always reference the specific email address. Use markdown. Keep it short and practical."""
 
 DEFAULT_CONFIG = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,

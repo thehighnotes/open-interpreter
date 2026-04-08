@@ -367,15 +367,24 @@ const Mail = {
 
   async createRuleFor(email, action) {
     document.querySelectorAll('.mail-email-popup').forEach(p => p.remove());
+    // Ask if this should be time-based
+    const days = prompt(`Auto-${action} emails from ${email}.\n\nOptional: only apply to emails older than N days.\nLeave blank for immediate (all emails).`, '');
+    const match = { from: email };
+    let name = `Auto-${action} ${email}`;
+    if (days && parseInt(days) > 0) {
+      match.older_than = parseInt(days);
+      name += ` (after ${days}d)`;
+    }
     try {
       const res = await fetch('/api/mail/rules/add', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({rule: {name: `Auto-${action} ${email}`, match: {from: email}, action}}),
+        body: JSON.stringify({rule: {name, match, action}}),
       });
       const data = await res.json();
       if (data.ok) {
-        App.toast(`Rule added: auto-${action} from ${email}`, 'success');
+        const retro = data.rule?._retroactive || 0;
+        App.toast(`Rule added: ${name}${retro ? ` (matched ${retro} existing)` : ''}`, 'success');
         Tabs.loaded.mail = false;
         Mail.load();
       } else {
@@ -439,8 +448,10 @@ const Mail = {
       const enabled = r.enabled !== false;
       const from = r.match?.from || '';
       const subject = r.match?.subject || '';
+      const olderThan = r.match?.older_than;
       const matched = r.stats?.total_matched || 0;
       const actionColor = r.action === 'delete' ? 'var(--status-error)' : 'var(--status-success)';
+      const ageBadge = olderThan ? `<span style="color:var(--accent-primary);font-size:var(--font-size-xs)">after ${olderThan}d</span>` : '';
 
       html += `
         <div style="display:flex;align-items:center;gap:var(--space-sm);padding:var(--space-xs) var(--space-sm);border-bottom:1px solid var(--border-secondary);${enabled ? '' : 'opacity:0.5'}">
@@ -448,6 +459,7 @@ const Mail = {
             <span style="color:var(--text-primary)">${this._esc(r.name || from)}</span>
             ${from ? `<span style="color:var(--text-tertiary);font-size:var(--font-size-xs)"> ${this._esc(from)}</span>` : ''}
             ${subject ? `<span style="color:var(--text-tertiary);font-size:var(--font-size-xs)"> subj: ${this._esc(subject)}</span>` : ''}
+            ${ageBadge}
           </div>
           <span style="color:${actionColor};font-size:var(--font-size-xs);font-weight:600">${r.action || 'archive'}</span>
           <span style="color:var(--text-tertiary);font-size:var(--font-size-xs)">${matched}x</span>
