@@ -784,7 +784,7 @@ def _refresh_suggestions(stats: dict, results: list, approvals: dict):
 
     advice = llm_query_text(
         DEFAULT_MODEL, system_msg, user_msg,
-        timeout=30, temperature=0.3, num_predict=512,
+        timeout=300, temperature=0.3, num_predict=2048,
     )
 
     _save_advice(advice or "LLM returned an empty response.")
