@@ -1,0 +1,15 @@
+#!/bin/bash
+# oi — Open Interpreter launcher with hub profile
+#   oi              Launch OI with hub profile (vLLM via proxy)
+#   oi --update     Pull latest hub tools and refresh symlinks/stubs
+
+REAL_PATH="$(readlink -f "$0")"
+TOOLS_DIR="$(dirname "$REAL_PATH")"
+REPO_DIR="$(cd "$TOOLS_DIR/../.." && pwd)"
+
+if [ "$1" = "--update" ]; then
+    cd "$REPO_DIR" || { echo "Cannot find OI repo at $REPO_DIR"; exit 1; }
+    exec python3 tools/hub/install.py --update
+fi
+
+exec interpreter --profile linux-admin "$@"

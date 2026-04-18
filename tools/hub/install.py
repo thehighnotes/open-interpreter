@@ -27,11 +27,11 @@ DIAGRAMS_FILE = CONFIG_DIR / 'diagrams.json'
 HUB_TOOLS = [
     'hub', 'git', 'overview', 'research', 'backup', 'prepare',
     'begin', 'work', 'autosummary', 'notify', 'health-probe',
-    'hubgrep', 'edit', 'search', 'code',
+    'hubgrep', 'edit', 'search', 'code', 'oi',
 ]
 
 # Node tools — only tools that work with local files or are needed for session flow
-NODE_TOOLS = ['edit', 'search', 'begin', 'work']
+NODE_TOOLS = ['edit', 'search', 'begin', 'work', 'oi']
 
 HUB_MODULE = 'hub_common.py'
 
