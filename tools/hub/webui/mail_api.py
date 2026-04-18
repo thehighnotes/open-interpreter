@@ -61,16 +61,15 @@ DEFAULT_SUGGESTION_PROMPT = """You're an email assistant reviewing the user's tr
 
 You also see the age of emails currently in the inbox. Pay attention to stale mail that piles up.
 
+IMPORTANT: You will see a list of existing filter rules. Do NOT suggest creating rules for senders \
+that are already covered by an existing rule. Only suggest rules for senders that have NO rule yet.
+
 Available filter rule types:
 1. **Immediate**: `from: "sender@example.com"` → archive/delete (for senders that are always noise)
 2. **Time-based**: `from: "sender@example.com", older_than: 7` → archive (for emails that are useful short-term but become clutter — e.g. order confirmations, newsletters you read within a week, notifications)
 
 When you see emails from a sender sitting in the inbox for weeks/months, recommend a time-based rule \
-with a specific `older_than` value in days. For example:
-- "GitHub notifications: useful when fresh, but you have 27 sitting there for months. \
-Suggest rule: `from: notifications@github.com, older_than: 7` → archive"
-- "PayPal receipts: 4 emails from 4 months ago still in inbox. \
-Suggest rule: `from: service@paypal.nl, older_than: 14` → archive"
+with a specific `older_than` value in days.
 
 Always reference the specific email address. Use markdown. Keep it short and practical."""
 
@@ -268,14 +267,28 @@ def save_rules(rules: list):
 
 def add_rule(rule: dict):
     rules = load_rules()
-    rule.setdefault("id", f"r_{uuid.uuid4().hex[:8]}")
-    rule.setdefault("enabled", True)
-    rule.setdefault("created", int(time.time()))
-    rule.setdefault("stats", {"total_matched": 0, "last_matched": None})
     match = rule.get("match", {})
     match.setdefault("from", None)
     match.setdefault("subject", None)
     rule["match"] = match
+
+    # Deduplicate: skip if an enabled rule already covers the same from+subject
+    new_from = (match.get("from") or "").lower()
+    new_subj = (match.get("subject") or "").lower()
+    for existing in rules:
+        if not existing.get("enabled", True):
+            continue
+        em = existing.get("match", {})
+        if (em.get("from") or "").lower() == new_from and \
+           (em.get("subject") or "").lower() == new_subj and \
+           not match.get("older_than") and not em.get("older_than"):
+            existing["_duplicate"] = True
+            return existing
+
+    rule.setdefault("id", f"r_{uuid.uuid4().hex[:8]}")
+    rule.setdefault("enabled", True)
+    rule.setdefault("created", int(time.time()))
+    rule.setdefault("stats", {"total_matched": 0, "last_matched": None})
     rules.append(rule)
     save_rules(rules)
 
@@ -769,14 +782,17 @@ def _refresh_suggestions(stats: dict, results: list, approvals: dict):
         _save_advice("Not enough repeat senders yet to spot patterns.")
         return
 
-    # Include existing rules for context
+    # Include existing rules — and build a covered-senders set so the LLM skips them
     existing_rules = load_rules()
     rules_ctx = ""
     if existing_rules:
         rule_lines = [f"- {r.get('name', r['id'])}: {r['match']} → {r.get('action', 'archive')}"
                       for r in existing_rules if r.get("enabled", True)]
         if rule_lines:
-            rules_ctx = f"\n\nExisting filter rules:\n" + "\n".join(rule_lines)
+            rules_ctx = (
+                "\n\nExisting filter rules (these senders are ALREADY handled — "
+                "do NOT suggest creating rules for them):\n" + "\n".join(rule_lines)
+            )
 
     config = load_mail_config()
     system_msg = config.get("suggestion_prompt") or DEFAULT_SUGGESTION_PROMPT

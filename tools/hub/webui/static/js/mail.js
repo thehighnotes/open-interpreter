@@ -69,6 +69,7 @@ const Mail = {
       // Make email addresses in inline code clickable
       rendered = rendered.replace(/<code>([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})<\/code>/g,
         '<code class="mail-email-action" data-email="$1" style="cursor:pointer;text-decoration:underline;text-decoration-style:dotted" title="Click for actions">$1</code>');
+      rendered = this._optimizeMarkdown(rendered);
       html += this._foldable('Insights', `
         <div class="msg-bubble markdown-content" style="padding:var(--space-sm);color:var(--text-secondary);font-size:var(--font-size-sm);line-height:1.6;background:transparent;border:none;max-width:none">${rendered}</div>
         <div style="display:flex;justify-content:space-between;align-items:center;padding:0 var(--space-sm) var(--space-sm)">
@@ -321,6 +322,73 @@ const Mail = {
     } catch (e) {
       App.toast('Failed: ' + e.message, 'error');
     }
+  },
+
+  _optimizeMarkdown(html) {
+    const div = document.createElement('div');
+    div.innerHTML = html;
+
+    // Tables → cards: each row becomes a compact card
+    div.querySelectorAll('table').forEach(table => {
+      const headers = Array.from(table.querySelectorAll('thead th, tr:first-child th'))
+        .map(th => th.textContent.trim());
+      const rows = table.querySelectorAll('tbody tr');
+      if (!headers.length || !rows.length) return;
+
+      const cards = document.createElement('div');
+      cards.className = 'mail-insight-cards';
+
+      rows.forEach(row => {
+        const cells = Array.from(row.querySelectorAll('td'));
+        if (!cells.length) return;
+
+        // Detect action type from recommendation text
+        const recIdx = headers.findIndex(h => h.toLowerCase().includes('recommend'));
+        const recText = recIdx >= 0 && cells[recIdx] ? cells[recIdx].textContent.toLowerCase() : '';
+        const isDelete = recText.includes('delete');
+        const actionClass = isDelete ? 'mail-insight-card--delete' : 'mail-insight-card--archive';
+
+        const card = document.createElement('div');
+        card.className = `mail-insight-card ${actionClass}`;
+
+        // Build card header: sender name + email on one line
+        const senderIdx = headers.findIndex(h => h.toLowerCase().includes('sender') || h.toLowerCase().includes('name'));
+        const emailIdx = headers.findIndex(h => h.toLowerCase().includes('email') || h.toLowerCase().includes('address'));
+
+        const senderName = senderIdx >= 0 && cells[senderIdx] ? cells[senderIdx].innerHTML.trim() : '';
+        const emailAddr = emailIdx >= 0 && cells[emailIdx] ? cells[emailIdx].innerHTML.trim() : '';
+
+        if (senderName || emailAddr) {
+          const header = document.createElement('div');
+          header.className = 'mail-insight-header';
+          header.innerHTML = (senderName ? `<strong>${senderName}</strong>` : '') +
+            (emailAddr ? `<span class="mail-insight-email">${emailAddr}</span>` : '');
+          card.appendChild(header);
+        }
+
+        // Build body: skip sender/email columns, show analysis inline, recommendation as tag
+        cells.forEach((cell, i) => {
+          if (i === senderIdx || i === emailIdx || !cell.innerHTML.trim()) return;
+          const label = headers[i] || '';
+          const isRec = label.toLowerCase().includes('recommend');
+          const val = document.createElement('div');
+          if (isRec) {
+            val.className = 'mail-insight-rec';
+            val.innerHTML = cell.innerHTML;
+          } else {
+            val.className = 'mail-insight-detail';
+            val.innerHTML = cell.innerHTML;
+          }
+          card.appendChild(val);
+        });
+
+        cards.appendChild(card);
+      });
+
+      table.replaceWith(cards);
+    });
+
+    return div.innerHTML;
   },
 
   _initEmailActions() {

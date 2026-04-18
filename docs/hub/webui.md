@@ -34,8 +34,10 @@ A single Starlette server hosts the API and serves static files. The interpreter
 | **Repo** | Git dashboard (`repo` output) |
 | **Research** | Research digest |
 | **Notify** | Notification history with mark-read |
+| **Mail** | LLM-driven Gmail triage — scan, review, apply workflow with fast-filter rules and insights |
+| **Updates** | Clustered update scanner with LLM analysis across all hosts |
 | **Help** | In-app documentation with searchable command reference |
-| **Settings** | Model switcher, context window, max tokens, connection status, session reset |
+| **Settings** | Model switcher, context window, max tokens, connection status, session reset, Gmail credentials |
 
 ## Chat Features
 
@@ -99,6 +101,52 @@ Magic commands (lines starting with `%`) are detected client-side and routed thr
 
 ![Help tab — searchable command reference with 70+ entries](images/webui-help.png)
 
+## Mail Tab
+
+LLM-driven Gmail triage assistant. Connects via OAuth2 and runs a two-phase classification pipeline.
+
+### Workflow
+
+1. **Scan** — fetches emails from Gmail API (configurable: unread/all, inbox/all labels, batch size)
+2. **Fast-filter** — local pattern rules (from/subject match, optional `older_than` days) fire first, skipping the LLM for known senders
+3. **LLM classification** — remaining emails are sent to the LLM with a configurable system prompt; returns keep/archive/delete per email
+4. **Review** (manual mode) — user sees results with dropdowns to override each decision
+5. **Apply** — approved actions execute via Gmail API (archive = remove INBOX label, delete = add TO-DELETE label + remove INBOX)
+
+In **auto mode**, steps 4–5 happen immediately after scan.
+
+### Filter Rules
+
+Rules are stored locally in `~/.config/hub/mail-rules.json` and run before LLM classification. Each rule matches on `from` (substring, case-insensitive), optional `subject`, and optional `older_than` (days). Duplicate rules are prevented — adding a rule with the same from+subject as an existing enabled rule returns the existing one.
+
+Rules can be created by clicking email addresses in the Insights panel (opens a popup with Auto-archive / Auto-delete / Unsubscribe options).
+
+### Insights
+
+Accumulated sender triage patterns (`~/.cache/gmail/sender-stats.json`) are periodically sent to the LLM for analysis. The response is rendered as markdown with post-processing:
+
+- Email addresses in backticks become clickable action elements
+- Markdown tables are converted to responsive cards (JS post-processing in `_optimizeMarkdown`)
+- Cards show a colored left border (green = archive, red = delete) and a tinted recommendation pill
+
+The insights prompt explicitly excludes senders already covered by existing rules to avoid redundant suggestions.
+
+### Data Files
+
+| Path | Purpose |
+|------|---------|
+| `~/.config/hub/gmail-token.json` | OAuth token |
+| `~/.config/hub/mail-rules.json` | Fast-filter rule definitions |
+| `~/.config/hub/mail-config.json` | Mode, scope, batch size, LLM prompts |
+| `~/.cache/gmail/scan-results.json` | Latest scan results |
+| `~/.cache/gmail/sender-stats.json` | Accumulated sender triage history |
+| `~/.cache/gmail/suggestions.json` | Latest insights text + timestamp |
+| `~/.cache/gmail/actions.jsonl` | Action audit log |
+
+## Updates Tab
+
+Clustered update scanner with LLM-driven analysis. Scans apt + pip across all 4 hosts, clusters packages by dependency influence (static + dynamic + hub tier), fetches GitHub release notes for intermediate versions, and runs per-cluster LLM analysis. Results display as a traffic-light UI with structured breaking changes and new features sections.
+
 ## API Endpoints
 
 | Method | Endpoint | Purpose |
@@ -118,6 +166,16 @@ Magic commands (lines starting with `%`) are detected client-side and routed thr
 | GET | `/api/research` | Research digest output |
 | GET | `/api/notifications` | Notification history |
 | POST | `/api/notifications/clear` | Mark notifications read |
+| GET | `/api/mail` | Mail overview (auth status, rules, actions, pending) |
+| GET | `/api/mail/rules` | List filter rules |
+| POST | `/api/mail/rules/add` | Create filter rule |
+| POST | `/api/mail/rules/update` | Update rule by ID |
+| POST | `/api/mail/rules/delete` | Delete rule by ID |
+| POST | `/api/mail/scan` | Trigger scan workflow |
+| POST | `/api/mail/apply` | Execute approved triage actions |
+| GET/POST | `/api/mail/config` | Get/update mail settings |
+| POST | `/api/mail/advice/refresh` | Re-run insights analysis |
+| POST | `/api/mail/unsubscribe` | Look up List-Unsubscribe header |
 | GET | `/api/settings` | Current model, context, connection |
 | POST | `/api/settings/update` | Update model/context/max tokens |
 | POST | `/api/image` | Upload image file |

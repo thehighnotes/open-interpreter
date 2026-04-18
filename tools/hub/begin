@@ -258,22 +258,14 @@ def build_preamble(project_key, cache_data, notes_str, git_str, env_status=None)
             except (json.JSONDecodeError, OSError):
                 pass
 
-    # Code Assistant API reference (only if project is indexed)
+    # Code intelligence tools (only if project is indexed)
     if ca_key:
         lines.append('')
-        ca_host_name = HOSTS.get(HUB_CONFIG['code_assistant']['host'], {}).get('name', 'CA')
-        ca_port = HUB_CONFIG['code_assistant']['port']
-        lines.append(f'Code Assistant API ({ca_host_name}:{ca_port}):')
-        lines.append(f'  Base: {CODE_ASSISTANT_URL}')
-        lines.append(f'  Project key: "{ca_key}"')
-        lines.append('  Endpoints:')
-        lines.append('    POST /ask          {question, project, model}         — RAG question (model: hub-coder-30b)')
-        lines.append('    POST /ask/stream   {question, project, use_tools}     — streaming search with tool use (SSE)')
-        lines.append('    POST /impact       {file_path, project}               — dependency impact analysis')
-        lines.append('    GET  /graph/stats  ?project=<name>                    — dependency graph overview')
-        lines.append('    GET  /projects                                        — list indexed projects')
-        lines.append('    POST /index        {project, code_paths[], doc_paths[]} — index new project')
-        lines.append('    POST /projects/<name>/reindex {}                      — reindex existing project')
+        lines.append(f'Code intelligence (indexed as "{ca_key}"):')
+        lines.append(f'  ~/code ask {project_key} "question"     — semantic RAG search (cached 4h)')
+        lines.append(f'  ~/code search {project_key} "query"     — file search (cached 1h)')
+        lines.append(f'  ~/code impact {project_key} "file"      — dependency impact analysis')
+        lines.append(f'  ~/code graph {project_key}              — dependency graph overview')
 
     lines.append('')
 

@@ -348,7 +348,64 @@
   font-style: italic;
   margin: 0.75em 0;
 }
-/* Tables */
+/* Insights card layout (tables converted to cards by JS) */
+.mail-insight-cards {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  margin: 0.75em 0;
+}
+.mail-insight-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-secondary);
+  border-left: 3px solid var(--status-success);
+  border-radius: var(--radius-md);
+  padding: var(--space-sm) var(--space-md);
+  font-size: var(--font-size-base);
+  line-height: 1.5;
+}
+.mail-insight-card--delete {
+  border-left-color: var(--status-error);
+}
+.mail-insight-card--archive {
+  border-left-color: var(--status-success);
+}
+.mail-insight-header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.mail-insight-header strong {
+  color: #fff;
+  font-size: var(--font-size-base);
+}
+.mail-insight-email {
+  color: #9a9ab0;
+  font-size: var(--font-size-sm);
+}
+.mail-insight-detail {
+  color: #b0b0c8;
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+}
+.mail-insight-rec {
+  margin-top: 6px;
+  padding: 4px 8px;
+  background: rgba(37, 99, 235, 0.15);
+  border-radius: var(--radius-sm);
+  color: #6ba1ff;
+  font-weight: 600;
+  font-size: var(--font-size-sm);
+}
+.mail-insight-card--delete .mail-insight-rec {
+  background: rgba(239, 68, 68, 0.12);
+  color: #f87171;
+}
+
+/* Tables — scrollable wrapper for narrow panels */
+.msg-bubble.markdown-content { overflow-x: auto; }
 .msg-bubble.markdown-content table {
   width: 100%;
   border-collapse: collapse;

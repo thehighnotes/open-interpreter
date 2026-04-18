@@ -134,6 +134,29 @@ def probe_git_log(host_alias, project_path, count=5):
     return []
 
 
+def probe_git_diff(host_alias, project_path, max_chars=6000):
+    """Get uncommitted changes: stat summary + truncated patch."""
+    cmd = (f'cd {project_path} 2>/dev/null && '
+           f'echo "===STAT===" && git diff --stat 2>/dev/null && '
+           f'echo "===PATCH===" && git diff 2>/dev/null')
+    ok, output = ssh_cmd(host_alias, cmd, timeout=10)
+    if not ok or '===STAT===' not in output:
+        return ''
+    parts = output.split('===PATCH===')
+    stat_section = parts[0].replace('===STAT===', '').strip()
+    patch_section = parts[1].strip() if len(parts) > 1 else ''
+    if not stat_section and not patch_section:
+        return ''
+    lines = []
+    if stat_section:
+        lines.append(stat_section)
+    if patch_section:
+        if len(patch_section) > max_chars:
+            patch_section = patch_section[:max_chars] + '\n[truncated]'
+        lines.append(patch_section)
+    return '\n'.join(lines)
+
+
 def probe_last_commit_ts(host_alias, project_path):
     """Get unix timestamp of the most recent git commit. Returns float or None."""
     cmd = (f'cd {project_path} 2>/dev/null && '
@@ -305,12 +328,12 @@ def probe_ollama_status(host_alias):
 OLLAMA_SYSTEM = """/no_think
 You are a JSON extraction tool. Output ONLY a JSON object. No other text."""
 
-OLLAMA_USER = """Return a JSON object from this project context. Use ALL sources — CLAUDE.md for background, recent files for activity, and the conversation transcript for what is ACTIVELY happening.
+OLLAMA_USER = """Return a JSON object from this project context. Use ALL sources — CLAUDE.md for background, recent files for activity, git diff for uncommitted work in progress, and the conversation transcript for what is ACTIVELY happening.
 
 Keys:
 - "phase": string — current project phase (short label)
 - "status_summary": string — 1-2 sentence status reflecting where things stand right now
-- "current_focus": list of strings — what is actively being worked on RIGHT NOW, with enough context to understand WHY (from transcript + recent files, max 5)
+- "current_focus": list of strings — what is actively being worked on RIGHT NOW, with enough context to understand WHY (from transcript + recent files + git diff, max 5)
 - "blockers": list of strings — known issues, failed attempts, constraints — include what was tried and what went wrong (max 5)
 - "key_metrics": object — key numbers mentioned, use descriptive keys
 - "recent_breakthroughs": list of strings — discoveries or achievements, explain the significance not just the name (max 3)
@@ -320,6 +343,7 @@ Keys:
 - "entry_points": object — key files with a brief note on what each does
 
 Rules:
+- Git diff shows uncommitted changes — files being actively modified are strong signals for current_focus and may reveal blockers (reverted code, partial implementations)
 - The transcript shows what JUST happened — prioritize it for current_focus, breakthroughs, blockers
 - Recent files confirm what areas are active
 - CLAUDE.md provides background context and architecture
@@ -331,8 +355,8 @@ Rules:
 
 
 def query_ollama(claude_md_content=None, recent_files=None, git_log=None,
-                 transcript=None, research_context=None, doc_context=None,
-                 model=DEFAULT_MODEL):
+                 git_diff=None, transcript=None, research_context=None,
+                 doc_context=None, model=DEFAULT_MODEL):
     """Build overview prompt from all sources and query Ollama. Returns parsed JSON or None."""
     # Build enriched content from all sources
     parts = []
@@ -350,6 +374,9 @@ def query_ollama(claude_md_content=None, recent_files=None, git_log=None,
     if git_log:
         log_str = '\n'.join(git_log[:5]) if isinstance(git_log, list) else git_log
         parts.append(f'=== RECENT GIT COMMITS ===\n{log_str}')
+
+    if git_diff:
+        parts.append(f'=== UNCOMMITTED CHANGES (git diff) ===\n{git_diff}')
 
     if transcript:
         parts.append(f'=== LAST DEVELOPMENT SESSION (conversation transcript) ===\n{transcript}')
@@ -459,6 +486,7 @@ def collect_project_data(project_key, force_refresh=False, model=DEFAULT_MODEL):
         'claude_md': lambda: probe_claude_md(host_alias, proj['path'], proj['claude_md']),
         'recent_files': lambda: probe_recent_files(host_alias, proj['path']),
         'git_log': lambda: probe_git_log(host_alias, proj['path']),
+        'git_diff': lambda: probe_git_diff(host_alias, proj['path']),
     }
 
     # Add transcript probe if claude_dir is configured
@@ -483,6 +511,7 @@ def collect_project_data(project_key, force_refresh=False, model=DEFAULT_MODEL):
 
     data['recent_files'] = results.get('recent_files', [])
     data['git_log'] = results.get('git_log', [])
+    data['git_diff'] = results.get('git_diff', '')
     transcript = results.get('transcript', '')
 
     # Get transcript file mtime for cache key
@@ -544,6 +573,7 @@ def collect_project_data(project_key, force_refresh=False, model=DEFAULT_MODEL):
                 data['claude_md'],
                 recent_files=data['recent_files'],
                 git_log=data['git_log'],
+                git_diff=data['git_diff'],
                 transcript=transcript,
                 research_context=research_context,
                 model=model,
@@ -579,6 +609,7 @@ def collect_project_data(project_key, force_refresh=False, model=DEFAULT_MODEL):
                                     data['claude_md'],
                                     recent_files=data['recent_files'],
                                     git_log=data['git_log'],
+                                    git_diff=data['git_diff'],
                                     transcript=transcript,
                                     research_context=research_context,
                                     doc_context=doc_context,
