@@ -16,7 +16,8 @@
 | `interpreter/terminal_interface/components/code_block.py` | Rich output integration |
 | `interpreter/terminal_interface/components/base_block.py` | Refresh throttle |
 | `interpreter/terminal_interface/components/message_block.py` | Refresh throttle |
-| `tools/hub/begin` | `--preamble-only` flag, hub/node-aware launch, OI context enrichment, project reference distillation |
+| `tools/hub/begin` | `--preamble-only` flag, hub/node-aware launch, OI context enrichment, project reference distillation, code intelligence CLI in preamble |
+| `tools/hub/overview` | Git diff (uncommitted changes) added to LLM analysis pipeline |
 | `tools/hub/prepare` | Smart skip (staleness check), `--force` flag |
 | `tools/hub/work` | Node-aware delegation to hub, `--force` pass-through |
 
@@ -33,7 +34,8 @@
 | `tools/hub/webui/oi_bridge.py` | Interpreter wrapper — singleton, SSE streaming via thread+queue, approval flow |
 | `tools/hub/webui/static/` | Frontend — HTML, CSS (dark theme), JS (chat, tabs, help), vendored marked.js + highlight.js |
 | `tools/hub/hub_common.py` | Shared module — config loading, SSH helpers, project registry, terminal UI primitives, hub/node role support (`ROLE`, `HUB_HOST`, `is_hub()`, `is_node()`) |
-| `tools/hub/install.py` | (rewritten) Hub/node setup wizard with SSH key exchange, `--update` command |
+| `tools/hub/oi` | OI launcher + `--update` flag (git pull + refresh symlinks/stubs) |
+| `tools/hub/install.py` | (rewritten) Hub/node setup wizard with SSH key exchange, `--update` command, `oi` in tool lists |
 | `tools/hub/config.example.json` | Minimal single-host config template |
 | `tools/hub/profiles/hub-profile.example.py` | OI profile template that reads from config.json |
 | `tools/hub/bootstrap.sh` | One-command installer for hub or node setup |

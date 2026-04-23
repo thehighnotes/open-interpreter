@@ -16,6 +16,7 @@ The `tools/hub/` directory contains a suite of CLI tools that manage a multi-mac
 | `code` | — | Code Assistant client: semantic search, RAG, dependency graphs |
 | `notify` | — | Notification history viewer |
 | `hubgrep` | — | Search across all hub files (tools, config, cache, memory) |
+| `oi` | — | OI launcher (`oi`) and hub tools updater (`oi --update`) |
 | `edit` | — | Structured remote file editing via SSH |
 | `search` | — | DuckDuckGo web search helper |
 | `oi-web` | — | Web UI for OI — chat, hub tabs, image upload (port 8585) |
@@ -268,7 +269,9 @@ Gathers context from five sources:
 4. Service status (which ports are up)
 5. Research digest (recent relevant papers/releases)
 
-Builds a structured preamble (~3000 chars for Claude Code, ~1500 for OI) containing phase, focus, blockers, breakthroughs, trajectory, recent decisions, cross-project context, and Code Assistant API reference. Delivers via `--append-system-prompt`.
+Builds a structured preamble (~3000 chars for Claude Code, ~1500 for OI) containing phase, focus, blockers, breakthroughs, trajectory, recent decisions, cross-project context, and Code Assistant CLI reference. Delivers via `--append-system-prompt`.
+
+For indexed projects, the preamble includes a "Code intelligence" section with `~/code` CLI commands (`ask`, `search`, `impact`, `graph`) so the session assistant knows how to query the codebase.
 
 **OI context enrichment:** When launching with `--oi`, `begin` fetches the project's directory tree (depth 2) and full CLAUDE.md from the project host, then distills the CLAUDE.md into a structured OI reference (~2.5K chars) via vLLM. The distillation covers tech stack, architecture, key files, conventions, and current state — optimized for the 35B model's context window. Results are cached by content hash in `~/.cache/oi-ref/` and only regenerated when CLAUDE.md changes (~28s on first run, instant on cache hit). The system message receives the preamble + dir tree + distilled reference. The reference is also written to `/tmp/_oi_reference.txt` for re-reading after context trimming. OI's shell subprocess starts in the project directory via `OI_PROJECT_PATH`.
 
@@ -293,7 +296,7 @@ Typically runs in a tmux window or via cron `@reboot`.
 
 ## `overview` — Project Briefings
 
-LLM-powered project overviews that extract phase, status, blockers, and focus from CLAUDE.md and git history.
+LLM-powered project overviews that extract phase, status, blockers, and focus from CLAUDE.md, git history, uncommitted changes, and session transcripts.
 
 ```
 overview                        Compact summary of all projects
@@ -307,6 +310,8 @@ Deep views include:
 - Blockers and breakthroughs
 - Architecture diagrams (loaded from `~/.config/hub/diagrams.json` with ANSI support)
 - Recent decisions and cross-project dependencies
+
+The LLM analysis is fed six data sources: CLAUDE.md (truncated to 8K chars), recently modified files, git log (last 5 commits), git diff (uncommitted changes, capped at 6K chars), the last Claude Code/OI session transcript, and research context (relevant papers/releases). A second enrichment pass queries the Code Assistant for indexed documentation. Uncommitted changes are prioritized for `current_focus` and `blockers` — they signal in-progress work and partial implementations.
 
 Results are cached per-project in `~/.cache/overview/` for fast re-access. The cache is refreshed by `prepare` and `autosummary`.
 
@@ -558,6 +563,21 @@ hubgrep --all <pattern>         Also search OI patches + installed interpreter
 - Tab completions
 
 Results are grouped by category with highlighted matches. Max 5 matches shown per file.
+
+---
+
+## `oi` — Launcher & Updater
+
+Launches Open Interpreter with the hub profile, or updates the hub tools installation.
+
+```
+oi                              Launch OI with hub profile (vLLM via proxy)
+oi --update                     Pull latest hub tools from origin, refresh symlinks/stubs
+```
+
+`oi --update` runs `git pull --ff-only` in the local OI repo, then refreshes symlinks (hub or node) and shell aliases. Works on both hub and node machines. On a node, this is the primary way to pick up changes pushed from the hub.
+
+The `oi` script is installed as a symlink to `tools/hub/oi` on both hub and node machines, so it resolves the repo path automatically regardless of where it's called from.
 
 ---
 

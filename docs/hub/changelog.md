@@ -4,6 +4,24 @@ All notable changes to the Hub Tools suite are documented here.
 
 ---
 
+## 2026-04-18
+
+### Added — Git diff in overview analysis
+
+The `overview` LLM analysis now includes uncommitted changes (`git diff --stat` + truncated patch, capped at 6K chars) as a data source. This gives the model visibility into in-progress work that hasn't been committed yet, improving the accuracy of `current_focus` and `blockers` fields.
+
+### Changed — Preamble code intelligence section
+
+The `begin` preamble for Claude Code sessions now shows `~/code` CLI commands (`ask`, `search`, `impact`, `graph`) instead of raw Code Assistant API endpoints. The CLI wrapper is the intended interface for both Claude Code and OI sessions, and works transparently on both hub and node machines via SSH delegation.
+
+### Added — `oi` tool
+
+New `tools/hub/oi` script replaces the standalone `~/oi` launcher. Supports `oi --update` to pull latest hub tools from origin and refresh symlinks/stubs. Added to both `HUB_TOOLS` and `NODE_TOOLS` in `install.py`, so it gets symlinked on both hub and node installs.
+
+**Files changed**: `tools/hub/oi` (new), `tools/hub/install.py`, `tools/hub/begin`, `tools/hub/overview`
+
+---
+
 ## 2026-03-15
 
 ### Fixed — WebUI markdown rendering (CSS selector bug)

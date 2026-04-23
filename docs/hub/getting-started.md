@@ -76,11 +76,15 @@ OI runs natively on the node for fast file access, while `hub --status`, `repo`,
 
 ## Updating
 
-Pull the latest changes from origin:
+Pull the latest changes from origin and refresh symlinks/stubs:
 
 ```bash
-interpreter --update
+oi --update
 ```
+
+This works on both hub and node machines. On a node, it's the primary way to pick up tool changes pushed from the hub.
+
+Alternatively, `interpreter --update` also works (checks for OI updates specifically).
 
 **Auto-update:** Set `"oi_auto_update": true` in `config.json` to pull automatically on startup. Node installs enable this by default; hub installs default to `false`.
 
