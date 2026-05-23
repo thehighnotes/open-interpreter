@@ -923,7 +923,7 @@ done
             print(f"  {GREEN}✓{RESET} Synced to {ca_host_name}")
             # Use the CA host mirror path for indexing
             ca_user = HOSTS[ca_host]['user']
-            full_path = f"/home/{ca_user}/projects/{e['ca_name']}"
+            full_path = f"/home/{ca_user}/projects/.ca-mirrors/{e['ca_name']}"
 
         # POST /index to Code Assistant
         print(f"  {CYAN}Indexing {e['ca_name']}...{RESET}")

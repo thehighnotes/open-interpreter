@@ -437,7 +437,7 @@ OVERVIEW_REQUIRED_KEYS = {
 # SSH
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ssh_cmd(host, cmd, timeout=10):
+def ssh_cmd(host, cmd, timeout=10, forward_agent=False):
     """Run a command on a remote host via SSH (or locally for 'nano'). Returns (success, output)."""
     try:
         if host == LOCAL_HOST:
@@ -446,10 +446,14 @@ def ssh_cmd(host, cmd, timeout=10):
                 capture_output=True, text=True, timeout=timeout
             )
         else:
+            ssh_args = ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                        '-o', 'StrictHostKeyChecking=no']
+            if forward_agent:
+                ssh_args.append('-A')
+            ssh_args.append(host)
+            ssh_args.append(cmd)
             result = subprocess.run(
-                ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
-                 '-o', 'StrictHostKeyChecking=no', host, cmd],
-                capture_output=True, text=True, timeout=timeout
+                ssh_args, capture_output=True, text=True, timeout=timeout
             )
         return result.returncode == 0, result.stdout.strip()
     except subprocess.TimeoutExpired:
@@ -2132,7 +2136,7 @@ def rsync_to_ca_host(source_host, source_path, mirror_path, dry_run=False):
     ca_host = HUB_CONFIG['code_assistant']['host']
     excludes = ' '.join(
         f'--exclude={x}' for x in
-        ('.git', 'node_modules', '__pycache__', '.venv', 'dist', 'build', '.next', '.cache', '.tox')
+        ('.git', 'node_modules', '__pycache__', '.venv', 'dist', 'build', 'target', '.next', '.cache', '.tox')
     )
     dry = '--dry-run ' if dry_run else ''
     cmd = f'rsync -az --delete {dry}{excludes} {source_host}:{source_path}/ {mirror_path}/'
