@@ -932,7 +932,7 @@ done
                 'project': e['ca_name'],
                 'code_paths': [full_path],
                 'doc_paths': [full_path],
-            }, timeout=300)
+            }, timeout=900)
 
         if result and result.get('success'):
             code_info = result.get('code', {})

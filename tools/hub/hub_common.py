@@ -11,6 +11,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -2094,8 +2095,9 @@ def code_assistant_get(endpoint, params=None, timeout=15):
 
 
 def code_assistant_post(endpoint, data, timeout=120):
-    """POST JSON to Code Assistant. Returns parsed JSON or None."""
+    """POST JSON to Code Assistant. Returns parsed JSON or error dict."""
     import urllib.request
+    import urllib.error
     url = f'{CODE_ASSISTANT_URL}/{endpoint}'
     body = json.dumps(data).encode()
     try:
@@ -2103,8 +2105,13 @@ def code_assistant_post(endpoint, data, timeout=120):
             headers={'Content-Type': 'application/json'})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
-    except Exception:
-        return None
+    except socket.timeout:
+        return {'error': f'timeout after {timeout}s', 'success': False}
+    except urllib.error.URLError as e:
+        reason = str(e.reason) if hasattr(e, 'reason') else str(e)
+        return {'error': f'connection failed: {reason}', 'success': False}
+    except Exception as e:
+        return {'error': str(e), 'success': False}
 
 
 def check_code_assistant():
