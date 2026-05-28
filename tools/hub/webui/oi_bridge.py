@@ -249,6 +249,77 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
         self._pending_approval = False
         return self._approval_result
 
+    def _stream_knowledge(self, message):
+        """Knowledge-mode generation. Streams one full completion directly from the
+        LLM, bypassing OI's code-execution loop (respond.py) entirely. The whole
+        answer — prose and fenced code — is emitted as markdown text; the frontend
+        renders code blocks for display. Nothing is executed, so unsupported
+        languages (typescript, yaml, ...) can't trigger the "disabled or not
+        supported" loop. History (interpreter.messages) is shared with terminal mode.
+
+        We call interpreter.llm.completions() directly rather than llm.run(), because
+        run_text_llm stops at the first code fence (it expects OI to execute the code
+        and continue). For a knowledge answer we want the complete response in one go.
+        """
+        from interpreter.vendor import tokentrim as tt
+        from interpreter.core.llm.utils.convert_to_openai_messages import (
+            convert_to_openai_messages,
+        )
+
+        interp = self._interpreter
+        interp.messages.append(
+            {"role": "user", "type": "message", "content": message})
+
+        lmc = [{"role": "system", "type": "message",
+                "content": _KNOWLEDGE_SYSTEM_MESSAGE}] + interp.messages
+        oai = convert_to_openai_messages(
+            lmc, function_calling=False, vision=False, interpreter=interp)
+
+        system_content = oai[0]["content"]
+        body = oai[1:]
+        try:
+            body = tt.trim(body, system_message=system_content,
+                           max_tokens=interp.llm.context_window or 8000)
+        except Exception:
+            body = [{"role": "system", "content": system_content}] + body
+
+        try:
+            from interpreter.terminal_interface.utils.count_tokens import count_tokens
+            interp._last_prompt_tokens = sum(
+                count_tokens(m["content"]) for m in body
+                if isinstance(m.get("content"), str) and m["content"])
+        except Exception:
+            interp._last_prompt_tokens = 0
+
+        params = {"model": interp.llm.model, "messages": body, "stream": True}
+        if interp.llm.api_key:
+            params["api_key"] = interp.llm.api_key
+        if interp.llm.api_base:
+            params["api_base"] = interp.llm.api_base
+        if interp.llm.max_tokens:
+            params["max_tokens"] = interp.llm.max_tokens
+        if interp.llm.temperature:
+            params["temperature"] = interp.llm.temperature
+
+        yield {"role": "assistant", "type": "message", "start": True}
+        full = ""
+        for chunk in interp.llm.completions(**params):
+            if self._stop_event.is_set():
+                break
+            try:
+                delta = chunk["choices"][0]["delta"].get("content", "")
+            except (KeyError, IndexError, TypeError):
+                delta = ""
+            if not delta:
+                continue
+            full += delta
+            yield {"role": "assistant", "type": "message", "content": delta}
+        yield {"role": "assistant", "type": "message", "end": True}
+
+        if full:
+            interp.messages.append(
+                {"role": "assistant", "type": "message", "content": full})
+
     def chat_stream(self, message, exec_mode=None):
         """Stream OI response as SSE events. Yields 'data: {...}\n\n' strings.
         exec_mode: optional per-request override ("none" suppresses all execution).
@@ -262,8 +333,6 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
             return
 
         _is_knowledge = (exec_mode == "none")
-        _orig_sys = None
-        _orig_ci = None
 
         try:
             self._turn_counter += 1
@@ -273,18 +342,18 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
             q = queue.Queue()
             error_holder = [None]
 
-            if _is_knowledge:
-                _orig_sys = self._interpreter.system_message
-                _orig_ci = self._interpreter.custom_instructions
-                self._interpreter.system_message = _KNOWLEDGE_SYSTEM_MESSAGE
-                self._interpreter.custom_instructions = ""
-
             _mode_label = "knowledge" if _is_knowledge else "terminal"
             yield f"data: {json.dumps({'type': 'mode', 'mode': _mode_label})}\n\n"
 
             def _run():
                 try:
-                    for chunk in self._interpreter.chat(message, display=False, stream=True):
+                    # Knowledge mode talks to the LLM directly (no code execution loop).
+                    # Terminal mode runs OI's full chat with its execution machinery.
+                    if _is_knowledge:
+                        source = self._stream_knowledge(message)
+                    else:
+                        source = self._interpreter.chat(message, display=False, stream=True)
+                    for chunk in source:
                         if self._stop_event.is_set():
                             break
                         normalized = self._normalize_chunk(chunk)
@@ -339,9 +408,6 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
 
         finally:
             self._request_exec_override = None
-            if _is_knowledge and _orig_sys is not None:
-                self._interpreter.system_message = _orig_sys
-                self._interpreter.custom_instructions = _orig_ci
             self._current_thread = None
             if self._lock.locked():
                 try:
