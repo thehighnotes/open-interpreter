@@ -1058,6 +1058,7 @@ def render_explain():
     print(f"      {GRAY}Ignored dirs are hidden from candidates (shown dimmed at bottom).{RESET}")
     print(f"    {WHITE}hub --scan --ignore <host>{RESET}  manage which dirs to ignore")
     print(f"      {GRAY}Shows ignored + unregistered dirs. Add/remove from ignore list interactively.{RESET}")
+    print(f"    {WHITE}hub --sync-projects{RESET}      push projects.json to all reachable nodes")
     print(f"      {GRAY}All hub tools read from ~/.config/hub/projects.json automatically.{RESET}")
 
     # ── Git Management ──
@@ -2989,6 +2990,172 @@ def render_vllm(args=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# --temps: Thermal snapshot + history
+# ─────────────────────────────────────────────────────────────────────────────
+
+THERMAL_LOG = Path.home() / '.cache' / 'thermal' / 'thermal.csv'
+THERMAL_THROTTLE = 95.0  # Tegra throttle threshold (°C)
+
+def _read_thermal_zone(name):
+    for zone in Path('/sys/class/thermal').glob('thermal_zone*'):
+        try:
+            if (zone / 'type').read_text().strip() == name:
+                return int((zone / 'temp').read_text().strip()) / 1000.0
+        except (OSError, ValueError):
+            continue
+    return None
+
+def _read_now():
+    cpu = _read_thermal_zone('cpu-thermal')
+    gpu = _read_thermal_zone('gpu-thermal')
+    soc = [_read_thermal_zone(f'soc{i}-thermal') for i in range(3)]
+    soc_avg = sum(s for s in soc if s is not None) / max(1, sum(1 for s in soc if s is not None))
+    tj = _read_thermal_zone('tj-thermal')
+    try:
+        fan = int(Path('/sys/class/hwmon/hwmon0/pwm1').read_text().strip())
+    except (OSError, ValueError):
+        fan = None
+    return {'cpu': cpu, 'gpu': gpu, 'soc': soc_avg, 'tj': tj, 'fan': fan}
+
+def _heat_color(temp):
+    if temp is None:
+        return GRAY
+    if temp >= 80:
+        return RED
+    if temp >= 65:
+        return YELLOW
+    return GREEN
+
+def _load_history(date_filter):
+    """Yield (timestamp, cpu, gpu, soc, tj, fan) tuples matching the filter prefix."""
+    if not THERMAL_LOG.exists():
+        return []
+    rows = []
+    with THERMAL_LOG.open() as fh:
+        next(fh, None)  # skip header
+        for line in fh:
+            parts = line.strip().split(',')
+            if len(parts) < 6:
+                continue
+            ts = parts[0]
+            if date_filter and not ts.startswith(date_filter):
+                continue
+            try:
+                rows.append((ts, float(parts[1]), float(parts[2]),
+                             float(parts[3]), float(parts[4]), int(parts[5])))
+            except ValueError:
+                continue
+    return rows
+
+def render_temps(args):
+    """Show current thermals + history summary. Args: optional date prefix or --all."""
+    now = datetime.now().strftime('%a %d %b %H:%M')
+
+    # Determine filter
+    if args and args[0] == '--all':
+        date_filter = ''
+        filter_label = 'ALL HISTORY'
+    elif args and not args[0].startswith('--'):
+        date_filter = args[0]
+        filter_label = args[0]
+    else:
+        date_filter = datetime.now().strftime('%Y-%m-%d')
+        filter_label = 'TODAY'
+
+    snapshot = _read_now()
+    rows = _load_history(date_filter)
+
+    print()
+    header_bar()
+    print_right(f"{BRIGHT_GREEN}  HUB TEMPS{RESET}", f"{BRIGHT_GREEN}{now}{RESET}")
+    header_bar()
+
+    # NOW
+    print(f"  {WHITE}NOW{RESET}")
+    divider()
+    fields = []
+    for label, val in [('cpu', snapshot['cpu']), ('gpu', snapshot['gpu']),
+                       ('soc', snapshot['soc']), ('tj',  snapshot['tj'])]:
+        if val is None:
+            fields.append(f"{label} {GRAY}--{RESET}")
+        else:
+            fields.append(f"{label} {_heat_color(val)}{val:.1f}°C{RESET}")
+    if snapshot['fan'] is not None:
+        pct = round(snapshot['fan'] / 255 * 100)
+        fields.append(f"fan {WHITE}{snapshot['fan']}/255{RESET} ({pct}%)")
+
+    headroom = THERMAL_THROTTLE - (snapshot['tj'] or 0)
+    print(f"    {'    '.join(fields)}")
+    print(f"    {DIM}headroom to throttle ({THERMAL_THROTTLE:.0f}°C): {headroom:.1f}°C{RESET}")
+    print()
+
+    # HISTORY
+    print(f"  {WHITE}{filter_label}{RESET}  {DIM}({len(rows)} samples){RESET}")
+    divider()
+
+    if not rows:
+        print(f"    {GRAY}No samples yet — logger runs every 5 min via cron.{RESET}")
+        print(f"    {GRAY}File: {THERMAL_LOG}{RESET}")
+        print()
+        return
+
+    # Compute min/avg/max/peak per column
+    cols_def = [('cpu', 1, '°C'), ('gpu', 2, '°C'),
+                ('soc', 3, '°C'), ('tj', 4, '°C'), ('fan', 5, '/255')]
+    print(f"    {DIM}{'':<6}{'min':>9}{'avg':>9}{'max':>9}   peak{RESET}")
+    for label, col_idx, unit in cols_def:
+        vals = [r[col_idx] for r in rows]
+        v_min, v_max = min(vals), max(vals)
+        v_avg = sum(vals) / len(vals)
+        peak_ts = next(r[0] for r in rows if r[col_idx] == v_max)
+        # Trim peak timestamp to HH:MM (or DD HH:MM for multi-day filter)
+        if date_filter and len(date_filter) == 10:
+            peak_label = peak_ts[11:16]
+        else:
+            peak_label = peak_ts[5:16].replace('T', ' ')
+        color = _heat_color(v_max) if unit == '°C' else WHITE
+        if unit == '°C':
+            print(f"    {label:<6}{v_min:>8.1f}°{v_avg:>8.1f}°{color}{v_max:>8.1f}°{RESET}   {DIM}{peak_label}{RESET}")
+        else:
+            print(f"    {label:<6}{int(v_min):>9}{int(v_avg):>9}{int(v_max):>9}   {DIM}{peak_label}{RESET}")
+    print()
+    print(f"  {DIM}Logged every 5 min · {THERMAL_LOG}{RESET}")
+    print(f"  {DIM}Filter: hub --temps <YYYY-MM-DD> | --all{RESET}")
+    print()
+
+
+def sync_projects():
+    """Push projects.json from hub to all reachable non-local hosts."""
+    src = str(PROJECTS_JSON)
+    remote_hosts = [k for k in HOSTS if k != LOCAL_HOST]
+    if not remote_hosts:
+        print(f"{YELLOW}No remote hosts configured.{RESET}")
+        return
+
+    for host_key in remote_hosts:
+        host = HOSTS[host_key]
+        alias = host['alias']
+        print(f"  {host['name']} ({alias})... ", end='', flush=True)
+        if not check_host_reachable(alias):
+            print(f"{YELLOW}offline, skipped{RESET}")
+            continue
+        ok, _ = ssh_cmd(alias, 'mkdir -p ~/.config/hub', timeout=5)
+        if not ok:
+            print(f"{RED}failed to create config dir{RESET}")
+            continue
+        result = subprocess.run(
+            ['scp', '-q', src, f'{alias}:~/.config/hub/projects.json'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            print(f"{GREEN}synced{RESET}")
+        else:
+            print(f"{RED}failed{RESET}")
+
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3008,6 +3175,7 @@ def print_usage():
   hub --manage         Edit, delete, or reorder project entries
   hub --scan <host>    Discover new projects on a host (agx, ws)
   hub --scan --ignore <host>   Manage ignored dirs on a host
+  hub --temps          Thermal snapshot + today's peaks (date | --all to filter)
   hub --help           This help
 """)
 
@@ -3057,6 +3225,12 @@ def main():
         manage_projects()
     elif '--services' in args:
         render_services()
+    elif '--temps' in args or '--temp' in args:
+        flag = '--temps' if '--temps' in args else '--temp'
+        idx = args.index(flag)
+        render_temps(args[idx + 1:])
+    elif '--sync-projects' in args:
+        sync_projects()
     elif '--status' in args:
         render_status()
     elif '--next' in args:

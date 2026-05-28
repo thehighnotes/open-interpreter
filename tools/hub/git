@@ -19,6 +19,7 @@ Usage:
     repo fix <project>             Audit/fix issues (PAT, user config, .gitignore)
 """
 
+import os
 import sys
 import time
 from datetime import datetime
@@ -38,6 +39,78 @@ from hub_common import (
     load_services, probe_service, restart_service, start_service,
     wait_for_ready, read_deploy_state, write_deploy_state, fetch_git_head,
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSH agent forwarding (route GitHub auth through Nano)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensure_ssh_agent():
+    """Ensure ssh-agent is running with the default key loaded.
+    Returns True if agent is ready for forwarding."""
+    import subprocess as _sp
+    key_path = Path.home() / '.ssh' / 'id_ed25519'
+    if not key_path.exists():
+        return False
+
+    # Try loading persisted agent env
+    agent_env = Path.home() / '.ssh' / 'agent-env'
+    if agent_env.exists() and 'SSH_AUTH_SOCK' not in os.environ:
+        for line in agent_env.read_text().splitlines():
+            if line.startswith('export '):
+                k, v = line[7:].split('=', 1)
+                os.environ[k] = v
+
+    # Check if agent is running and has keys
+    try:
+        r = _sp.run(['ssh-add', '-l'], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+
+    # Start agent and add key
+    try:
+        r = _sp.run(['ssh-agent', '-s'], capture_output=True, text=True, timeout=5)
+        for line in r.stdout.split(';'):
+            if '=' in line:
+                k, v = line.strip().split('=', 1)
+                if k in ('SSH_AUTH_SOCK', 'SSH_AGENT_PID'):
+                    os.environ[k] = v
+        # Persist for other processes
+        with open(str(agent_env), 'w') as f:
+            f.write(f"export SSH_AUTH_SOCK={os.environ.get('SSH_AUTH_SOCK','')}\n")
+            f.write(f"export SSH_AGENT_PID={os.environ.get('SSH_AGENT_PID','')}\n")
+        _sp.run(['ssh-add', str(key_path)], capture_output=True, text=True, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
+_forwarding_cache = {}
+
+def _needs_agent_forwarding(host_alias):
+    """Check if a remote host needs agent forwarding for GitHub SSH access.
+    Returns True if the host lacks direct SSH auth but forwarding works.
+    Result is cached per host for the lifetime of this process."""
+    if host_alias == LOCAL_HOST:
+        return False
+    if host_alias in _forwarding_cache:
+        return _forwarding_cache[host_alias]
+    ok, out = ssh_cmd(host_alias,
+        'ssh -T -o BatchMode=yes -o ConnectTimeout=5 git@github.com 2>&1 || true', timeout=15)
+    if 'successfully authenticated' in (out or '').lower():
+        _forwarding_cache[host_alias] = False
+        return False
+    if _ensure_ssh_agent():
+        ok_fwd, fwd_out = ssh_cmd(host_alias,
+            'ssh -T -o BatchMode=yes -o ConnectTimeout=5 git@github.com 2>&1 || true',
+            timeout=15, forward_agent=True)
+        if 'successfully authenticated' in (fwd_out or '').lower():
+            _forwarding_cache[host_alias] = True
+            return True
+    _forwarding_cache[host_alias] = False
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -322,7 +395,7 @@ def _ssh_commit(host_alias, path, message, timeout=30):
             ssh_cmd(host_alias, f'rm -f {tmp_remote}', timeout=5)
 
 
-def _ssh_cmd_with_stderr(host_alias, cmd, timeout=30):
+def _ssh_cmd_with_stderr(host_alias, cmd, timeout=30, forward_agent=False):
     """SSH command that captures both stdout and stderr separately.
 
     Returns (success, stdout, stderr). Unlike ssh_cmd() which drops stderr,
@@ -337,10 +410,14 @@ def _ssh_cmd_with_stderr(host_alias, cmd, timeout=30):
                 capture_output=True, text=True, timeout=timeout
             )
         else:
+            ssh_args = ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
+                        '-o', 'StrictHostKeyChecking=no']
+            if forward_agent:
+                ssh_args.append('-A')
+            ssh_args.append(host_alias)
+            ssh_args.append(cmd)
             result = _sp.run(
-                ['ssh', '-o', 'ConnectTimeout=3', '-o', 'BatchMode=yes',
-                 '-o', 'StrictHostKeyChecking=no', host_alias, cmd],
-                capture_output=True, text=True, timeout=timeout
+                ssh_args, capture_output=True, text=True, timeout=timeout
             )
         return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
     except _sp.TimeoutExpired:
@@ -1175,6 +1252,9 @@ def do_push(key):
     if not _check_remote_auth(host_alias, path, remote.strip()):
         return
 
+    # Determine if we need agent forwarding for this host
+    use_forwarding = _needs_agent_forwarding(host_alias)
+
     # Check for upstream tracking
     ok_up, upstream = ssh_cmd(host_alias, f'cd {path} && git rev-parse --abbrev-ref @{{upstream}} 2>/dev/null', timeout=8)
     if not ok_up or not upstream.strip():
@@ -1186,7 +1266,8 @@ def do_push(key):
         push_cmd = f'cd {path} && git push'
 
     with Spinner('Pushing...'):
-        ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, push_cmd, timeout=60)
+        ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, push_cmd, timeout=60,
+            forward_agent=use_forwarding)
 
     output = (stdout + '\n' + stderr).strip()
     if ok:
@@ -1228,8 +1309,10 @@ def do_pull(key):
         print(f"\n  {YELLOW}●{RESET} {WHITE}{key}{RESET} has no remote configured")
         return
 
+    fwd = _needs_agent_forwarding(host_alias)
     with Spinner('Pulling...'):
-        ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, f'cd {path} && git pull', timeout=60)
+        ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, f'cd {path} && git pull', timeout=60,
+            forward_agent=fwd)
 
     output = (stdout + '\n' + stderr).strip()
     if ok:
@@ -1391,13 +1474,25 @@ def do_create(key):
         print(f"\n  {GREEN}✓{RESET} Created {GITHUB_USERNAME}/{name}")
 
     # Configure remote on the project's host
-    # First check if SSH auth works on that host
+    # Check direct SSH auth first, then try agent forwarding from Nano
+    use_forwarding = False
     ok_ssh, ssh_out = ssh_cmd(host_alias, 'ssh -T -o BatchMode=yes -o ConnectTimeout=5 git@github.com 2>&1 || true', timeout=15)
     github_ssh_ok = 'successfully authenticated' in (ssh_out or '').lower()
 
+    if not github_ssh_ok and host_alias != LOCAL_HOST:
+        # Try forwarding Nano's SSH agent
+        if _ensure_ssh_agent():
+            ok_fwd, fwd_out = ssh_cmd(host_alias,
+                'ssh -T -o BatchMode=yes -o ConnectTimeout=5 git@github.com 2>&1 || true',
+                timeout=15, forward_agent=True)
+            if 'successfully authenticated' in (fwd_out or '').lower():
+                github_ssh_ok = True
+                use_forwarding = True
+
     if github_ssh_ok:
         remote_url = f'git@github.com:{GITHUB_USERNAME}/{name}.git'
-        print(f"  {GREEN}✓{RESET} SSH auth works on {HOSTS[host]['name']} — using SSH URL")
+        via = ' (via Nano agent forwarding)' if use_forwarding else ''
+        print(f"  {GREEN}✓{RESET} SSH auth works on {HOSTS[host]['name']}{via} — using SSH URL")
     else:
         remote_url = f'https://github.com/{GITHUB_USERNAME}/{name}.git'
         print(f"  {YELLOW}●{RESET} No SSH auth on {HOSTS[host]['name']} — using HTTPS URL")
@@ -1411,12 +1506,14 @@ def do_create(key):
         # Maybe origin already exists with different URL
         ssh_cmd(host_alias, f'cd {path} && git remote set-url origin {remote_url}', timeout=10)
 
-    # Push
+    # Push (use agent forwarding if that's how we authenticated)
     ok_br, branch = ssh_cmd(host_alias, f'cd {path} && git symbolic-ref --short HEAD 2>/dev/null', timeout=8)
     branch_name = branch.strip() if ok_br and branch.strip() else 'main'
 
     with Spinner('Pushing to GitHub...'):
-        ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, f'cd {path} && git push -u origin {branch_name}', timeout=60)
+        ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias,
+            f'cd {path} && git push -u origin {branch_name}', timeout=60,
+            forward_agent=use_forwarding)
 
     if ok:
         print(f"  {GREEN}✓{RESET} Pushed to {GITHUB_USERNAME}/{name}")
@@ -1679,8 +1776,10 @@ def do_checkpoint(message=None, auto_yes=False):
 
         if ok and has_remote:
             remote_url = st.get('remote_url', '')
+            fwd = remote_url.startswith('git@') and _needs_agent_forwarding(host_alias)
             ok_push, stdout_push, stderr_push = _ssh_cmd_with_stderr(
-                host_alias, f'cd {path} && git push', timeout=60)
+                host_alias, f'cd {path} && git push', timeout=60,
+                forward_agent=fwd)
             if not ok_push:
                 ok = False
                 output = stderr_push or stdout_push or 'Push failed'
@@ -1937,7 +2036,9 @@ def do_deploy(key):
         ahead_count = int(ahead.strip()) if ok and ahead.strip().isdigit() else 0
         if ahead_count > 0:
             print(f"  {CYAN}● {ahead_count} commit(s) ahead — pushing...{RESET}")
-            ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, f'cd {path} && git push', timeout=60)
+            fwd = _needs_agent_forwarding(host_alias)
+            ok, stdout, stderr = _ssh_cmd_with_stderr(host_alias, f'cd {path} && git push', timeout=60,
+                forward_agent=fwd)
             if ok:
                 print(f"  {GREEN}✓{RESET} Pushed")
             else:

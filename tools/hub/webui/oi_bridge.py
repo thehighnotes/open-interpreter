@@ -71,6 +71,17 @@ _UNSAFE_PATTERNS = re.compile(
     re.IGNORECASE
 )
 
+_KNOWLEDGE_SYSTEM_MESSAGE = """You are a knowledgeable assistant. Explain concepts clearly with examples, code snippets, and well-structured markdown.
+
+When showing code, use fenced code blocks with the appropriate language tag. These are illustrative examples — they will NOT be executed.
+
+ENVIRONMENT (for reference only):
+Nano  192.168.2.31  — edge hub, runs OI WebUI
+AGX   192.168.2.33  — GPU server, runs vLLM + Code Assistant
+WS    192.168.2.24  — dev workstation
+
+Give thorough, well-structured answers using markdown (headings, lists, code blocks). Be concise but complete — don't artificially shorten responses."""
+
 
 class OIBridge:
     """Singleton wrapper around Open Interpreter for WebUI use."""
@@ -87,6 +98,8 @@ class OIBridge:
         self._stop_event = threading.Event()
         self._current_thread = None
         self._pending_approval = False
+        self._request_exec_override = None
+        self._turn_counter = 0
         # Load saved settings from webui config
         self._saved_cfg = self._load_saved_config()
         self._model_name = self._saved_cfg.get(
@@ -121,7 +134,7 @@ class OIBridge:
             "context_window", int(os.environ.get("OI_CTX", _CONTEXT_WINDOW)))
         interpreter.llm.max_tokens = self._saved_cfg.get("max_tokens", 3000)
         interpreter.llm.supports_functions = False
-        interpreter.llm.supports_vision = True
+        interpreter.llm.supports_vision = False
         interpreter.disable_telemetry = True
         interpreter.offline = True
 
@@ -172,6 +185,11 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
         # Auto-run callable — blocks on approval for unsafe commands
         interpreter.auto_run = self._webui_auto_run
 
+        self._turn_counter = sum(
+            1 for m in (interpreter.messages or [])
+            if m.get("role") == "user" and m.get("type") == "message"
+        )
+
         # Probe connection
         self._connected = False
         try:
@@ -216,6 +234,8 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
 
     def _webui_auto_run(self, code):
         """Auto-run callable respecting execution mode setting."""
+        if self._request_exec_override == "none":
+            return False
         if self._exec_mode == "auto":
             return True
         if self._exec_mode == "safe" and self._should_auto_run(code):
@@ -229,8 +249,10 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
         self._pending_approval = False
         return self._approval_result
 
-    def chat_stream(self, message):
-        """Stream OI response as SSE events. Yields 'data: {...}\n\n' strings."""
+    def chat_stream(self, message, exec_mode=None):
+        """Stream OI response as SSE events. Yields 'data: {...}\n\n' strings.
+        exec_mode: optional per-request override ("none" suppresses all execution).
+        """
         if not self._interpreter:
             yield f"data: {json.dumps({'type': 'error', 'content': 'Interpreter not initialized'})}\n\n"
             return
@@ -239,10 +261,26 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
             yield f"data: {json.dumps({'type': 'error', 'content': 'Another request is in progress'})}\n\n"
             return
 
+        _is_knowledge = (exec_mode == "none")
+        _orig_sys = None
+        _orig_ci = None
+
         try:
+            self._turn_counter += 1
+            current_turn = self._turn_counter
+            self._request_exec_override = exec_mode
             self._stop_event.clear()
             q = queue.Queue()
             error_holder = [None]
+
+            if _is_knowledge:
+                _orig_sys = self._interpreter.system_message
+                _orig_ci = self._interpreter.custom_instructions
+                self._interpreter.system_message = _KNOWLEDGE_SYSTEM_MESSAGE
+                self._interpreter.custom_instructions = ""
+
+            _mode_label = "knowledge" if _is_knowledge else "terminal"
+            yield f"data: {json.dumps({'type': 'mode', 'mode': _mode_label})}\n\n"
 
             def _run():
                 try:
@@ -291,7 +329,7 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
                 yield f"data: {json.dumps({'type': 'error', 'content': error_holder[0]})}\n\n"
 
             # Emit context stats with done event
-            _done = {'type': 'done'}
+            _done = {'type': 'done', 'turn': current_turn, 'mode': _mode_label}
             if self._interpreter:
                 _pt = getattr(self._interpreter, '_last_prompt_tokens', 0)
                 _cw = getattr(self._interpreter.llm, 'context_window', 0)
@@ -300,8 +338,16 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
             yield f"data: {json.dumps(_done)}\n\n"
 
         finally:
+            self._request_exec_override = None
+            if _is_knowledge and _orig_sys is not None:
+                self._interpreter.system_message = _orig_sys
+                self._interpreter.custom_instructions = _orig_ci
             self._current_thread = None
-            self._lock.release()
+            if self._lock.locked():
+                try:
+                    self._lock.release()
+                except RuntimeError:
+                    pass
 
     def _get_pending_code(self):
         """Extract the last code block from messages for the confirmation UI."""
@@ -395,16 +441,50 @@ Give thorough, well-structured answers using markdown (headings, lists, code blo
         self._approval_event.set()
 
     def stop(self):
-        """Abort current generation."""
+        """Abort current generation and ensure lock is released."""
         self._stop_event.set()
         if self._pending_approval:
             self._approval_result = False
             self._approval_event.set()
+        # Force-release the lock if the generator didn't clean up
+        if self._lock.locked():
+            try:
+                self._lock.release()
+            except RuntimeError:
+                pass
+            self._current_thread = None
 
     def reset(self):
         """Clear conversation history."""
         if self._interpreter:
             self._interpreter.messages = []
+            self._turn_counter = 0
+
+    def truncate(self, turn):
+        """Remove all messages from the given turn onward.
+        Returns True on success, False if busy or invalid."""
+        if not self._interpreter:
+            return False
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            msgs = self._interpreter.messages
+            user_count = 0
+            cut_index = len(msgs)
+            for i, m in enumerate(msgs):
+                if m.get("role") == "user" and m.get("type") == "message":
+                    user_count += 1
+                    if user_count == turn:
+                        cut_index = i
+                        break
+            self._interpreter.messages = msgs[:cut_index]
+            self._turn_counter = sum(
+                1 for m in self._interpreter.messages
+                if m.get("role") == "user" and m.get("type") == "message"
+            )
+            return True
+        finally:
+            self._lock.release()
 
     def get_messages(self):
         """Return current message history."""

@@ -231,9 +231,10 @@ async def chat(request):
     if not message:
         return JSONResponse({"error": "Empty message"}, status_code=400)
 
+    exec_mode = body.get("exec_mode")
     bridge = get_bridge()
     return StreamingResponse(
-        bridge.chat_stream(message),
+        bridge.chat_stream(message, exec_mode=exec_mode),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -365,6 +366,18 @@ async def get_messages(request):
 async def reset_session(request):
     bridge = get_bridge()
     bridge.reset()
+    return JSONResponse({"ok": True})
+
+
+async def truncate_session(request):
+    body = await _json_body(request)
+    turn = body.get("turn")
+    if not isinstance(turn, int) or turn < 1:
+        return JSONResponse({"ok": False, "error": "Valid turn number required"}, status_code=400)
+    bridge = get_bridge()
+    ok = bridge.truncate(turn)
+    if not ok:
+        return JSONResponse({"ok": False, "error": "Truncation failed (generation in progress?)"}, status_code=409)
     return JSONResponse({"ok": True})
 
 
@@ -905,6 +918,38 @@ async def delete_project(request):
 
     hub_common.save_projects(projects, order, ignored)
     return JSONResponse({"ok": True})
+
+
+async def create_project(request):
+    """Create a new project. Body: { key, data: { name, host, path, code_index, tagline } }"""
+    if not hub_common:
+        return JSONResponse({"ok": False}, status_code=500)
+    body = await _json_body(request)
+    key = body.get("key", "").strip()
+    data = body.get("data", {})
+
+    if not key:
+        return JSONResponse({"ok": False, "error": "Missing key"}, status_code=400)
+
+    projects, order, ignored = hub_common.load_projects()
+    if key in projects:
+        return JSONResponse({"ok": False, "error": "Already exists"}, status_code=409)
+
+    projects[key] = {
+        "name": data.get("name", key),
+        "host": data.get("host", "ws"),
+        "path": data.get("path", ""),
+        "code_index": data.get("code_index", ""),
+        "tagline": data.get("tagline", ""),
+        "claude_md": data.get("claude_md", "CLAUDE.md"),
+        "services": [],
+        "dev_services": [],
+        "related_repos": [],
+    }
+    order.append(key)
+    hub_common.save_projects(projects, order, ignored)
+    hub_common.reload_projects()
+    return JSONResponse({"ok": True, "key": key})
 
 
 # ── Code Assistant projects ───────────────────────────────────────────────
@@ -1475,6 +1520,7 @@ routes = [
     Route("/api/session", get_session),
     Route("/api/session/messages", get_messages),
     Route("/api/session/reset", reset_session, methods=["POST"]),
+    Route("/api/session/truncate", truncate_session, methods=["POST"]),
     Route("/api/session/exec-mode", set_exec_mode, methods=["POST"]),
     Route("/api/status", get_status),
     Route("/api/projects", get_projects),
@@ -1512,6 +1558,7 @@ routes = [
     Route("/api/projects/dev-toggle", toggle_dev_service, methods=["POST"]),
     # Project CRUD
     Route("/api/projects/update", update_project, methods=["POST"]),
+    Route("/api/projects/create", create_project, methods=["POST"]),
     Route("/api/projects/delete", delete_project, methods=["POST"]),
     # Research fetch
     Route("/api/research/fetch", research_fetch, methods=["POST"]),
